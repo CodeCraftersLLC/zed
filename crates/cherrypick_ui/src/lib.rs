@@ -9,4 +9,9 @@ mod remote_toolbar;
 mod repo_state_banner;
 mod settings;
 
-pub fn init(_cx: &mut gpui::App) {}
+pub fn init(cx: &mut gpui::App) {
+    cx.observe_new(|workspace: &mut workspace::Workspace, _window, _cx| {
+        cherrypick_sidebar::register(workspace);
+    })
+    .detach();
+}
