@@ -27,6 +27,8 @@ members = [
     "crates/call",
     "crates/channel",
     "crates/cherrypick_ui",
+    "crates/cherrypick_pr",
+    "crates/cherrypick_agent",
     "crates/cli",
     "crates/client",
     "crates/clock",
@@ -280,6 +282,8 @@ buffer_diff = { path = "crates/buffer_diff" }
 call = { path = "crates/call" }
 channel = { path = "crates/channel" }
 cherrypick_ui = { path = "crates/cherrypick_ui" }
+cherrypick_pr = { path = "crates/cherrypick_pr" }
+cherrypick_agent = { path = "crates/cherrypick_agent" }
 cli = { path = "crates/cli" }
 client = { path = "crates/client" }
 clock = { path = "crates/clock" }
@@ -590,6 +594,7 @@ linkify = "0.10.0"
 libwebrtc = "0.3.26"
 livekit = { version = "0.7.32", features = ["tokio", "rustls-tls-native-roots"] }
 log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+lru = "0.12"
 lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "a4f410987660bf560d1e617cb78117c6b6b9f599" }
 mach2 = "0.5"
 markup5ever_rcdom = "0.3.0"
@@ -600,6 +605,7 @@ naga = { version = "28.0", features = ["wgsl-in"] }
 nanoid = "0.4"
 nbformat = "1.2.0"
 nix = "0.29"
+notify = "7"
 num-format = "0.4.4"
 objc = "0.2"
 objc2-foundation = { version = "=0.3.1", default-features = false, features = [
@@ -674,6 +680,7 @@ rsa = "0.9.6"
 runtimelib = { version = "1.4.0", default-features = false, features = [
     "async-dispatcher-runtime", "aws-lc-rs"
 ] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 rust-embed = { version = "8.4", features = ["include-exclude"] }
 rustc-hash = "2.1.0"
 rustls = { version = "0.23.26" }
@@ -719,6 +726,7 @@ time = { version = "0.3", features = [
 ] }
 tiny_http = "0.8"
 tokio = { version = "1" }
+tokio-rusqlite = "0.6"
 tokio-socks = { version = "0.5.2", default-features = false, features = [
     "futures-io",
     "tokio",

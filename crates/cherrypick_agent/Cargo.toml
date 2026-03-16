@@ -1,0 +1,32 @@
+[package]
+name = "cherrypick_agent"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+git2.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "process", "io-util"] }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+tokio-rusqlite.workspace = true
+tiktoken-rs.workspace = true
+notify.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
