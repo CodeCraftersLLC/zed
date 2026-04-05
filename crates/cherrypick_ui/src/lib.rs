@@ -2,7 +2,7 @@ pub mod cherrypick_sidebar;
 pub use cherrypick_sidebar::CherryPickSidebar;
 pub(crate) mod cherrypick_view;
 pub(crate) mod branch_list;
-mod commit_graph_embed;
+pub(crate) mod commit_graph_embed;
 pub(crate) mod create_pr_form;
 pub(crate) mod diff_file_list;
 pub(crate) mod pr_detail;

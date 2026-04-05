@@ -13,6 +13,7 @@ use workspace::{
 
 use crate::branch_list::BranchList;
 use crate::cherrypick_view::CherryPickView;
+use crate::commit_graph_embed;
 use crate::create_pr_form::{CreatePrForm, CreatePrFormEvent};
 use crate::pr_list::{PrList, PrListEvent};
 use crate::pr_state::PrState;
@@ -252,6 +253,13 @@ impl CherryPickSidebar {
         });
     }
 
+    fn open_commit_graph(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        let _ = workspace.update(cx, |workspace, cx| {
+            commit_graph_embed::open_git_graph(workspace, window, cx);
+        });
+    }
+
     fn current_branch_name(&self, cx: &App) -> Option<String> {
         self.active_repository.as_ref().and_then(|repo| {
             repo.read(cx).branch.as_ref().map(|b| b.name().to_string())
@@ -314,6 +322,22 @@ impl Render for CherryPickSidebar {
                                         current_branch
                                             .unwrap_or_else(|| "no branch".to_string()),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .id("open-graph-btn")
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(cx.theme().colors().ghost_element_background)
+                                    .hover(|s| {
+                                        s.bg(cx.theme().colors().ghost_element_hover)
+                                    })
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.open_commit_graph(window, cx);
+                                    }))
+                                    .child("Graph"),
                             )
                             .child(
                                 div()

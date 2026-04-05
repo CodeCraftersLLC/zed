@@ -2877,6 +2877,7 @@ dependencies = [
  "cherrypick_pr",
  "git",
  "git2",
+ "git_graph",
  "git_ui",
  "gpui",
  "log",

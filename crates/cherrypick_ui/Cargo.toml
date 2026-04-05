@@ -24,6 +24,7 @@ askpass.workspace = true
 anyhow.workspace = true
 cherrypick_pr.workspace = true
 cherrypick_agent.workspace = true
+git_graph.workspace = true
 log.workspace = true
 sha2.workspace = true
 git2.workspace = true
