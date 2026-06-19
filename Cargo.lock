@@ -2801,7 +2801,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "futures 0.3.31",
+ "futures 0.3.32",
  "git2",
  "notify 7.0.0",
  "rusqlite",
@@ -18134,6 +18134,20 @@ dependencies = [
  "quick-error 2.0.1",
  "weezl",
  "zune-jpeg 0.5.15",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.9.1"
+source = "git+https://github.com/zed-industries/tiktoken-rs?rev=2570c4387a8505fb8f1d3f3557454b474f1e8271#2570c4387a8505fb8f1d3f3557454b474f1e8271"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bstr",
+ "fancy-regex 0.16.2",
+ "lazy_static",
+ "regex",
+ "rustc-hash 1.1.0",
 ]
 
 [[package]]

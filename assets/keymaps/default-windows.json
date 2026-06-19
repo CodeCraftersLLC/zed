@@ -956,7 +956,6 @@
       "ctrl-k ctrl-shift-c": "workspace::CopyRelativePath",
       "ctrl-z": "project_panel::Undo",
       "ctrl-shift-z": "project_panel::Redo",
-      "enter": "project_panel::Rename",
       "f2": "project_panel::Rename",
       "backspace": ["project_panel::Trash", { "skip_prompt": false }],
       "delete": ["project_panel::Trash", { "skip_prompt": false }],
@@ -977,6 +976,10 @@
     "use_key_equivalents": true,
     "bindings": {
       "space": "project_panel::Open",
+      // CHERRYPICK: Windows-native Enter = open file (Zed defaults Enter to Rename,
+      // a Finder convention). Rename stays on F2. Gated behind not_editing so Enter
+      // still confirms while editing a name.
+      "enter": "project_panel::Open",
     },
   },
   {
