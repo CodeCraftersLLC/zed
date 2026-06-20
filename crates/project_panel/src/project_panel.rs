@@ -1043,7 +1043,6 @@ impl ProjectPanel {
             let is_unfoldable = auto_fold_dirs && self.is_unfoldable(entry, worktree);
             let is_read_only = project.is_read_only(cx);
             let is_remote = project.is_remote();
-            let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
 
             let settings = ProjectPanelSettings::get_global(cx);
@@ -1051,24 +1050,6 @@ impl ProjectPanel {
             let should_hide_rename = is_root
                 && (cfg!(target_os = "windows")
                     || (settings.hide_root && visible_worktrees_count == 1));
-            let should_show_compare = !is_dir && self.file_abs_paths_to_diff(cx).is_some();
-
-            let (has_git_repo, has_history) = {
-                let project_path = project::ProjectPath {
-                    worktree_id,
-                    path: entry.path.clone(),
-                };
-                let git_store = project.git_store().read(cx);
-                let has_git_repo = git_store
-                    .repository_and_path_for_project_path(&project_path, cx)
-                    .is_some();
-                let has_history = has_git_repo
-                    && !git_store
-                        .project_path_git_status(&project_path, cx)
-                        .is_some_and(|status| status.is_created());
-                (has_git_repo, has_history)
-            };
-
             let has_pasteable_content = self.has_pasteable_content(cx);
             let entity = cx.entity();
             let context_menu = ContextMenu::build(window, cx, |menu, _, cx| {
@@ -1078,6 +1059,15 @@ impl ProjectPanel {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
                     } else {
+                        // CHERRYPICK: curated menu. This panel is embedded as the local
+                        // Files tree, so we expose only the operations the file-browser
+                        // -editor plan scopes (Task 2.2: create / rename / delete-trash /
+                        // reveal / open, plus copy/cut/paste/duplicate). Zed's
+                        // workspace/git/search/terminal entries are removed — in this
+                        // embedded single-root surface they are unwired, broken, or
+                        // destructive (e.g. "Remove from Project" emptied the worktree,
+                        // "Find in Folder" opened a broken search tab). Plan line 32:
+                        // no broadening into Zed workspace parity.
                         menu.action("New File", Box::new(NewFile))
                             .action("New Folder", Box::new(NewDirectory))
                             .separator()
@@ -1090,20 +1080,11 @@ impl ProjectPanel {
                             .when(is_local, |menu| {
                                 menu.action("Open in Default App", Box::new(OpenWithSystem))
                             })
-                            .action("Open in Terminal", Box::new(OpenInTerminal))
-                            .when(is_dir, |menu| {
-                                menu.separator()
-                                    .action("Find in Folder…", Box::new(NewSearchInDirectory))
-                            })
                             .when(is_unfoldable, |menu| {
                                 menu.action("Unfold Directory", Box::new(UnfoldDirectory))
                             })
                             .when(is_foldable, |menu| {
                                 menu.action("Fold Directory", Box::new(FoldDirectory))
-                            })
-                            .when(should_show_compare, |menu| {
-                                menu.separator()
-                                    .action("Compare Marked Files", Box::new(CompareMarkedFiles))
                             })
                             .separator()
                             .action("Cut", Box::new(Cut))
@@ -1133,19 +1114,6 @@ impl ProjectPanel {
                                 "Copy Relative Path",
                                 Box::new(zed_actions::workspace::CopyRelativePath),
                             )
-                            .when(has_git_repo, |menu| {
-                                menu.separator()
-                                    .when(!is_dir && self.has_git_changes(entry_id), |menu| {
-                                        menu.action(
-                                            "Restore File",
-                                            Box::new(git::RestoreFile { skip_prompt: false }),
-                                        )
-                                    })
-                                    .action("Add to .gitignore", Box::new(git::AddToGitignore))
-                                    .when(has_history, |menu| {
-                                        menu.action("View History", Box::new(git::FileHistory))
-                                    })
-                            })
                             .when(!should_hide_rename, |menu| {
                                 menu.separator().action("Rename", Box::new(Rename))
                             })
@@ -1154,14 +1122,6 @@ impl ProjectPanel {
                             })
                             .when(!is_root, |menu| {
                                 menu.action("Delete", Box::new(Delete { skip_prompt: false }))
-                            })
-                            .when(!is_collab && is_root, |menu| {
-                                menu.separator()
-                                    .action(
-                                        "Add Folders to Project…",
-                                        Box::new(workspace::AddFolderToProject),
-                                    )
-                                    .action("Remove from Project", Box::new(RemoveFromProject))
                             })
                             .when(is_dir && !is_root, |menu| {
                                 menu.separator().action(
@@ -6262,6 +6222,51 @@ impl ProjectPanel {
 
         dispatch_context.add(identifier);
         dispatch_context
+    }
+
+    /// CHERRYPICK: reveal (expand ancestors of + select + scroll to) the entry at
+    /// `abs_path`. A thin public adapter over `reveal_entry` so the Cherrypick host
+    /// can restore tree expansion to the previously-open file on relaunch — the
+    /// auto-reveal-on-open path doesn't fire reliably for a programmatic open
+    /// issued before the worktree scan settles. No-op if the path isn't in the
+    /// project (e.g. not yet scanned).
+    pub fn reveal_abs_path(
+        &mut self,
+        project: Entity<Project>,
+        abs_path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_path) = project.read(cx).project_path_for_absolute_path(abs_path, cx)
+        else {
+            return;
+        };
+        let Some(entry_id) = project
+            .read(cx)
+            .entry_for_path(&project_path, cx)
+            .map(|entry| entry.id)
+        else {
+            return;
+        };
+        // `reveal_entry` -> `expand_entry` only records expanded ancestors when the
+        // worktree already has an `expanded_dir_ids` entry. That map is seeded
+        // asynchronously by `update_visible_entries` (its vacant branch inserts the
+        // root entry), so a restore-time reveal issued right after mount can beat it
+        // and `expand_entry`'s `get_mut` returns `None` — it silently no-ops and the
+        // tree never expands to the restored file. Seed the worktree root here if
+        // it's still vacant (same value `update_visible_entries` would insert) so
+        // `expand_entry` writes the ancestors into `self.state` synchronously; every
+        // later `update_visible_entries` derives from that state and preserves them.
+        let worktree_id = project_path.worktree_id;
+        if !self.state.expanded_dir_ids.contains_key(&worktree_id)
+            && let Some(root_id) = project
+                .read(cx)
+                .worktree_for_id(worktree_id, cx)
+                .and_then(|worktree| worktree.read(cx).root_entry().map(|entry| entry.id))
+        {
+            self.state.expanded_dir_ids.insert(worktree_id, vec![root_id]);
+        }
+        self.reveal_entry(project, entry_id, true, window, cx).ok();
     }
 
     fn reveal_entry(

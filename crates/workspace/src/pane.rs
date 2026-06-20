@@ -1,7 +1,7 @@
 use crate::{
-    CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions,
-    OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom,
-    Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
+    CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenOptions, OpenVisible, SplitDirection,
+    ToggleFileFinder, ToggleProjectSymbols, ToggleZoom, Workspace, WorkspaceItemBuilder, ZoomIn,
+    ZoomOut,
     focus_follows_mouse::FocusFollowsMouse as _,
     invalid_item_view::InvalidItemView,
     item::{
@@ -3272,9 +3272,6 @@ impl Pane {
 
                             let entry_abs_path = pane.read(cx).entry_abs_path(entry, cx);
                             let reveal_path = entry_abs_path.clone();
-                            let parent_abs_path = entry_abs_path
-                                .as_deref()
-                                .and_then(|abs_path| Some(abs_path.parent()?.to_path_buf()));
                             let relative_path = project_path
                                 .map(|project_path| project_path.path)
                                 .filter(|_| has_relative_path);
@@ -3356,23 +3353,10 @@ impl Pane {
                                                 .ok();
                                         }),
                                     )
-                                })
-                                .when_some(parent_abs_path, |menu, parent_abs_path| {
-                                    menu.entry(
-                                        "Open in Terminal",
-                                        Some(Box::new(OpenInTerminal)),
-                                        window.handler_for(&pane, move |_, window, cx| {
-                                            window.dispatch_action(
-                                                OpenTerminal {
-                                                    working_directory: parent_abs_path.clone(),
-                                                    local: false,
-                                                }
-                                                .boxed_clone(),
-                                                cx,
-                                            );
-                                        }),
-                                    )
                                 });
+                            // CHERRYPICK: "Open in Terminal" removed from the editor tab
+                            // context menu — no terminal in the embedded surface (PRD §11,
+                            // smallest editor surface).
                         } else {
                             menu = menu.map(pin_tab_entries);
                         }
