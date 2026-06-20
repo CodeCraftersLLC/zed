@@ -243,7 +243,7 @@ pub fn deploy_context_menu(
                 .is_some_and(|file| {
                     std::path::Path::new(file.file_name(cx))
                         .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
                 });
 
         ui::ContextMenu::build(window, cx, |menu, _window, _cx| {

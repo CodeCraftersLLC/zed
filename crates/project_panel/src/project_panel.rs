@@ -134,6 +134,11 @@ impl State {
     }
 }
 
+/// Controls which context-menu action groups are shown by the project panel.
+///
+/// The default policy preserves normal Zed behavior. Embedded hosts, such as
+/// Cherrypick, can install a restricted policy when the host owns those actions
+/// or intentionally omits them from its file-browser surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProjectPanelContextMenuPolicy {
     pub show_terminal_actions: bool,
@@ -144,6 +149,7 @@ pub struct ProjectPanelContextMenuPolicy {
 }
 
 impl ProjectPanelContextMenuPolicy {
+    /// Shows every action group used by the standard Zed project panel.
     pub const fn full() -> Self {
         Self {
             show_terminal_actions: true,
@@ -154,7 +160,8 @@ impl ProjectPanelContextMenuPolicy {
         }
     }
 
-    pub const fn file_browser() -> Self {
+    /// Hides action groups that are handled by, or unavailable in, an embedded host.
+    pub const fn embedded() -> Self {
         Self {
             show_terminal_actions: false,
             show_search_actions: false,
@@ -3955,6 +3962,10 @@ impl ProjectPanel {
         })
     }
 
+    /// Updates context-menu action visibility for this project-panel surface.
+    ///
+    /// Standalone Zed leaves the default policy in place; embedded hosts call
+    /// this to hide actions that the host owns or does not expose.
     pub fn set_context_menu_policy(
         &mut self,
         policy: ProjectPanelContextMenuPolicy,
@@ -6433,17 +6444,20 @@ impl ProjectPanel {
         dispatch_context
     }
 
-    /// Reveals, selects, and scrolls to the project entry at `abs_path`.
+    /// Reveals, selects, and scrolls to the project entry at `absolute_path`.
+    ///
+    /// The path must belong to this panel's project and already have a loaded
+    /// project entry.
     pub fn reveal_abs_path(
         &mut self,
-        project: Entity<Project>,
-        abs_path: &Path,
+        absolute_path: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        let project = self.project.clone();
         let Some(project_path) = project
             .read(cx)
-            .project_path_for_absolute_path(abs_path, cx)
+            .project_path_for_absolute_path(absolute_path, cx)
         else {
             anyhow::bail!("path is not part of the project");
         };

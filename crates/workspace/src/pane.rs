@@ -390,23 +390,26 @@ impl fmt::Debug for Event {
     }
 }
 
-/// A container for 0 to many items that are open in the workspace.
-/// Treats all items uniformly via the [`ItemHandle`] trait, whether it's an editor, search results multibuffer, terminal or something else,
-/// responsible for managing item tabs, focus and zoom states and drag and drop features.
-/// Can be split, see `PaneGroup` for more details.
+/// Controls which context-menu action groups are shown by a workspace pane.
+///
+/// The default policy preserves normal Zed behavior. Embedded hosts, such as
+/// Cherrypick, can install a restricted policy when the host owns those actions
+/// or intentionally omits them from its file-editor surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaneContextMenuPolicy {
     pub show_terminal_actions: bool,
 }
 
 impl PaneContextMenuPolicy {
+    /// Shows every action group used by the standard Zed pane.
     pub const fn full() -> Self {
         Self {
             show_terminal_actions: true,
         }
     }
 
-    pub const fn file_editor() -> Self {
+    /// Hides action groups that are handled by, or unavailable in, an embedded host.
+    pub const fn embedded() -> Self {
         Self {
             show_terminal_actions: false,
         }
@@ -419,6 +422,10 @@ impl Default for PaneContextMenuPolicy {
     }
 }
 
+/// A container for 0 to many items that are open in the workspace.
+/// Treats all items uniformly via the [`ItemHandle`] trait, whether it's an editor, search results multibuffer, terminal or something else,
+/// responsible for managing item tabs, focus and zoom states and drag and drop features.
+/// Can be split, see `PaneGroup` for more details.
 pub struct Pane {
     alternate_file_items: (
         Option<Box<dyn WeakItemHandle>>,
@@ -911,6 +918,10 @@ impl Pane {
         cx.notify();
     }
 
+    /// Updates context-menu action visibility for this pane surface.
+    ///
+    /// Standalone Zed leaves the default policy in place; embedded hosts call
+    /// this to hide actions that the host owns or does not expose.
     pub fn set_context_menu_policy(
         &mut self,
         policy: PaneContextMenuPolicy,
@@ -3313,14 +3324,16 @@ impl Pane {
 
                             let entry_abs_path = pane.read(cx).entry_abs_path(entry, cx);
                             let reveal_path = entry_abs_path.clone();
-                            let parent_abs_path =
-                                if pane.read(cx).context_menu_policy.show_terminal_actions {
-                                    entry_abs_path
-                                        .as_deref()
-                                        .and_then(|abs_path| Some(abs_path.parent()?.to_path_buf()))
-                                } else {
-                                    None
-                                };
+                            let parent_abs_path = pane
+                                .read(cx)
+                                .context_menu_policy
+                                .show_terminal_actions
+                                .then(|| {
+                                    entry_abs_path.as_deref().and_then(|path| {
+                                        path.parent().map(|parent| parent.to_path_buf())
+                                    })
+                                })
+                                .flatten();
                             let relative_path = project_path
                                 .map(|project_path| project_path.path)
                                 .filter(|_| has_relative_path);
@@ -8748,6 +8761,17 @@ mod tests {
         for split_direction in SplitDirection::all() {
             test_single_pane_split(["A"], split_direction, SplitMode::EmptyPane, cx).await;
         }
+    }
+
+    #[test]
+    fn test_embedded_pane_context_menu_policy_hides_host_owned_actions() {
+        let policy = PaneContextMenuPolicy::embedded();
+
+        assert!(!policy.show_terminal_actions);
+        assert_eq!(
+            PaneContextMenuPolicy::default(),
+            PaneContextMenuPolicy::full()
+        );
     }
 
     #[gpui::test]

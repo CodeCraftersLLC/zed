@@ -594,6 +594,11 @@ pub struct ContextMenuOptions {
     pub placement: Option<ContextMenuPlacement>,
 }
 
+/// Controls which context-menu action groups are shown for an editor surface.
+///
+/// The default policy preserves normal Zed behavior. Embedded hosts, such as
+/// Cherrypick, can install a restricted policy when the host owns those actions
+/// or intentionally omits them from its file-editor surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EditorSurfacePolicy {
     pub show_language_actions: bool,
@@ -604,6 +609,7 @@ pub struct EditorSurfacePolicy {
 }
 
 impl EditorSurfacePolicy {
+    /// Shows every action group used by the standard Zed editor.
     pub const fn full() -> Self {
         Self {
             show_language_actions: true,
@@ -614,7 +620,8 @@ impl EditorSurfacePolicy {
         }
     }
 
-    pub const fn file_editor() -> Self {
+    /// Hides action groups that are handled by, or unavailable in, an embedded host.
+    pub const fn embedded() -> Self {
         Self {
             show_language_actions: false,
             show_agent_actions: false,
@@ -1774,6 +1781,7 @@ impl Editor {
         clone.needs_initial_data_update = self.enable_lsp_data;
         clone.enable_runnables = self.enable_runnables;
         clone.enable_code_lens = self.enable_code_lens;
+        clone.surface_policy = self.surface_policy;
         clone
     }
 
@@ -3003,6 +3011,10 @@ impl Editor {
         self.in_project_search = in_project_search;
     }
 
+    /// Updates context-menu action visibility for this editor surface.
+    ///
+    /// Standalone Zed leaves the default policy in place; embedded hosts call
+    /// this to hide actions that the host owns or does not expose.
     pub fn set_surface_policy(&mut self, policy: EditorSurfacePolicy, cx: &mut Context<Self>) {
         if self.surface_policy == policy {
             return;
