@@ -113,7 +113,6 @@ pub struct EditorSelectionControls {
     active_item: Option<Box<dyn ItemHandle>>,
     handle: PopoverMenuHandle<ContextMenu>,
     options: SelectionControlsMenuOptions,
-    _editor_subscription: Option<Subscription>,
     _settings_subscription: Subscription,
 }
 
@@ -134,7 +133,6 @@ impl EditorSelectionControls {
             active_item: None,
             handle: Default::default(),
             options,
-            _editor_subscription: None,
             _settings_subscription: settings_subscription,
         }
     }
@@ -192,17 +190,6 @@ impl ToolbarItemView for EditorSelectionControls {
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
         self.active_item = active_pane_item.map(ItemHandle::boxed_clone);
-        self._editor_subscription.take();
-
-        if let Some(editor) = self.active_editor() {
-            self._editor_subscription = Some(cx.observe(&editor, |this, _, cx| {
-                cx.emit(ToolbarItemEvent::ChangeLocation(
-                    this.toolbar_item_location(cx),
-                ));
-                cx.notify();
-            }));
-        }
-
         self.toolbar_item_location(cx)
     }
 }
