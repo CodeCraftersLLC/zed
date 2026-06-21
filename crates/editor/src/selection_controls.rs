@@ -1,55 +1,68 @@
 use crate::{
     Editor,
     actions::{
-        AddSelectionAbove, AddSelectionBelow, DuplicateLineDown, GoToDiagnostic, GoToHunk,
-        GoToPreviousDiagnostic, GoToPreviousHunk, MoveLineDown, MoveLineUp, SelectAll,
-        SelectLargerSyntaxNode, SelectNext, SelectSmallerSyntaxNode, ToggleGoToLine,
+        AddSelectionAbove, AddSelectionBelow, DuplicateLineDown, SelectAll, SelectLargerSyntaxNode,
+        SelectNext, SelectSmallerSyntaxNode,
     },
 };
 use gpui::{
     App, Context, ElementId, Entity, EventEmitter, Focusable, Render, Subscription, Window,
 };
-use project::DisableAiSettings;
-use settings::{Settings, SettingsStore};
+use settings::SettingsStore;
 use ui::{
     ButtonStyle, ContextMenu, IconButton, IconName, IconSize, PopoverMenu, PopoverMenuHandle,
     Tooltip, prelude::*,
 };
 use workspace::{ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, item::ItemHandle};
-use zed_actions::{agent::AddSelectionToThread, outline::ToggleOutline};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SelectionControlsMenuOptions {
-    pub include_agent_thread: bool,
-    pub include_navigation: bool,
-    pub include_diagnostics: bool,
-    pub include_diff_hunks: bool,
-    pub include_line_move_actions: bool,
     pub include_duplicate_selection: bool,
 }
 
 impl SelectionControlsMenuOptions {
     pub const fn core() -> Self {
         Self {
-            include_agent_thread: false,
-            include_navigation: false,
-            include_diagnostics: false,
-            include_diff_hunks: false,
-            include_line_move_actions: false,
             include_duplicate_selection: true,
         }
     }
 
-    pub const fn zed_quick_action_bar() -> Self {
+    pub const fn without_duplicate_selection() -> Self {
         Self {
-            include_agent_thread: true,
-            include_navigation: true,
-            include_diagnostics: true,
-            include_diff_hunks: true,
-            include_line_move_actions: true,
-            include_duplicate_selection: true,
+            include_duplicate_selection: false,
         }
     }
+}
+
+pub fn selection_controls_menu_items(
+    menu: ContextMenu,
+    options: SelectionControlsMenuOptions,
+) -> ContextMenu {
+    menu.action("Select All", Box::new(SelectAll))
+        .action(
+            "Select Next Occurrence",
+            Box::new(SelectNext {
+                replace_newest: false,
+            }),
+        )
+        .action("Expand Selection", Box::new(SelectLargerSyntaxNode))
+        .action("Shrink Selection", Box::new(SelectSmallerSyntaxNode))
+        .action(
+            "Add Cursor Above",
+            Box::new(AddSelectionAbove {
+                skip_soft_wrap: true,
+            }),
+        )
+        .action(
+            "Add Cursor Below",
+            Box::new(AddSelectionBelow {
+                skip_soft_wrap: true,
+            }),
+        )
+        .when(options.include_duplicate_selection, |this| {
+            this.separator()
+                .action("Duplicate Selection", Box::new(DuplicateLineDown))
+        })
 }
 
 pub fn selection_controls_menu(
@@ -59,87 +72,17 @@ pub fn selection_controls_menu(
     cx: &mut App,
 ) -> Entity<ContextMenu> {
     let focus = editor.read(cx).focus_handle(cx);
-    let has_selection = editor.update(cx, |editor, cx| {
-        editor.has_non_empty_selection(&editor.display_snapshot(cx))
-    });
-    let has_diff_hunks = options.include_diff_hunks
-        && editor
-            .read(cx)
-            .buffer()
-            .read(cx)
-            .snapshot(cx)
-            .has_diff_hunks();
-    let disable_ai = DisableAiSettings::get_global(cx).disable_ai;
 
     ContextMenu::build(window, cx, move |menu, _, _| {
-        menu.context(focus.clone())
-            .action("Select All", Box::new(SelectAll))
-            .action(
-                "Select Next Occurrence",
-                Box::new(SelectNext {
-                    replace_newest: false,
-                }),
-            )
-            .action("Expand Selection", Box::new(SelectLargerSyntaxNode))
-            .action("Shrink Selection", Box::new(SelectSmallerSyntaxNode))
-            .action(
-                "Add Cursor Above",
-                Box::new(AddSelectionAbove {
-                    skip_soft_wrap: true,
-                }),
-            )
-            .action(
-                "Add Cursor Below",
-                Box::new(AddSelectionBelow {
-                    skip_soft_wrap: true,
-                }),
-            )
-            .when(options.include_agent_thread && !disable_ai, |this| {
-                this.separator().action_disabled_when(
-                    !has_selection,
-                    "Add to Agent Thread",
-                    Box::new(AddSelectionToThread),
-                )
-            })
-            .when(options.include_navigation, |this| {
-                this.separator()
-                    .action("Go to Symbol", Box::new(ToggleOutline))
-                    .action("Go to Line/Column", Box::new(ToggleGoToLine))
-            })
-            .when(options.include_diagnostics, |this| {
-                this.separator()
-                    .action("Next Problem", Box::new(GoToDiagnostic::default()))
-                    .action(
-                        "Previous Problem",
-                        Box::new(GoToPreviousDiagnostic::default()),
-                    )
-            })
-            .when(options.include_diff_hunks, |this| {
-                this.separator()
-                    .action_disabled_when(!has_diff_hunks, "Next Hunk", Box::new(GoToHunk))
-                    .action_disabled_when(
-                        !has_diff_hunks,
-                        "Previous Hunk",
-                        Box::new(GoToPreviousHunk),
-                    )
-            })
-            .when(options.include_line_move_actions, |this| {
-                this.separator()
-                    .action("Move Line Up", Box::new(MoveLineUp))
-                    .action("Move Line Down", Box::new(MoveLineDown))
-            })
-            .when(options.include_duplicate_selection, |this| {
-                this.action("Duplicate Selection", Box::new(DuplicateLineDown))
-            })
+        selection_controls_menu_items(menu.context(focus.clone()), options)
     })
 }
 
-pub fn selection_controls_popover(
+pub fn selection_controls_popover_with_menu(
     menu_id: impl Into<ElementId>,
     trigger_id: impl Into<ElementId>,
-    editor: Entity<Editor>,
-    options: SelectionControlsMenuOptions,
     handle: PopoverMenuHandle<ContextMenu>,
+    build_menu: impl Fn(&mut Window, &mut App) -> Option<Entity<ContextMenu>> + 'static,
 ) -> PopoverMenu<ContextMenu> {
     PopoverMenu::new(menu_id)
         .trigger_with_tooltip(
@@ -151,7 +94,19 @@ pub fn selection_controls_popover(
         )
         .with_handle(handle)
         .anchor(gpui::Anchor::TopRight)
-        .menu(move |window, cx| Some(selection_controls_menu(editor.clone(), options, window, cx)))
+        .menu(build_menu)
+}
+
+pub fn selection_controls_popover(
+    menu_id: impl Into<ElementId>,
+    trigger_id: impl Into<ElementId>,
+    editor: Entity<Editor>,
+    options: SelectionControlsMenuOptions,
+    handle: PopoverMenuHandle<ContextMenu>,
+) -> PopoverMenu<ContextMenu> {
+    selection_controls_popover_with_menu(menu_id, trigger_id, handle, move |window, cx| {
+        Some(selection_controls_menu(editor.clone(), options, window, cx))
+    })
 }
 
 pub struct EditorSelectionControls {
