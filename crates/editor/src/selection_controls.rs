@@ -1,5 +1,5 @@
 use crate::{
-    Editor,
+    Editor, EditorEvent,
     actions::{
         AddSelectionAbove, AddSelectionBelow, DuplicateLineDown, SelectAll, SelectLargerSyntaxNode,
         SelectNext, SelectSmallerSyntaxNode,
@@ -113,6 +113,7 @@ pub struct EditorSelectionControls {
     active_item: Option<Box<dyn ItemHandle>>,
     handle: PopoverMenuHandle<ContextMenu>,
     options: SelectionControlsMenuOptions,
+    active_editor_subscription: Option<Subscription>,
     _settings_subscription: Subscription,
 }
 
@@ -133,6 +134,7 @@ impl EditorSelectionControls {
             active_item: None,
             handle: Default::default(),
             options,
+            active_editor_subscription: None,
             _settings_subscription: settings_subscription,
         }
     }
@@ -152,6 +154,26 @@ impl EditorSelectionControls {
         } else {
             ToolbarItemLocation::Hidden
         }
+    }
+
+    fn subscribe_to_active_editor(&mut self, cx: &mut Context<Self>) {
+        self.active_editor_subscription.take();
+
+        let Some(editor) = self.active_editor() else {
+            return;
+        };
+
+        self.active_editor_subscription = Some(cx.subscribe(
+            &editor,
+            |this, _editor, event: &EditorEvent, cx| {
+                if matches!(event, EditorEvent::SelectionMenuChanged) {
+                    cx.emit(ToolbarItemEvent::ChangeLocation(
+                        this.toolbar_item_location(cx),
+                    ));
+                    cx.notify();
+                }
+            },
+        ));
     }
 }
 
@@ -190,6 +212,69 @@ impl ToolbarItemView for EditorSelectionControls {
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
         self.active_item = active_pane_item.map(ItemHandle::boxed_clone);
+        self.subscribe_to_active_editor(cx);
         self.toolbar_item_location(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{actions::ToggleSelectionMenu, test::build_editor};
+    use gpui::TestAppContext;
+    use multi_buffer::MultiBuffer;
+    use std::{cell::RefCell, rc::Rc};
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            crate::init(cx);
+        });
+        zlog::init_test();
+    }
+
+    #[gpui::test]
+    async fn selection_menu_toggle_updates_toolbar_location(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            let buffer = MultiBuffer::build_simple("abc", cx);
+            build_editor(buffer, window, cx)
+        });
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let controls = cx.new({
+            let events = events.clone();
+            |cx| {
+                cx.subscribe(&cx.entity(), move |_, _, event: &ToolbarItemEvent, _| {
+                    let ToolbarItemEvent::ChangeLocation(location) = event;
+                    events.borrow_mut().push(*location);
+                })
+                .detach();
+                EditorSelectionControls::new(cx)
+            }
+        });
+
+        controls.update_in(cx, |controls, window, cx| {
+            let active_item: &dyn ItemHandle = &editor;
+            assert_eq!(
+                controls.set_active_pane_item(Some(active_item), window, cx),
+                ToolbarItemLocation::PrimaryRight
+            );
+        });
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.toggle_selection_menu(&ToggleSelectionMenu, window, cx);
+        });
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[ToolbarItemLocation::Hidden],
+            "toggling the active editor's per-buffer selection menu must move the toolbar item"
+        );
     }
 }

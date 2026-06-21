@@ -2778,11 +2778,15 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let was_enabled = self.selection_menu_enabled(cx);
         self.show_selection_menu = self
             .show_selection_menu
             .map(|show_selections_menu| !show_selections_menu)
             .or_else(|| Some(!EditorSettings::get_global(cx).toolbar.selections_menu));
 
+        if self.selection_menu_enabled(cx) != was_enabled {
+            cx.emit(EditorEvent::SelectionMenuChanged);
+        }
         cx.notify();
     }
 
@@ -11688,6 +11692,7 @@ pub enum EditorEvent {
     Saved,
     TitleChanged,
     FileHandleChanged,
+    SelectionMenuChanged,
     SelectionsChanged {
         local: bool,
     },
