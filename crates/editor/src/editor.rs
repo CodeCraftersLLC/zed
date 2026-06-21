@@ -41,6 +41,7 @@ mod persistence;
 mod runnables;
 mod rust_analyzer_ext;
 pub mod scroll;
+pub mod selection_controls;
 mod selections_collection;
 pub mod semantic_tokens;
 mod split;
