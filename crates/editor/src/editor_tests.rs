@@ -843,6 +843,7 @@ fn test_clone(cx: &mut TestAppContext) {
     });
 
     _ = editor.update(cx, |editor, window, cx| {
+        editor.set_surface_policy(EditorSurfacePolicy::embedded(), cx);
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
             s.select_ranges(
                 selection_ranges
@@ -915,6 +916,24 @@ fn test_clone(cx: &mut TestAppContext) {
                 .display_ranges(&e.display_snapshot(cx)))
             .unwrap()
     );
+    assert_eq!(
+        cloned_editor
+            .update(cx, |editor, _, _| editor.surface_policy)
+            .unwrap(),
+        EditorSurfacePolicy::embedded()
+    );
+}
+
+#[test]
+fn test_embedded_surface_policy_hides_host_owned_actions() {
+    let policy = EditorSurfacePolicy::embedded();
+
+    assert!(!policy.show_language_actions);
+    assert!(!policy.show_agent_actions);
+    assert!(!policy.show_preview_actions);
+    assert!(!policy.show_terminal_actions);
+    assert!(!policy.show_git_actions);
+    assert_eq!(EditorSurfacePolicy::default(), EditorSurfacePolicy::full());
 }
 
 #[gpui::test]

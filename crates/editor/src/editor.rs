@@ -41,6 +41,7 @@ mod persistence;
 mod runnables;
 mod rust_analyzer_ext;
 pub mod scroll;
+pub mod selection_controls;
 mod selections_collection;
 pub mod semantic_tokens;
 mod split;
@@ -594,6 +595,50 @@ pub struct ContextMenuOptions {
     pub placement: Option<ContextMenuPlacement>,
 }
 
+/// Controls which context-menu action groups are shown for an editor surface.
+///
+/// The default policy preserves normal Zed behavior. Embedded hosts, such as
+/// Cherrypick, can install a restricted policy when the host owns those actions
+/// or intentionally omits them from its file-editor surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EditorSurfacePolicy {
+    pub show_language_actions: bool,
+    pub show_agent_actions: bool,
+    pub show_preview_actions: bool,
+    pub show_terminal_actions: bool,
+    pub show_git_actions: bool,
+}
+
+impl EditorSurfacePolicy {
+    /// Shows every action group used by the standard Zed editor.
+    pub const fn full() -> Self {
+        Self {
+            show_language_actions: true,
+            show_agent_actions: true,
+            show_preview_actions: true,
+            show_terminal_actions: true,
+            show_git_actions: true,
+        }
+    }
+
+    /// Hides action groups that are handled by, or unavailable in, an embedded host.
+    pub const fn embedded() -> Self {
+        Self {
+            show_language_actions: false,
+            show_agent_actions: false,
+            show_preview_actions: false,
+            show_terminal_actions: false,
+            show_git_actions: false,
+        }
+    }
+}
+
+impl Default for EditorSurfacePolicy {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuPlacement {
     Above,
@@ -1080,6 +1125,7 @@ pub struct Editor {
     show_selection_menu: Option<bool>,
     blame: Option<Entity<GitBlame>>,
     blame_subscription: Option<Subscription>,
+    surface_policy: EditorSurfacePolicy,
     custom_context_menu: Option<
         Box<
             dyn 'static
@@ -1736,6 +1782,7 @@ impl Editor {
         clone.needs_initial_data_update = self.enable_lsp_data;
         clone.enable_runnables = self.enable_runnables;
         clone.enable_code_lens = self.enable_code_lens;
+        clone.surface_policy = self.surface_policy;
         clone
     }
 
@@ -2305,6 +2352,7 @@ impl Editor {
             }),
             blame: None,
             blame_subscription: None,
+            surface_policy: EditorSurfacePolicy::default(),
 
             bookmark_store,
             breakpoint_store,
@@ -2730,11 +2778,15 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let was_enabled = self.selection_menu_enabled(cx);
         self.show_selection_menu = self
             .show_selection_menu
             .map(|show_selections_menu| !show_selections_menu)
             .or_else(|| Some(!EditorSettings::get_global(cx).toolbar.selections_menu));
 
+        if self.selection_menu_enabled(cx) != was_enabled {
+            cx.emit(EditorEvent::SelectionMenuChanged);
+        }
         cx.notify();
     }
 
@@ -2962,6 +3014,18 @@ impl Editor {
 
     pub fn set_in_project_search(&mut self, in_project_search: bool) {
         self.in_project_search = in_project_search;
+    }
+
+    /// Updates context-menu action visibility for this editor surface.
+    ///
+    /// Standalone Zed leaves the default policy in place; embedded hosts call
+    /// this to hide actions that the host owns or does not expose.
+    pub fn set_surface_policy(&mut self, policy: EditorSurfacePolicy, cx: &mut Context<Self>) {
+        if self.surface_policy == policy {
+            return;
+        }
+        self.surface_policy = policy;
+        cx.notify();
     }
 
     pub fn set_custom_context_menu(
@@ -11628,6 +11692,7 @@ pub enum EditorEvent {
     Saved,
     TitleChanged,
     FileHandleChanged,
+    SelectionMenuChanged,
     SelectionsChanged {
         local: bool,
     },

@@ -84,17 +84,7 @@ impl FileFinder {
     ) {
         workspace.register_action(
             |workspace, action: &workspace::ToggleFileFinder, window, cx| {
-                let Some(file_finder) = workspace.active_modal::<Self>(cx) else {
-                    Self::open(workspace, action.separate_history, window, cx).detach();
-                    return;
-                };
-
-                file_finder.update(cx, |file_finder, cx| {
-                    file_finder.init_modifiers = Some(window.modifiers());
-                    file_finder.picker.update(cx, |picker, cx| {
-                        picker.cycle_selection(window, cx);
-                    });
-                });
+                toggle_file_finder(workspace, action.separate_history, window, cx);
             },
         );
     }
@@ -330,6 +320,30 @@ impl FileFinder {
             FileFinderWidth::Medium => (window_width - px(1024.)).max(small_width),
         }
     }
+}
+
+/// Toggle the file finder modal for a workspace.
+///
+/// This preserves the behavior of the registered `ToggleFileFinder` action:
+/// open the modal when it is absent, or cycle the existing picker selection
+/// when the file finder is already active.
+pub fn toggle_file_finder(
+    workspace: &mut Workspace,
+    separate_history: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(file_finder) = workspace.active_modal::<FileFinder>(cx) else {
+        FileFinder::open(workspace, separate_history, window, cx).detach();
+        return;
+    };
+
+    file_finder.update(cx, |file_finder, cx| {
+        file_finder.init_modifiers = Some(window.modifiers());
+        file_finder.picker.update(cx, |picker, cx| {
+            picker.cycle_selection(window, cx);
+        });
+    });
 }
 
 impl EventEmitter<DismissEvent> for FileFinder {}

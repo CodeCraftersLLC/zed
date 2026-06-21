@@ -3,12 +3,15 @@ mod repl_menu;
 
 use agent_settings::AgentSettings;
 use editor::actions::{
-    AddSelectionAbove, AddSelectionBelow, CodeActionSource, DuplicateLineDown, GoToDiagnostic,
-    GoToHunk, GoToPreviousDiagnostic, GoToPreviousHunk, MoveLineDown, MoveLineUp, SelectAll,
-    SelectLargerSyntaxNode, SelectNext, SelectSmallerSyntaxNode, ToggleCodeActions,
-    ToggleDiagnostics, ToggleGoToLine, ToggleInlineDiagnostics,
+    CodeActionSource, DuplicateLineDown, GoToDiagnostic, GoToHunk, GoToPreviousDiagnostic,
+    GoToPreviousHunk, MoveLineDown, MoveLineUp, ToggleCodeActions, ToggleDiagnostics,
+    ToggleGoToLine, ToggleInlineDiagnostics,
 };
 use editor::code_context_menus::{CodeContextMenu, ContextMenuOrigin};
+use editor::selection_controls::{
+    SelectionControlsMenuOptions, selection_controls_menu_items,
+    selection_controls_popover_with_menu,
+};
 use editor::{Editor, EditorSettings};
 use gpui::{
     Action, Anchor, AnchoredPositionMode, ClickEvent, Context, ElementId, Entity, EventEmitter,
@@ -247,76 +250,50 @@ impl Render for QuickActionBar {
             let has_selection = editor.update(cx, |editor, cx| {
                 editor.has_non_empty_selection(&editor.display_snapshot(cx))
             });
-
             let focus = editor.focus_handle(cx);
-
             let disable_ai = DisableAiSettings::get_global(cx).disable_ai;
 
-            PopoverMenu::new("editor-selections-dropdown")
-                .trigger_with_tooltip(
-                    IconButton::new("toggle_editor_selections_icon", IconName::CursorIBeam)
-                        .icon_size(IconSize::Small)
-                        .style(ButtonStyle::Subtle)
-                        .toggle_state(self.toggle_selections_handle.is_deployed()),
-                    Tooltip::text("Selection Controls"),
-                )
-                .with_handle(self.toggle_selections_handle.clone())
-                .anchor(Anchor::TopRight)
-                .menu(move |window, cx| {
+            selection_controls_popover_with_menu(
+                "editor-selections-dropdown",
+                "toggle_editor_selections_icon",
+                self.toggle_selections_handle.clone(),
+                move |window, cx| {
                     let focus = focus.clone();
-                    let menu = ContextMenu::build(window, cx, move |menu, _, _| {
-                        menu.context(focus.clone())
-                            .action("Select All", Box::new(SelectAll))
-                            .action(
-                                "Select Next Occurrence",
-                                Box::new(SelectNext {
-                                    replace_newest: false,
-                                }),
+                    Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                        selection_controls_menu_items(
+                            menu.context(focus.clone()),
+                            SelectionControlsMenuOptions::without_duplicate_selection(),
+                        )
+                        .when(!disable_ai, |this| {
+                            this.separator().action_disabled_when(
+                                !has_selection,
+                                "Add to Agent Thread",
+                                Box::new(AddSelectionToThread),
                             )
-                            .action("Expand Selection", Box::new(SelectLargerSyntaxNode))
-                            .action("Shrink Selection", Box::new(SelectSmallerSyntaxNode))
-                            .action(
-                                "Add Cursor Above",
-                                Box::new(AddSelectionAbove {
-                                    skip_soft_wrap: true,
-                                }),
-                            )
-                            .action(
-                                "Add Cursor Below",
-                                Box::new(AddSelectionBelow {
-                                    skip_soft_wrap: true,
-                                }),
-                            )
-                            .when(!disable_ai, |this| {
-                                this.separator().action_disabled_when(
-                                    !has_selection,
-                                    "Add to Agent Thread",
-                                    Box::new(AddSelectionToThread),
-                                )
-                            })
-                            .separator()
-                            .action("Go to Symbol", Box::new(ToggleOutline))
-                            .action("Go to Line/Column", Box::new(ToggleGoToLine))
-                            .separator()
-                            .action("Next Problem", Box::new(GoToDiagnostic::default()))
-                            .action(
-                                "Previous Problem",
-                                Box::new(GoToPreviousDiagnostic::default()),
-                            )
-                            .separator()
-                            .action_disabled_when(!has_diff_hunks, "Next Hunk", Box::new(GoToHunk))
-                            .action_disabled_when(
-                                !has_diff_hunks,
-                                "Previous Hunk",
-                                Box::new(GoToPreviousHunk),
-                            )
-                            .separator()
-                            .action("Move Line Up", Box::new(MoveLineUp))
-                            .action("Move Line Down", Box::new(MoveLineDown))
-                            .action("Duplicate Selection", Box::new(DuplicateLineDown))
-                    });
-                    Some(menu)
-                })
+                        })
+                        .separator()
+                        .action("Go to Symbol", Box::new(ToggleOutline))
+                        .action("Go to Line/Column", Box::new(ToggleGoToLine))
+                        .separator()
+                        .action("Next Problem", Box::new(GoToDiagnostic::default()))
+                        .action(
+                            "Previous Problem",
+                            Box::new(GoToPreviousDiagnostic::default()),
+                        )
+                        .separator()
+                        .action_disabled_when(!has_diff_hunks, "Next Hunk", Box::new(GoToHunk))
+                        .action_disabled_when(
+                            !has_diff_hunks,
+                            "Previous Hunk",
+                            Box::new(GoToPreviousHunk),
+                        )
+                        .separator()
+                        .action("Move Line Up", Box::new(MoveLineUp))
+                        .action("Move Line Down", Box::new(MoveLineDown))
+                        .action("Duplicate Selection", Box::new(DuplicateLineDown))
+                    }))
+                },
+            )
         });
 
         let editor_focus_handle = editor.focus_handle(cx);

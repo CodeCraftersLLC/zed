@@ -21,6 +21,21 @@ use workspace::{
     register_project_item,
 };
 
+#[test]
+fn test_embedded_project_panel_context_menu_policy_hides_host_owned_actions() {
+    let policy = ProjectPanelContextMenuPolicy::embedded();
+
+    assert!(!policy.show_terminal_actions);
+    assert!(!policy.show_search_actions);
+    assert!(!policy.show_compare_actions);
+    assert!(!policy.show_git_actions);
+    assert!(!policy.show_workspace_folder_actions);
+    assert_eq!(
+        ProjectPanelContextMenuPolicy::default(),
+        ProjectPanelContextMenuPolicy::full()
+    );
+}
+
 #[gpui::test]
 async fn test_visible_list(cx: &mut gpui::TestAppContext) {
     init_test(cx);
@@ -5576,6 +5591,62 @@ async fn test_gitignored_and_always_included(cx: &mut gpui::TestAppContext) {
             "      .gitignore",
         ],
         "When auto reveal is enabled, a gitignored but always included selected entry should be revealed in the project panel"
+    );
+}
+
+#[gpui::test]
+async fn test_reveal_abs_path_seeds_missing_expanded_state(cx: &mut gpui::TestAppContext) {
+    init_test_with_editor(cx);
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/project_root",
+        json!({
+            ".git": {},
+            "dir_1": {
+                "nested": {
+                    "file_1.py": "# File contents",
+                },
+            },
+            "dir_2": {
+                "file_2.py": "# File contents",
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/project_root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.state.expanded_dir_ids.clear();
+        panel
+            .reveal_abs_path(
+                Path::new("/project_root/dir_1/nested/file_1.py"),
+                window,
+                cx,
+            )
+            .unwrap();
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..20, cx),
+        &[
+            "v project_root",
+            "    > .git",
+            "    v dir_1",
+            "        v nested",
+            "              file_1.py  <== selected  <== marked",
+            "    > dir_2",
+        ],
+        "absolute-path reveal should seed the worktree root before expanding ancestors"
     );
 }
 
