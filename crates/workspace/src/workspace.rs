@@ -7894,6 +7894,14 @@ impl Workspace {
         self.modal_layer.read(cx).active_modal()
     }
 
+    /// Returns the workspace modal layer entity.
+    ///
+    /// Embedders that render a `Workspace` outside of `MultiWorkspace` can use
+    /// this to render workspace-owned modals such as the file finder.
+    pub fn modal_layer(&self) -> Entity<ModalLayer> {
+        self.modal_layer.clone()
+    }
+
     /// Toggles a modal of type `V`. If a modal of the same type is currently active,
     /// it will be hidden. If a different modal is active, it will be replaced with the new one.
     /// If no modal is active, the new modal will be shown.
