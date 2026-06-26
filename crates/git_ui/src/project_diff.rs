@@ -83,6 +83,7 @@ pub struct ProjectDiff {
     multibuffer: Entity<MultiBuffer>,
     branch_diff: Entity<branch_diff::BranchDiff>,
     editor: Entity<SplittableEditor>,
+    options: ProjectDiffOptions,
     buffer_subscriptions: HashMap<Arc<RelPath>, BufferSubscriptions>,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -95,6 +96,33 @@ pub struct ProjectDiff {
 const CONFLICT_SORT_PREFIX: u64 = 1;
 const TRACKED_SORT_PREFIX: u64 = 2;
 const NEW_SORT_PREFIX: u64 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectDiffOptions {
+    pub enable_hunk_controls: bool,
+    pub show_review_button: bool,
+    pub register_git_panel_addon: bool,
+}
+
+impl ProjectDiffOptions {
+    pub const fn embedded_view_only() -> Self {
+        Self {
+            enable_hunk_controls: false,
+            show_review_button: false,
+            register_git_panel_addon: false,
+        }
+    }
+}
+
+impl Default for ProjectDiffOptions {
+    fn default() -> Self {
+        Self {
+            enable_hunk_controls: true,
+            show_review_button: true,
+            register_git_panel_addon: true,
+        }
+    }
+}
 
 impl ProjectDiff {
     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
@@ -332,6 +360,16 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        Self::deploy_at_with_options(workspace, entry, ProjectDiffOptions::default(), window, cx);
+    }
+
+    pub fn deploy_at_with_options(
+        workspace: &mut Workspace,
+        entry: Option<GitStatusEntry>,
+        options: ProjectDiffOptions,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         telemetry::event!(
             "Git Diff Opened",
             source = if entry.is_some() {
@@ -342,9 +380,10 @@ impl ProjectDiff {
         );
         let intended_repo = workspace.project().read(cx).active_repository(cx);
 
-        let existing = workspace
-            .items_of_type::<Self>(cx)
-            .find(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Head));
+        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+            let item = item.read(cx);
+            matches!(item.diff_base(cx), DiffBase::Head) && item.options == options
+        });
         let project_diff = if let Some(existing) = existing {
             existing.update(cx, |project_diff, cx| {
                 project_diff.move_to_beginning(window, cx);
@@ -354,8 +393,15 @@ impl ProjectDiff {
             existing
         } else {
             let workspace_handle = cx.entity();
-            let project_diff =
-                cx.new(|cx| Self::new(workspace.project().clone(), workspace_handle, window, cx));
+            let project_diff = cx.new(|cx| {
+                Self::new_with_options(
+                    workspace.project().clone(),
+                    workspace_handle,
+                    options,
+                    window,
+                    cx,
+                )
+            });
             workspace.add_item_to_active_pane(
                 Box::new(project_diff.clone()),
                 None,
@@ -395,17 +441,41 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        Self::deploy_at_project_path_with_options(
+            workspace,
+            project_path,
+            ProjectDiffOptions::default(),
+            window,
+            cx,
+        );
+    }
+
+    pub fn deploy_at_project_path_with_options(
+        workspace: &mut Workspace,
+        project_path: ProjectPath,
+        options: ProjectDiffOptions,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         telemetry::event!("Git Diff Opened", source = "Agent Panel");
-        let existing = workspace
-            .items_of_type::<Self>(cx)
-            .find(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Head));
+        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+            let item = item.read(cx);
+            matches!(item.diff_base(cx), DiffBase::Head) && item.options == options
+        });
         let project_diff = if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
             existing
         } else {
             let workspace_handle = cx.entity();
-            let project_diff =
-                cx.new(|cx| Self::new(workspace.project().clone(), workspace_handle, window, cx));
+            let project_diff = cx.new(|cx| {
+                Self::new_with_options(
+                    workspace.project().clone(),
+                    workspace_handle,
+                    options,
+                    window,
+                    cx,
+                )
+            });
             workspace.add_item_to_active_pane(
                 Box::new(project_diff.clone()),
                 None,
@@ -458,7 +528,14 @@ impl ProjectDiff {
                 branch_diff
             })?;
             cx.new_window_entity(|window, cx| {
-                Self::new_impl(branch_diff, project, workspace, window, cx)
+                Self::new_impl(
+                    branch_diff,
+                    project,
+                    workspace,
+                    ProjectDiffOptions::default(),
+                    window,
+                    cx,
+                )
             })
         })
     }
@@ -483,7 +560,14 @@ impl ProjectDiff {
                 branch_diff
             })?;
             cx.new_window_entity(|window, cx| {
-                Self::new_impl(branch_diff, project, workspace, window, cx)
+                Self::new_impl(
+                    branch_diff,
+                    project,
+                    workspace,
+                    ProjectDiffOptions::default(),
+                    window,
+                    cx,
+                )
             })
         })
     }
@@ -494,15 +578,32 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_options(
+            project,
+            workspace,
+            ProjectDiffOptions::default(),
+            window,
+            cx,
+        )
+    }
+
+    fn new_with_options(
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        options: ProjectDiffOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let branch_diff =
             cx.new(|cx| branch_diff::BranchDiff::new(DiffBase::Head, project.clone(), window, cx));
-        Self::new_impl(branch_diff, project, workspace, window, cx)
+        Self::new_impl(branch_diff, project, workspace, options, window, cx)
     }
 
     fn new_impl(
         branch_diff: Entity<branch_diff::BranchDiff>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
+        options: ProjectDiffOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -522,19 +623,20 @@ impl ProjectDiff {
                 window,
                 cx,
             );
-            match branch_diff.read(cx).diff_base() {
-                DiffBase::Head => {}
-                DiffBase::Merge { .. } => diff_display_editor.disable_diff_hunk_controls(cx),
+            let diff_base = branch_diff.read(cx).diff_base().clone();
+            if !options.enable_hunk_controls || matches!(&diff_base, DiffBase::Merge { .. }) {
+                diff_display_editor.disable_diff_hunk_controls(cx);
             }
             diff_display_editor.rhs_editor().update(cx, |editor, cx| {
-                editor.set_show_diff_review_button(true, cx);
+                editor.set_show_diff_review_button(options.show_review_button, cx);
 
-                match branch_diff.read(cx).diff_base() {
-                    DiffBase::Head => {
+                match diff_base {
+                    DiffBase::Head if options.register_git_panel_addon => {
                         editor.register_addon(GitPanelAddon {
                             workspace: workspace.downgrade(),
                         });
                     }
+                    DiffBase::Head => {}
                     DiffBase::Merge { .. } => {
                         editor.register_addon(BranchDiffAddon {
                             branch_diff: branch_diff.clone(),
@@ -608,6 +710,7 @@ impl ProjectDiff {
             branch_diff,
             focus_handle,
             editor,
+            options,
             multibuffer,
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
@@ -1423,9 +1526,16 @@ impl SerializableItem for ProjectDiff {
                 let branch_diff = cx
                     .new(|cx| branch_diff::BranchDiff::new(diff_base, project.clone(), window, cx));
                 let workspace = workspace.upgrade().context("workspace gone")?;
-                anyhow::Ok(
-                    cx.new(|cx| ProjectDiff::new_impl(branch_diff, project, workspace, window, cx)),
-                )
+                anyhow::Ok(cx.new(|cx| {
+                    ProjectDiff::new_impl(
+                        branch_diff,
+                        project,
+                        workspace,
+                        ProjectDiffOptions::default(),
+                        window,
+                        cx,
+                    )
+                }))
             })??;
 
             Ok(diff)
