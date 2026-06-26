@@ -25,7 +25,7 @@ use crate::{SharedString, TasksIncluded, WindowId};
 /// `#[cold]` gives the optimizer the same "this branch is unlikely" hint with no
 /// behavioral effect, so callers can mark improbable paths on a stable toolchain.
 #[cold]
-#[inline]
+#[inline(never)]
 pub(crate) fn cold_path() {}
 
 #[cfg(feature = "profiler")]

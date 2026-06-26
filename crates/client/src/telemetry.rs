@@ -191,6 +191,16 @@ pub fn os_version() -> String {
             "unknown".to_string()
         }
     }
+    #[cfg(not(any(
+        feature = "test-support",
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows",
+    )))]
+    {
+        "unknown".to_string()
+    }
 }
 
 impl Telemetry {
