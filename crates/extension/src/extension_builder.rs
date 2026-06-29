@@ -33,15 +33,50 @@ const RUST_TARGET: &str = "wasm32-wasip2";
 /// Once Clang 17 and its wasm target are available via system package managers, we won't need
 /// to download this.
 const WASI_SDK_URL: &str = "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/";
-const WASI_SDK_ASSET_NAME: Option<&str> = cfg_select! {
-    all(target_os = "macos", target_arch = "x86_64") => Some("wasi-sdk-25.0-x86_64-macos.tar.gz"),
-    all(target_os = "macos", target_arch = "aarch64") => Some("wasi-sdk-25.0-arm64-macos.tar.gz"),
-    all(target_os = "linux", target_arch = "x86_64") => Some("wasi-sdk-25.0-x86_64-linux.tar.gz"),
-    all(target_os = "linux", target_arch = "aarch64") => Some("wasi-sdk-25.0-arm64-linux.tar.gz"),
-    all(target_os = "freebsd", target_arch = "x86_64") => Some("wasi-sdk-25.0-x86_64-linux.tar.gz"),
-    all(target_os = "freebsd", target_arch = "aarch64") => Some("wasi-sdk-25.0-arm64-linux.tar.gz"),
-    all(target_os = "windows", target_arch = "x86_64") => Some("wasi-sdk-25.0-x86_64-windows.tar.gz"),
-    _ => None
+// Stable replacement for the unstable `cfg_select!` macro (rust-lang/rust#115585).
+// Each arm is a mutually-exclusive `#[cfg]` block; the `None` fallback is guarded by
+// `not(any(..))` of every explicit arm so exactly one block survives cfg expansion.
+const WASI_SDK_ASSET_NAME: Option<&str> = {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Some("wasi-sdk-25.0-x86_64-macos.tar.gz")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some("wasi-sdk-25.0-arm64-macos.tar.gz")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some("wasi-sdk-25.0-x86_64-linux.tar.gz")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        Some("wasi-sdk-25.0-arm64-linux.tar.gz")
+    }
+    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    {
+        Some("wasi-sdk-25.0-x86_64-linux.tar.gz")
+    }
+    #[cfg(all(target_os = "freebsd", target_arch = "aarch64"))]
+    {
+        Some("wasi-sdk-25.0-arm64-linux.tar.gz")
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        Some("wasi-sdk-25.0-x86_64-windows.tar.gz")
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "freebsd", target_arch = "x86_64"),
+        all(target_os = "freebsd", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64"),
+    )))]
+    {
+        None
+    }
 };
 
 pub struct ExtensionBuilder {
