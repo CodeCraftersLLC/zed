@@ -471,6 +471,12 @@ impl SplittableEditor {
         });
     }
 
+    pub fn set_delegate_stage_and_restore(&self, delegate: bool, cx: &mut Context<Self>) {
+        self.update_editors(cx, |editor, _cx| {
+            editor.set_delegate_stage_and_restore(delegate);
+        });
+    }
+
     pub fn set_render_diff_hunks_as_unstaged(&self, cx: &mut Context<Self>) {
         self.update_editors(cx, |editor, cx| {
             editor.set_render_diff_hunks_as_unstaged(true, cx);

@@ -75,7 +75,7 @@ struct BufferSubscriptions {
     _diff: Entity<BufferDiff>,
     _diff_subscription: Subscription,
     _conflict_set: Entity<ConflictSet>,
-    _conflict_set_subscription: Subscription,
+    _conflict_set_subscription: Option<Subscription>,
 }
 
 pub struct ProjectDiff {
@@ -102,6 +102,8 @@ pub struct ProjectDiffOptions {
     pub enable_hunk_controls: bool,
     pub show_review_button: bool,
     pub register_git_panel_addon: bool,
+    pub allow_index_mutations: bool,
+    pub enable_conflict_view: bool,
 }
 
 impl ProjectDiffOptions {
@@ -110,6 +112,8 @@ impl ProjectDiffOptions {
             enable_hunk_controls: false,
             show_review_button: false,
             register_git_panel_addon: false,
+            allow_index_mutations: false,
+            enable_conflict_view: false,
         }
     }
 }
@@ -120,6 +124,8 @@ impl Default for ProjectDiffOptions {
             enable_hunk_controls: true,
             show_review_button: true,
             register_git_panel_addon: true,
+            allow_index_mutations: true,
+            enable_conflict_view: true,
         }
     }
 }
@@ -627,6 +633,9 @@ impl ProjectDiff {
             if !options.enable_hunk_controls || matches!(&diff_base, DiffBase::Merge { .. }) {
                 diff_display_editor.disable_diff_hunk_controls(cx);
             }
+            if !options.allow_index_mutations {
+                diff_display_editor.set_delegate_stage_and_restore(true, cx);
+            }
             diff_display_editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_diff_review_button(options.show_review_button, cx);
 
@@ -897,6 +906,13 @@ impl ProjectDiff {
                     })
                     .ok();
             }
+            EditorEvent::StageOrUnstageRequested { .. } | EditorEvent::RestoreRequested { .. }
+                if !self.options.allow_index_mutations =>
+            {
+                // Embedded Cherrypick diffs are view-only. The editor still
+                // receives Zed git keybindings, but delegation routes them here
+                // instead of writing to the index/worktree.
+            }
             EditorEvent::Saved => {
                 self._task =
                     cx.spawn_in(window, async move |this, cx| Self::refresh(this, cx).await);
@@ -942,23 +958,27 @@ impl ProjectDiff {
                 | buffer_diff::BufferDiffEvent::HunksStagedOrUnstaged(_) => {}
             }
         });
-        let conflict_set_subscription = cx.subscribe_in(&conflict_set, window, {
-            let path_key = path_key.clone();
-            let buffer = buffer.clone();
-            let diff = diff.clone();
-            let conflict_set = conflict_set.clone();
-            move |this, _, _, window, cx| {
-                this.buffer_ranges_changed(
-                    path_key.clone(),
-                    file_status,
-                    buffer.clone(),
-                    diff.clone(),
-                    conflict_set.clone(),
-                    window,
-                    cx,
-                )
-            }
-        });
+        let conflict_set_subscription = if self.options.enable_conflict_view {
+            Some(cx.subscribe_in(&conflict_set, window, {
+                let path_key = path_key.clone();
+                let buffer = buffer.clone();
+                let diff = diff.clone();
+                let conflict_set = conflict_set.clone();
+                move |this, _, _, window, cx| {
+                    this.buffer_ranges_changed(
+                        path_key.clone(),
+                        file_status,
+                        buffer.clone(),
+                        diff.clone(),
+                        conflict_set.clone(),
+                        window,
+                        cx,
+                    )
+                }
+            }))
+        } else {
+            None
+        };
         self.buffer_subscriptions.insert(
             path_key.path.clone(),
             BufferSubscriptions {
@@ -994,6 +1014,7 @@ impl ProjectDiff {
         };
 
         let mut needs_fold = None;
+        let enable_conflict_view = self.options.enable_conflict_view;
 
         let (was_empty, is_excerpt_newly_added) = self.editor.update(cx, |editor, cx| {
             let was_empty = editor.rhs_editor().read(cx).buffer().read(cx).is_empty();
@@ -1005,9 +1026,11 @@ impl ProjectDiff {
                 diff,
                 cx,
             );
-            editor.rhs_editor().update(cx, |editor, cx| {
-                conflict_view::buffer_ranges_updated(editor, conflict_set, cx);
-            });
+            if enable_conflict_view {
+                editor.rhs_editor().update(cx, |editor, cx| {
+                    conflict_view::buffer_ranges_updated(editor, conflict_set, cx);
+                });
+            }
             (was_empty, is_newly_added)
         });
 
@@ -1110,12 +1133,15 @@ impl ProjectDiff {
                 }
             }
 
+            let enable_conflict_view = this.options.enable_conflict_view;
             this.editor.update(cx, |editor, cx| {
                 for (path, buffer_id) in previous_paths {
                     this.buffer_subscriptions.remove(&path.path);
-                    editor.rhs_editor().update(cx, |editor, cx| {
-                        conflict_view::buffers_removed(editor, &[buffer_id], cx);
-                    });
+                    if enable_conflict_view {
+                        editor.rhs_editor().update(cx, |editor, cx| {
+                            conflict_view::buffers_removed(editor, &[buffer_id], cx);
+                        });
+                    }
                     let _span = ztracing::info_span!("remove_excerpts_for_path");
                     _span.enter();
                     editor.remove_excerpts_for_path(path, cx);
@@ -1185,6 +1211,10 @@ impl ProjectDiff {
                     .clone()
             })
             .collect()
+    }
+
+    pub fn is_embedded_view_only(&self) -> bool {
+        self.options == ProjectDiffOptions::embedded_view_only()
     }
 }
 
