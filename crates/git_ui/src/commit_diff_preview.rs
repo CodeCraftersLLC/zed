@@ -5,12 +5,16 @@ use gpui::{
     AnyElement, App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, FocusHandle,
     Focusable, Font, IntoElement, Render, SharedString, Task, Window,
 };
-use language::{Buffer, Capability, HighlightedText, OffsetRangeExt, Point};
+use language::{
+    Buffer, Capability, DiskState, File as LanguageFile, HighlightedText, OffsetRangeExt, Point,
+    ReplicaId, TextBuffer,
+};
 use multi_buffer::PathKey;
 use project::{Project, ProjectPath};
+use settings::WorktreeId;
 use std::{
     any::{Any, TypeId},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use ui::{Color, Icon, IconName, Label, LabelCommon as _};
@@ -74,6 +78,75 @@ struct PreviewEntry {
     path: Arc<str>,
     old_text: Option<Arc<str>>,
     new_text: Arc<str>,
+}
+
+struct PreviewBufferFile {
+    path: Arc<RelPath>,
+    full_path: PathBuf,
+    file_name: String,
+}
+
+impl PreviewBufferFile {
+    fn new(display_path: &str) -> Self {
+        let path = display_rel_path(display_path);
+        let file_name = path.file_name().unwrap_or("untitled").to_string();
+        let full_path = path.as_std_path().to_path_buf();
+
+        Self {
+            path,
+            full_path,
+            file_name,
+        }
+    }
+}
+
+impl LanguageFile for PreviewBufferFile {
+    fn as_local(&self) -> Option<&dyn language::LocalFile> {
+        None
+    }
+
+    fn disk_state(&self) -> DiskState {
+        DiskState::Historic { was_deleted: false }
+    }
+
+    fn path(&self) -> &Arc<RelPath> {
+        &self.path
+    }
+
+    fn full_path(&self, _: &App) -> PathBuf {
+        self.full_path.clone()
+    }
+
+    fn path_style(&self, _: &App) -> PathStyle {
+        PathStyle::Posix
+    }
+
+    fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
+        &self.file_name
+    }
+
+    fn worktree_id(&self, _: &App) -> WorktreeId {
+        WorktreeId::from_usize(0)
+    }
+
+    fn to_proto(&self, cx: &App) -> language::proto::File {
+        language::proto::File {
+            worktree_id: self.worktree_id(cx).to_proto(),
+            entry_id: None,
+            path: self.path.as_ref().to_proto(),
+            mtime: None,
+            is_deleted: false,
+            is_historic: true,
+        }
+    }
+
+    fn is_private(&self) -> bool {
+        false
+    }
+
+    fn can_open(&self) -> bool {
+        false
+    }
 }
 
 impl CommitDiffPreviewFile {
@@ -221,7 +294,17 @@ async fn populate_entries(
             .ok();
 
         let buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local(entry.new_text.to_string(), cx);
+            let buffer_file: Arc<dyn LanguageFile> =
+                Arc::new(PreviewBufferFile::new(entry.path.as_ref()));
+            let mut buffer = Buffer::build(
+                TextBuffer::new(
+                    ReplicaId::LOCAL,
+                    cx.entity_id().as_non_zero_u64().into(),
+                    entry.new_text.to_string(),
+                ),
+                Some(buffer_file),
+                Capability::ReadWrite,
+            );
             buffer.set_language(language.clone(), cx);
             buffer
         });
@@ -291,15 +374,14 @@ fn register_entry(
 }
 
 fn display_path_key(index: usize, display_path: &str) -> PathKey {
-    let rel_path = RelPath::new(Path::new(display_path), PathStyle::Posix)
-        .map(|path| path.into_owned().into())
-        .unwrap_or_else(|_| {
-            RelPath::new(Path::new("untitled"), PathStyle::Posix)
-                .unwrap()
-                .into_owned()
-                .into()
-        });
-    PathKey::with_sort_prefix(index as u64, rel_path)
+    PathKey::with_sort_prefix(index as u64, display_rel_path(display_path))
+}
+
+fn display_rel_path(display_path: &str) -> Arc<RelPath> {
+    RelPath::new(Path::new(display_path), PathStyle::Posix)
+        .unwrap_or_else(|_| RelPath::new(Path::new("untitled"), PathStyle::Posix).unwrap())
+        .into_owned()
+        .into()
 }
 
 impl EventEmitter<EditorEvent> for CommitDiffPreview {}
@@ -430,5 +512,37 @@ impl Item for CommitDiffPreview {
 impl Render for CommitDiffPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         self.editor.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_buffer_file_uses_display_path_for_header_metadata() {
+        let file = PreviewBufferFile::new("src/lib.rs");
+
+        assert_eq!(
+            file.path().display(PathStyle::Posix).to_string(),
+            "src/lib.rs"
+        );
+        assert_eq!(file.file_name, "lib.rs");
+        assert_eq!(
+            file.disk_state(),
+            DiskState::Historic { was_deleted: false }
+        );
+        assert!(!file.can_open());
+    }
+
+    #[test]
+    fn display_path_key_preserves_path_with_sort_prefix() {
+        let key = display_path_key(3, "crates/cherrypick-ui/src/app_shell.rs");
+
+        assert_eq!(key.sort_prefix, Some(3));
+        assert_eq!(
+            key.path.display(PathStyle::Posix).to_string(),
+            "crates/cherrypick-ui/src/app_shell.rs"
+        );
     }
 }
