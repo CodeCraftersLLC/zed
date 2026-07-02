@@ -413,6 +413,7 @@ pub struct SplittableEditor {
     /// True when the current width is below the minimum threshold for split
     /// mode, regardless of the current diff view style setting.
     too_narrow_for_split: bool,
+    delegate_stage_and_restore: bool,
     last_width: Option<Pixels>,
     _subscriptions: Vec<Subscription>,
 }
@@ -468,6 +469,13 @@ impl SplittableEditor {
         });
         self.update_editors(cx, |editor, cx| {
             editor.set_render_diff_hunk_controls(empty_controls.clone(), cx);
+        });
+    }
+
+    pub fn set_delegate_stage_and_restore(&mut self, delegate: bool, cx: &mut Context<Self>) {
+        self.delegate_stage_and_restore = delegate;
+        self.update_editors(cx, |editor, _cx| {
+            editor.set_delegate_stage_and_restore(delegate);
         });
     }
 
@@ -583,6 +591,7 @@ impl SplittableEditor {
             split_state,
             searched_side: None,
             too_narrow_for_split: false,
+            delegate_stage_and_restore: false,
             last_width: None,
             _subscriptions: subscriptions,
         }
@@ -666,6 +675,10 @@ impl SplittableEditor {
                     }
                 }
                 EditorEvent::StageOrUnstageRequested { stage, hunks } => {
+                    if this.delegate_stage_and_restore {
+                        cx.emit(event.clone());
+                        return;
+                    }
                     if this.lhs.is_some() {
                         let translated = translate_lhs_hunks_to_rhs(hunks, this, cx);
                         if !translated.is_empty() {
@@ -680,6 +693,10 @@ impl SplittableEditor {
                     }
                 }
                 EditorEvent::RestoreRequested { hunks } => {
+                    if this.delegate_stage_and_restore {
+                        cx.emit(event.clone());
+                        return;
+                    }
                     if this.lhs.is_some() {
                         let translated = translate_lhs_hunks_to_rhs(hunks, this, cx);
                         if !translated.is_empty() {

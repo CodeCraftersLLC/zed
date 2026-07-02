@@ -1403,6 +1403,59 @@ impl GitStore {
         Some(repo.read(cx).status_for_path(&repo_path)?.status)
     }
 
+    pub fn refresh_status_for_project_paths<I>(
+        &mut self,
+        project_paths: I,
+        cx: &mut Context<Self>,
+    ) -> usize
+    where
+        I: IntoIterator<Item = ProjectPath>,
+    {
+        if matches!(&self.state, GitStoreState::Remote { .. }) {
+            return 0;
+        }
+
+        let updates_tx = match &self.state {
+            GitStoreState::Local { downstream, .. } => downstream
+                .as_ref()
+                .map(|downstream| downstream.updates_tx.clone()),
+            GitStoreState::Remote { .. } => unreachable!("remote git store returned above"),
+        };
+
+        let mut paths_by_repo: HashMap<RepositoryId, (Entity<Repository>, Vec<RepoPath>)> =
+            HashMap::default();
+        let mut fallback_active_repo_id = None;
+        for project_path in project_paths {
+            let Some((repo, repo_path)) =
+                self.repository_and_path_for_project_path(&project_path, cx)
+            else {
+                continue;
+            };
+            let repo_id = repo.read(cx).id;
+            if self.active_repo_id.is_none() && fallback_active_repo_id.is_none() {
+                fallback_active_repo_id = Some(repo_id);
+            }
+            paths_by_repo
+                .entry(repo_id)
+                .or_insert_with(|| (repo, Vec::new()))
+                .1
+                .push(repo_path);
+        }
+
+        if let Some(repo_id) = fallback_active_repo_id {
+            self.set_active_repo_id(repo_id, cx);
+        }
+
+        let mut refreshed = 0;
+        for (_, (repo, paths)) in paths_by_repo {
+            refreshed += paths.len();
+            repo.update(cx, |repo, cx| {
+                repo.paths_changed(paths, updates_tx.clone(), cx);
+            });
+        }
+        refreshed
+    }
+
     pub fn checkpoint(&self, cx: &mut App) -> Task<Result<GitStoreCheckpoint>> {
         let mut work_directory_abs_paths = Vec::new();
         let mut checkpoints = Vec::new();
