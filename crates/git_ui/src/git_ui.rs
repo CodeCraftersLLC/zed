@@ -31,6 +31,8 @@ use crate::{commit_view::CommitView, git_panel::GitPanel, text_diff_view::TextDi
 
 mod askpass_modal;
 pub mod branch_picker;
+// Public for downstream embedders that render historical commit diffs outside
+// Zed's working-copy ProjectDiff.
 pub mod commit_diff_preview;
 mod commit_modal;
 pub mod commit_tooltip;

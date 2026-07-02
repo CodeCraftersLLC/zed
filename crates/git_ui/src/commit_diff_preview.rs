@@ -18,6 +18,7 @@ use std::{
     sync::Arc,
 };
 use ui::{Color, Icon, IconName, Label, LabelCommon as _};
+use util::ResultExt as _;
 use util::paths::PathStyle;
 use util::rel_path::RelPath;
 use workspace::{
@@ -75,7 +76,9 @@ pub struct CommitDiffPreview {
 
 struct PreviewEntry {
     index: usize,
-    path: Arc<str>,
+    display_path: Arc<str>,
+    metadata_path: Arc<str>,
+    was_deleted: bool,
     old_text: Option<Arc<str>>,
     new_text: Arc<str>,
 }
@@ -84,11 +87,12 @@ struct PreviewBufferFile {
     path: Arc<RelPath>,
     full_path: PathBuf,
     file_name: String,
+    was_deleted: bool,
 }
 
 impl PreviewBufferFile {
-    fn new(display_path: &str) -> Self {
-        let path = display_rel_path(display_path);
+    fn new(metadata_path: &str, was_deleted: bool) -> Self {
+        let path = display_rel_path(metadata_path);
         let file_name = path.file_name().unwrap_or("untitled").to_string();
         let full_path = path.as_std_path().to_path_buf();
 
@@ -96,6 +100,7 @@ impl PreviewBufferFile {
             path,
             full_path,
             file_name,
+            was_deleted,
         }
     }
 }
@@ -106,7 +111,9 @@ impl LanguageFile for PreviewBufferFile {
     }
 
     fn disk_state(&self) -> DiskState {
-        DiskState::Historic { was_deleted: false }
+        DiskState::Historic {
+            was_deleted: self.was_deleted,
+        }
     }
 
     fn path(&self) -> &Arc<RelPath> {
@@ -135,7 +142,7 @@ impl LanguageFile for PreviewBufferFile {
             entry_id: None,
             path: self.path.as_ref().to_proto(),
             mtime: None,
-            is_deleted: false,
+            is_deleted: self.was_deleted,
             is_historic: true,
         }
     }
@@ -153,19 +160,27 @@ impl CommitDiffPreviewFile {
     fn into_entry(self, index: usize) -> PreviewEntry {
         let CommitDiffPreviewFile {
             display_path,
+            old_path,
+            new_path,
             status,
             old_text,
             new_text,
             is_binary,
             is_truncated,
             load_error,
-            ..
         } = self;
+        let metadata_path = new_path
+            .clone()
+            .or_else(|| old_path.clone())
+            .unwrap_or_else(|| display_path.clone());
+        let was_deleted = matches!(status, CommitDiffPreviewStatus::Deleted);
 
         if let Some(error) = load_error {
             return PreviewEntry {
                 index,
-                path: display_path.clone(),
+                display_path: display_path.clone(),
+                metadata_path,
+                was_deleted,
                 old_text: None,
                 new_text: format!("Unable to load diff for {display_path}: {error}\n").into(),
             };
@@ -174,7 +189,9 @@ impl CommitDiffPreviewFile {
         if is_binary {
             return PreviewEntry {
                 index,
-                path: display_path.clone(),
+                display_path: display_path.clone(),
+                metadata_path,
+                was_deleted,
                 old_text: None,
                 new_text: format!("Binary file: {display_path}\n").into(),
             };
@@ -183,7 +200,9 @@ impl CommitDiffPreviewFile {
         if is_truncated {
             return PreviewEntry {
                 index,
-                path: display_path.clone(),
+                display_path: display_path.clone(),
+                metadata_path,
+                was_deleted,
                 old_text: None,
                 new_text: format!("File too large to preview: {display_path}\n").into(),
             };
@@ -192,13 +211,17 @@ impl CommitDiffPreviewFile {
         match status {
             CommitDiffPreviewStatus::Added => PreviewEntry {
                 index,
-                path: display_path,
+                display_path,
+                metadata_path,
+                was_deleted,
                 old_text: None,
                 new_text: new_text.unwrap_or_else(|| "".into()),
             },
             CommitDiffPreviewStatus::Deleted => PreviewEntry {
                 index,
-                path: display_path,
+                display_path,
+                metadata_path,
+                was_deleted,
                 old_text,
                 new_text: "".into(),
             },
@@ -207,7 +230,9 @@ impl CommitDiffPreviewFile {
             | CommitDiffPreviewStatus::Copied
             | CommitDiffPreviewStatus::Typechange => PreviewEntry {
                 index,
-                path: display_path,
+                display_path,
+                metadata_path,
+                was_deleted,
                 old_text,
                 new_text: new_text.unwrap_or_else(|| "".into()),
             },
@@ -256,7 +281,10 @@ impl CommitDiffPreview {
             .collect::<Vec<_>>();
         let context_lines = options.context_lines;
         let populate_task = cx.spawn(async move |_, cx| {
-            populate_entries(multibuffer, entries, context_lines, language_registry, cx).await
+            populate_entries(multibuffer, entries, context_lines, language_registry, cx)
+                .await
+                .log_err();
+            Ok(())
         });
 
         Self {
@@ -289,13 +317,15 @@ async fn populate_entries(
 ) -> Result<()> {
     for entry in entries {
         let language = language_registry
-            .load_language_for_file_path(Path::new(entry.path.as_ref()))
+            .load_language_for_file_path(Path::new(entry.metadata_path.as_ref()))
             .await
             .ok();
 
         let buffer = cx.new(|cx| {
-            let buffer_file: Arc<dyn LanguageFile> =
-                Arc::new(PreviewBufferFile::new(entry.path.as_ref()));
+            let buffer_file: Arc<dyn LanguageFile> = Arc::new(PreviewBufferFile::new(
+                entry.metadata_path.as_ref(),
+                entry.was_deleted,
+            ));
             let mut buffer = Buffer::build(
                 TextBuffer::new(
                     ReplicaId::LOCAL,
@@ -305,6 +335,7 @@ async fn populate_entries(
                 Some(buffer_file),
                 Capability::ReadWrite,
             );
+            buffer.set_language_registry(language_registry.clone());
             buffer.set_language(language.clone(), cx);
             buffer
         });
@@ -314,7 +345,7 @@ async fn populate_entries(
         register_entry(
             &multibuffer,
             entry.index,
-            entry.path,
+            entry.display_path,
             buffer,
             diff,
             context_lines,
@@ -379,7 +410,10 @@ fn display_path_key(index: usize, display_path: &str) -> PathKey {
 
 fn display_rel_path(display_path: &str) -> Arc<RelPath> {
     RelPath::new(Path::new(display_path), PathStyle::Posix)
-        .unwrap_or_else(|_| RelPath::new(Path::new("untitled"), PathStyle::Posix).unwrap())
+        .unwrap_or_else(|_| {
+            RelPath::new(Path::new("untitled"), PathStyle::Posix)
+                .expect("static fallback path is repo-relative")
+        })
         .into_owned()
         .into()
 }
@@ -521,7 +555,7 @@ mod tests {
 
     #[test]
     fn preview_buffer_file_uses_display_path_for_header_metadata() {
-        let file = PreviewBufferFile::new("src/lib.rs");
+        let file = PreviewBufferFile::new("src/lib.rs", false);
 
         assert_eq!(
             file.path().display(PathStyle::Posix).to_string(),
@@ -533,6 +567,34 @@ mod tests {
             DiskState::Historic { was_deleted: false }
         );
         assert!(!file.can_open());
+    }
+
+    #[test]
+    fn preview_buffer_file_marks_deleted_historic_files() {
+        let file = PreviewBufferFile::new("src/deleted.rs", true);
+
+        assert_eq!(file.disk_state(), DiskState::Historic { was_deleted: true });
+    }
+
+    #[test]
+    fn preview_entry_uses_metadata_path_separately_from_display_path() {
+        let entry = CommitDiffPreviewFile {
+            display_path: "old.rs -> new.rs".into(),
+            old_path: Some("old.rs".into()),
+            new_path: Some("new.rs".into()),
+            status: CommitDiffPreviewStatus::Renamed,
+            old_text: Some("old".into()),
+            new_text: Some("new".into()),
+            is_binary: false,
+            is_truncated: false,
+            load_error: None,
+        }
+        .into_entry(7);
+
+        assert_eq!(entry.index, 7);
+        assert_eq!(entry.display_path.as_ref(), "old.rs -> new.rs");
+        assert_eq!(entry.metadata_path.as_ref(), "new.rs");
+        assert!(!entry.was_deleted);
     }
 
     #[test]

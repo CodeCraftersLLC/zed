@@ -621,7 +621,7 @@ impl ProjectDiff {
         });
 
         let editor = cx.new(|cx| {
-            let diff_display_editor = SplittableEditor::new(
+            let mut diff_display_editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
                 multibuffer.clone(),
                 project.clone(),
@@ -992,6 +992,7 @@ impl ProjectDiff {
         let snapshot = buffer.read(cx).snapshot();
         let diff_snapshot = diff.read(cx).snapshot(cx);
 
+        let enable_conflict_view = self.options.enable_conflict_view;
         let excerpt_ranges = {
             let diff_hunk_ranges = diff_snapshot
                 .hunks_intersecting_range(
@@ -999,22 +1000,25 @@ impl ProjectDiff {
                     &snapshot,
                 )
                 .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot));
-            let conflicts = conflict_set.read(cx).snapshot();
-            let mut conflicts = conflicts
-                .conflicts
-                .iter()
-                .map(|conflict| conflict.range.to_point(&snapshot))
-                .peekable();
+            if enable_conflict_view {
+                let conflicts = conflict_set.read(cx).snapshot();
+                let mut conflicts = conflicts
+                    .conflicts
+                    .iter()
+                    .map(|conflict| conflict.range.to_point(&snapshot))
+                    .peekable();
 
-            if conflicts.peek().is_some() {
-                conflicts.collect::<Vec<_>>()
+                if conflicts.peek().is_some() {
+                    conflicts.collect::<Vec<_>>()
+                } else {
+                    diff_hunk_ranges.collect()
+                }
             } else {
                 diff_hunk_ranges.collect()
             }
         };
 
         let mut needs_fold = None;
-        let enable_conflict_view = self.options.enable_conflict_view;
 
         let (was_empty, is_excerpt_newly_added) = self.editor.update(cx, |editor, cx| {
             let was_empty = editor.rhs_editor().read(cx).buffer().read(cx).is_empty();
@@ -1364,8 +1368,13 @@ impl Item for ProjectDiff {
         let Some(workspace) = self.workspace.upgrade() else {
             return Task::ready(None);
         };
+        let diff_base = self.branch_diff.read(cx).diff_base().clone();
+        let project = self.project.clone();
+        let options = self.options;
         Task::ready(Some(cx.new(|cx| {
-            ProjectDiff::new(self.project.clone(), workspace, window, cx)
+            let branch_diff =
+                cx.new(|cx| branch_diff::BranchDiff::new(diff_base, project.clone(), window, cx));
+            ProjectDiff::new_impl(branch_diff, project, workspace, options, window, cx)
         })))
     }
 
@@ -1736,6 +1745,7 @@ impl ToolbarItemView for ProjectDiffToolbar {
         self.project_diff = active_pane_item
             .and_then(|item| item.act_as::<ProjectDiff>(cx))
             .filter(|item| item.read(cx).diff_base(cx) == &DiffBase::Head)
+            .filter(|item| item.read(cx).options.allow_index_mutations)
             .map(|entity| entity.downgrade());
         if self.project_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
