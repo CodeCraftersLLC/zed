@@ -16,6 +16,7 @@ use std::{
     any::{Any, TypeId},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use ui::{Color, Icon, IconName, Label, LabelCommon as _};
 use util::ResultExt as _;
@@ -248,6 +249,7 @@ impl CommitDiffPreview {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let started = Instant::now();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
             if options.reveal_all_hunks {
@@ -286,6 +288,7 @@ impl CommitDiffPreview {
                 .log_err();
             Ok(())
         });
+        trace_diff_preview_duration("commit_diff_preview.new", started);
 
         Self {
             editor,
@@ -315,12 +318,26 @@ async fn populate_entries(
     language_registry: Arc<language::LanguageRegistry>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
+    let total_started = Instant::now();
     for entry in entries {
+        let entry_started = Instant::now();
+        let trace_path = if diff_preview_trace_enabled() {
+            Some(entry.display_path.clone())
+        } else {
+            None
+        };
+        let language_started = Instant::now();
         let language = language_registry
             .load_language_for_file_path(Path::new(entry.metadata_path.as_ref()))
             .await
             .ok();
+        trace_diff_preview_path_duration(
+            "commit_diff_preview.language_load",
+            trace_path.as_deref(),
+            language_started,
+        );
 
+        let buffer_started = Instant::now();
         let buffer = cx.new(|cx| {
             let buffer_file: Arc<dyn LanguageFile> = Arc::new(PreviewBufferFile::new(
                 entry.metadata_path.as_ref(),
@@ -339,9 +356,20 @@ async fn populate_entries(
             buffer.set_language(language.clone(), cx);
             buffer
         });
-        buffer.update(cx, |buffer, _| buffer.parsing_idle()).await;
+        trace_diff_preview_path_duration(
+            "commit_diff_preview.buffer_build",
+            trace_path.as_deref(),
+            buffer_started,
+        );
 
+        let diff_started = Instant::now();
         let diff = build_snapshot_diff(entry.old_text.clone(), &buffer, cx).await?;
+        trace_diff_preview_path_duration(
+            "commit_diff_preview.buffer_diff",
+            trace_path.as_deref(),
+            diff_started,
+        );
+        let register_started = Instant::now();
         register_entry(
             &multibuffer,
             entry.index,
@@ -351,8 +379,19 @@ async fn populate_entries(
             context_lines,
             cx,
         );
+        trace_diff_preview_path_duration(
+            "commit_diff_preview.register_entry",
+            trace_path.as_deref(),
+            register_started,
+        );
+        trace_diff_preview_path_duration(
+            "commit_diff_preview.populate_entry",
+            trace_path.as_deref(),
+            entry_started,
+        );
     }
 
+    trace_diff_preview_duration("commit_diff_preview.populate_entries", total_started);
     Ok(())
 }
 
@@ -416,6 +455,32 @@ fn display_rel_path(display_path: &str) -> Arc<RelPath> {
         })
         .into_owned()
         .into()
+}
+
+fn diff_preview_trace_enabled() -> bool {
+    std::env::var_os("CHERRYPICK_DIFF_PREVIEW_TRACE").is_some()
+}
+
+fn trace_diff_preview_duration(event: &str, started: Instant) {
+    if diff_preview_trace_enabled() {
+        eprintln!(
+            "diff-preview {event} {:.2}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+fn trace_diff_preview_path_duration(event: &str, path: Option<&str>, started: Instant) {
+    if diff_preview_trace_enabled() {
+        if let Some(path) = path {
+            eprintln!(
+                "diff-preview {event} path={path} {:.2}ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        } else {
+            trace_diff_preview_duration(event, started);
+        }
+    }
 }
 
 impl EventEmitter<EditorEvent> for CommitDiffPreview {}
