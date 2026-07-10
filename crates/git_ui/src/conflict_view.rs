@@ -115,19 +115,17 @@ pub(crate) fn buffer_ranges_updated(
         return;
     }
 
-    let buffer_conflicts = editor
-        .addon_mut::<ConflictAddon>()
-        .unwrap()
-        .buffers
-        .entry(buffer_id)
-        .or_insert_with(|| {
-            let subscription = cx.subscribe(&conflict_set, conflicts_updated);
-            BufferConflicts {
-                block_ids: Vec::new(),
-                conflict_set: conflict_set.clone(),
-                _subscription: subscription,
-            }
-        });
+    let Some(conflict_addon) = editor.addon_mut::<ConflictAddon>() else {
+        return;
+    };
+    let buffer_conflicts = conflict_addon.buffers.entry(buffer_id).or_insert_with(|| {
+        let subscription = cx.subscribe(&conflict_set, conflicts_updated);
+        BufferConflicts {
+            block_ids: Vec::new(),
+            conflict_set: conflict_set.clone(),
+            _subscription: subscription,
+        }
+    });
 
     let conflict_set = buffer_conflicts.conflict_set.clone();
     let conflicts_len = conflict_set.read(cx).snapshot().conflicts.len();
@@ -150,18 +148,17 @@ pub(crate) fn buffers_removed(
     cx: &mut Context<Editor>,
 ) {
     let mut removed_block_ids = HashSet::default();
-    editor
-        .addon_mut::<ConflictAddon>()
-        .unwrap()
-        .buffers
-        .retain(|buffer_id, buffer| {
-            if removed_buffer_ids.contains(buffer_id) {
-                removed_block_ids.extend(buffer.block_ids.iter().map(|(_, block_id)| *block_id));
-                false
-            } else {
-                true
-            }
-        });
+    let Some(conflict_addon) = editor.addon_mut::<ConflictAddon>() else {
+        return;
+    };
+    conflict_addon.buffers.retain(|buffer_id, buffer| {
+        if removed_buffer_ids.contains(buffer_id) {
+            removed_block_ids.extend(buffer.block_ids.iter().map(|(_, block_id)| *block_id));
+            false
+        } else {
+            true
+        }
+    });
     editor.remove_blocks(removed_block_ids, None, cx);
 }
 
