@@ -451,7 +451,7 @@ fn display_rel_path(display_path: &str) -> Arc<RelPath> {
     RelPath::new(Path::new(display_path), PathStyle::Posix)
         .unwrap_or_else(|_| {
             RelPath::new(Path::new("untitled"), PathStyle::Posix)
-                .expect("static fallback path is repo-relative")
+                .unwrap_or_else(|_| unreachable!("'untitled' is a valid relative path"))
         })
         .into_owned()
         .into()

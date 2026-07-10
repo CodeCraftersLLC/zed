@@ -1411,16 +1411,12 @@ impl GitStore {
     where
         I: IntoIterator<Item = ProjectPath>,
     {
-        if matches!(&self.state, GitStoreState::Remote { .. }) {
+        let GitStoreState::Local { downstream, .. } = &self.state else {
             return 0;
-        }
-
-        let updates_tx = match &self.state {
-            GitStoreState::Local { downstream, .. } => downstream
-                .as_ref()
-                .map(|downstream| downstream.updates_tx.clone()),
-            GitStoreState::Remote { .. } => unreachable!("remote git store returned above"),
         };
+        let updates_tx = downstream
+            .as_ref()
+            .map(|downstream| downstream.updates_tx.clone());
 
         let mut paths_by_repo: HashMap<RepositoryId, (Entity<Repository>, Vec<RepoPath>)> =
             HashMap::default();

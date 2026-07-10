@@ -1369,11 +1369,16 @@ impl Item for ProjectDiff {
             return Task::ready(None);
         };
         let diff_base = self.branch_diff.read(cx).diff_base().clone();
+        let repo = self.branch_diff.read(cx).repo().cloned();
         let project = self.project.clone();
         let options = self.options;
         Task::ready(Some(cx.new(|cx| {
-            let branch_diff =
-                cx.new(|cx| branch_diff::BranchDiff::new(diff_base, project.clone(), window, cx));
+            let branch_diff = cx.new(|cx| {
+                let mut branch_diff =
+                    branch_diff::BranchDiff::new(diff_base, project.clone(), window, cx);
+                branch_diff.set_repo(repo, cx);
+                branch_diff
+            });
             ProjectDiff::new_impl(branch_diff, project, workspace, options, window, cx)
         })))
     }
