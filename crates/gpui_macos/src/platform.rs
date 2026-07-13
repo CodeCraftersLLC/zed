@@ -162,6 +162,59 @@ unsafe fn build_classes() {
 
 pub struct MacPlatform(Mutex<MacPlatformState>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuActionScope {
+    Main,
+    Dock,
+}
+
+impl MenuActionScope {
+    fn encode_tag(self, index: usize) -> Option<NSInteger> {
+        let index = NSInteger::try_from(index).ok()?;
+        match self {
+            Self::Main => Some(index),
+            Self::Dock => index.checked_add(1)?.checked_neg(),
+        }
+    }
+
+    fn decode_tag(tag: NSInteger) -> Option<(Self, usize)> {
+        if tag >= 0 {
+            Some((Self::Main, usize::try_from(tag).ok()?))
+        } else {
+            let index = tag.checked_neg()?.checked_sub(1)?;
+            Some((Self::Dock, usize::try_from(index).ok()?))
+        }
+    }
+}
+
+#[cfg(test)]
+mod menu_action_scope_tests {
+    use super::*;
+
+    #[test]
+    fn main_and_dock_action_tags_have_disjoint_round_trips() {
+        for index in [0, 1, 127] {
+            let main = MenuActionScope::Main.encode_tag(index).unwrap();
+            let dock = MenuActionScope::Dock.encode_tag(index).unwrap();
+            assert!(main >= 0);
+            assert!(dock < 0);
+            assert_eq!(
+                MenuActionScope::decode_tag(main),
+                Some((MenuActionScope::Main, index))
+            );
+            assert_eq!(
+                MenuActionScope::decode_tag(dock),
+                Some((MenuActionScope::Dock, index))
+            );
+        }
+    }
+
+    #[test]
+    fn minimum_native_tag_is_rejected_without_overflow() {
+        assert_eq!(MenuActionScope::decode_tag(NSInteger::MIN), None);
+    }
+}
+
 pub(crate) struct MacPlatformState {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
@@ -178,7 +231,8 @@ pub(crate) struct MacPlatformState {
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
-    menu_actions: Vec<Box<dyn Action>>,
+    main_menu_actions: Vec<Box<dyn Action>>,
+    dock_menu_actions: Vec<Box<dyn Action>>,
     open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
     finish_launching: Option<Box<dyn FnOnce()>>,
     dock_menu: Option<id>,
@@ -222,7 +276,8 @@ impl MacPlatform {
             menu_command: None,
             validate_menu_command: None,
             will_open_menu: None,
-            menu_actions: Default::default(),
+            main_menu_actions: Default::default(),
+            dock_menu_actions: Default::default(),
             open_urls: None,
             finish_launching: None,
             dock_menu: None,
@@ -255,6 +310,7 @@ impl MacPlatform {
                     menu.addItem_(Self::create_menu_item(
                         item_config,
                         delegate,
+                        MenuActionScope::Main,
                         actions,
                         keymap,
                     ));
@@ -289,6 +345,7 @@ impl MacPlatform {
                 dock_menu.addItem_(Self::create_menu_item(
                     &item_config,
                     delegate,
+                    MenuActionScope::Dock,
                     actions,
                     keymap,
                 ));
@@ -301,6 +358,7 @@ impl MacPlatform {
     unsafe fn create_menu_item(
         item: &MenuItem,
         delegate: id,
+        action_scope: MenuActionScope,
         actions: &mut Vec<Box<dyn Action>>,
         keymap: &Keymap,
     ) -> id {
@@ -414,7 +472,9 @@ impl MacPlatform {
                     }
                     item.setEnabled_(if *disabled { NO } else { YES });
 
-                    let tag = actions.len() as NSInteger;
+                    let tag = action_scope
+                        .encode_tag(actions.len())
+                        .expect("native menu action index exceeds NSInteger");
                     let _: () = msg_send![item, setTag: tag];
                     actions.push(action.boxed_clone());
                     item
@@ -428,7 +488,13 @@ impl MacPlatform {
                     let submenu = NSMenu::new(nil).autorelease();
                     submenu.setDelegate_(delegate);
                     for item in items {
-                        submenu.addItem_(Self::create_menu_item(item, delegate, actions, keymap));
+                        submenu.addItem_(Self::create_menu_item(
+                            item,
+                            delegate,
+                            action_scope,
+                            actions,
+                            keymap,
+                        ));
                     }
                     item.setSubmenu_(submenu);
                     item.setEnabled_(if *disabled { NO } else { YES });
@@ -963,7 +1029,11 @@ impl Platform for MacPlatform {
         unsafe {
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();
-            let actions = &mut state.menu_actions;
+            // Native menu items address this table by tag. Replacing the main
+            // menu must also replace its action table; appending here leaks one
+            // boxed action per item on every dynamic menu refresh.
+            state.main_menu_actions.clear();
+            let actions = &mut state.main_menu_actions;
             let menu = self.create_menu_bar(&menus, NSWindow::delegate(app), actions, keymap);
             drop(state);
             app.setMainMenu_(menu);
@@ -979,7 +1049,10 @@ impl Platform for MacPlatform {
         unsafe {
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();
-            let actions = &mut state.menu_actions;
+            // Dock items use negative tags and a separate replace-on-refresh
+            // table, so rebuilding either menu cannot invalidate the other.
+            state.dock_menu_actions.clear();
+            let actions = &mut state.dock_menu_actions;
             let new = self.create_dock_menu(menu, NSWindow::delegate(app), actions, keymap);
             if let Some(old) = state.dock_menu.replace(new) {
                 CFRelease(old as _)
@@ -1344,10 +1417,13 @@ extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.menu_command.take() {
             let tag: NSInteger = msg_send![item, tag];
-            let index = tag as usize;
-            if let Some(action) = lock.menu_actions.get(index) {
-                let action = action.boxed_clone();
-                drop(lock);
+            let action = MenuActionScope::decode_tag(tag).and_then(|(scope, index)| match scope {
+                MenuActionScope::Main => lock.main_menu_actions.get(index),
+                MenuActionScope::Dock => lock.dock_menu_actions.get(index),
+            });
+            let action = action.map(|action| action.boxed_clone());
+            drop(lock);
+            if let Some(action) = action {
                 callback(&*action);
             }
             platform.0.lock().menu_command.get_or_insert(callback);
@@ -1362,10 +1438,13 @@ extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.validate_menu_command.take() {
             let tag: NSInteger = msg_send![item, tag];
-            let index = tag as usize;
-            if let Some(action) = lock.menu_actions.get(index) {
-                let action = action.boxed_clone();
-                drop(lock);
+            let action = MenuActionScope::decode_tag(tag).and_then(|(scope, index)| match scope {
+                MenuActionScope::Main => lock.main_menu_actions.get(index),
+                MenuActionScope::Dock => lock.dock_menu_actions.get(index),
+            });
+            let action = action.map(|action| action.boxed_clone());
+            drop(lock);
+            if let Some(action) = action {
                 result = callback(action.as_ref());
             }
             platform
