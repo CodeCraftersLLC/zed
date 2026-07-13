@@ -5184,6 +5184,12 @@ impl Window {
         });
     }
 
+    /// Whether a custom or platform-fallback prompt is currently rendered in
+    /// this window. Native platform dialogs do not use this in-window state.
+    pub fn has_active_prompt(&self) -> bool {
+        self.prompt.is_some()
+    }
+
     /// Present a platform dialog.
     /// The provided message will be presented, along with buttons for each answer.
     /// When a button is clicked, the returned Receiver will receive the index of the clicked button.

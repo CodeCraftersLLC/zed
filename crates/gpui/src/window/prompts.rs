@@ -140,6 +140,7 @@ impl Render for FallbackPromptRenderer {
                     .text_sm()
                     .child(action.label().clone())
                     .id(ix)
+                    .debug_selector(|| format!("prompt-action-{ix}"))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(PromptResponse(ix));
                         cx.stop_propagation();
@@ -148,6 +149,10 @@ impl Render for FallbackPromptRenderer {
 
         div()
             .size_full()
+            // This is a separate root painted above the application. Consume
+            // background mouse-down events in the bubble phase so action
+            // buttons run first while the application beneath remains modal.
+            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .size_full()
@@ -228,5 +233,108 @@ impl Deref for PromptBuilder {
             Self::Default => &fallback_prompt_renderer,
             Self::Custom(f) => f.as_ref(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::{
+        Context, InputEvent as _, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Render,
+        TestAppContext, Window, point, px, size,
+    };
+
+    use super::*;
+
+    struct ClickableBackground {
+        clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for ClickableBackground {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let clicks = self.clicks.clone();
+            div().size_full().id("background").on_click(move |_, _, _| {
+                clicks.set(clicks.get() + 1);
+            })
+        }
+    }
+
+    fn click(
+        window: &crate::WindowHandle<ClickableBackground>,
+        position: crate::Point<crate::Pixels>,
+        cx: &mut TestAppContext,
+    ) {
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn fallback_prompt_keeps_background_modal_and_actions_clickable(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_prompt_builder(fallback_prompt_renderer));
+        let background_clicks = Rc::new(Cell::new(0));
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let clicks = background_clicks.clone();
+            move |_, _| ClickableBackground { clicks }
+        });
+
+        let response = window
+            .update(cx, |_, window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    "Quit?",
+                    None,
+                    &[PromptButton::Other("Quit Anyway".into())],
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            window
+                .update(cx, |_, window, _| window.has_active_prompt())
+                .unwrap()
+        );
+        click(&window, point(px(10.), px(10.)), cx);
+        assert_eq!(background_clicks.get(), 0);
+
+        let action_bounds = window
+            .update(cx, |_, window, _| {
+                window
+                    .rendered_frame
+                    .debug_bounds
+                    .get("prompt-action-0")
+                    .copied()
+            })
+            .unwrap()
+            .expect("fallback prompt action should be rendered");
+        click(&window, action_bounds.center(), cx);
+        assert_eq!(response.await.unwrap(), 0);
+        assert_eq!(background_clicks.get(), 0);
     }
 }
