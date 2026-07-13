@@ -234,6 +234,25 @@ impl Application {
         self
     }
 
+    /// Invokes a handler before a platform-originated quit request is allowed
+    /// to terminate the process. Return `false` to cancel that immediate
+    /// request; the handler may later call [`App::quit`] after asynchronous
+    /// save prompts or other shutdown preflights complete.
+    pub fn on_quit_requested<F>(&self, mut callback: F) -> &Self
+    where
+        F: 'static + FnMut(&mut App) -> bool,
+    {
+        let this = Rc::downgrade(&self.0);
+        self.0
+            .borrow_mut()
+            .platform
+            .on_quit_requested(Box::new(move || {
+                this.upgrade()
+                    .is_none_or(|app| callback(&mut app.borrow_mut()))
+            }));
+        self
+    }
+
     /// Returns a handle to the [`BackgroundExecutor`] associated with this app, which can be used to spawn futures in the background.
     pub fn background_executor(&self) -> BackgroundExecutor {
         self.0.borrow().background_executor.clone()

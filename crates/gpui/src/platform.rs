@@ -186,6 +186,11 @@ pub trait Platform: 'static {
     fn reveal_path(&self, path: &Path);
     fn open_with_system(&self, path: &Path);
 
+    /// Register a callback for a platform-originated quit request. Returning
+    /// `false` cancels the immediate platform termination so the application
+    /// can run an asynchronous guarded shutdown and call [`Self::quit`] once
+    /// it is ready.
+    fn on_quit_requested(&self, _callback: Box<dyn FnMut() -> bool>) {}
     fn on_quit(&self, callback: Box<dyn FnMut()>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
 

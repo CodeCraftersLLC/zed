@@ -92,6 +92,10 @@ unsafe fn build_classes() {
                 should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
             );
             decl.add_method(
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
+            );
+            decl.add_method(
                 sel!(applicationWillTerminate:),
                 will_terminate as extern "C" fn(&mut Object, Sel, id),
             );
@@ -169,6 +173,7 @@ pub(crate) struct MacPlatformState {
     reopen: Option<Box<dyn FnMut()>>,
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     on_thermal_state_change: Option<Box<dyn FnMut()>>,
+    quit_requested: Option<Box<dyn FnMut() -> bool>>,
     quit: Option<Box<dyn FnMut()>>,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
@@ -212,6 +217,7 @@ impl MacPlatform {
             general_pasteboard: Pasteboard::general(),
             find_pasteboard: Pasteboard::find(),
             reopen: None,
+            quit_requested: None,
             quit: None,
             menu_command: None,
             validate_menu_command: None,
@@ -895,6 +901,10 @@ impl Platform for MacPlatform {
         self.0.lock().quit = Some(callback);
     }
 
+    fn on_quit_requested(&self, callback: Box<dyn FnMut() -> bool>) {
+        self.0.lock().quit_requested = Some(callback);
+    }
+
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().reopen = Some(callback);
     }
@@ -1228,6 +1238,28 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
             callback();
             platform.0.lock().reopen.get_or_insert(callback);
         }
+    }
+}
+
+// NSApplicationTerminateReply values from AppKit. Cancelling the immediate
+// request lets the application finish async save prompts and invoke
+// `Platform::quit` again after it has explicitly approved termination.
+const NS_TERMINATE_CANCEL: NSUInteger = 0;
+const NS_TERMINATE_NOW: NSUInteger = 1;
+
+extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
+    let platform = unsafe { get_mac_platform(this) };
+    let mut lock = platform.0.lock();
+    let Some(mut callback) = lock.quit_requested.take() else {
+        return NS_TERMINATE_NOW;
+    };
+    drop(lock);
+    let allow = callback();
+    platform.0.lock().quit_requested.get_or_insert(callback);
+    if allow {
+        NS_TERMINATE_NOW
+    } else {
+        NS_TERMINATE_CANCEL
     }
 }
 
