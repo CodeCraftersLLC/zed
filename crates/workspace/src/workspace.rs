@@ -3253,6 +3253,28 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
+        self.prepare_to_close_internal(close_intent, true, window, cx)
+    }
+
+    /// Prepare a workspace to close while requiring the user to explicitly
+    /// save, discard, or cancel every dirty item. Unlike `prepare_to_close`,
+    /// this never treats session serialization as approval to close.
+    pub fn prepare_to_close_with_dirty_prompt(
+        &mut self,
+        close_intent: CloseIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<bool>> {
+        self.prepare_to_close_internal(close_intent, false, window, cx)
+    }
+
+    fn prepare_to_close_internal(
+        &mut self,
+        close_intent: CloseIntent,
+        allow_recoverable_hot_exit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<bool>> {
         let active_call = self.active_global_call();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -3345,18 +3367,19 @@ impl Workspace {
             // if the workspace will be reachable again, either via session
             // restore or by reopening its folder paths. Otherwise prompt, so
             // we don't orphan the buffers.
-            let allow_hot_exit_serialization = close_intent == CloseIntent::Quit
-                || save_last_workspace
-                || this
-                    .read_with(cx, |workspace, cx| {
-                        workspace
-                            .project
-                            .read(cx)
-                            .visible_worktrees(cx)
-                            .next()
-                            .is_some()
-                    })
-                    .unwrap_or(false);
+            let allow_hot_exit_serialization = allow_recoverable_hot_exit
+                && (close_intent == CloseIntent::Quit
+                    || save_last_workspace
+                    || this
+                        .read_with(cx, |workspace, cx| {
+                            workspace
+                                .project
+                                .read(cx)
+                                .visible_worktrees(cx)
+                                .next()
+                                .is_some()
+                        })
+                        .unwrap_or(false));
             let save_result = this
                 .update_in(cx, |this, window, cx| {
                     this.save_all_internal(
@@ -11804,6 +11827,44 @@ mod tests {
              launch will bring the dirty buffer back"
         );
         assert!(task.await.unwrap());
+    }
+
+    #[gpui::test]
+    async fn test_guarded_quit_prompts_for_dirty_serializable_item(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            register_serializable_item::<TestItem>(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "one": "" })).await;
+        let project = Project::test(fs, ["root".as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let item = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_dirty(true)
+                .with_serialize(|| Some(Task::ready(Ok(()))))
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+
+        let task = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.prepare_to_close_with_dirty_prompt(CloseIntent::Quit, window, cx)
+        });
+        cx.executor().run_until_parked();
+
+        assert!(
+            cx.has_pending_prompt(),
+            "guarded quit must not silently serialize a dirty item"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.executor().run_until_parked();
+
+        assert!(!task.await.unwrap());
     }
 
     // See https://github.com/zed-industries/zed/issues/55726.

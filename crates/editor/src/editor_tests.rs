@@ -69,11 +69,56 @@ use util::{
     test::{TextRangeMarker, marked_text_ranges, marked_text_ranges_by, sample_text},
 };
 use workspace::{
-    CloseActiveItem, CloseAllItems, CloseOtherItems, MultiWorkspace, NavigationEntry, OpenOptions,
-    ToolbarItemLocation, ViewId,
+    CloseActiveItem, CloseAllItems, CloseIntent, CloseOtherItems, MultiWorkspace, NavigationEntry,
+    OpenOptions, ToolbarItemLocation, ViewId,
     item::{FollowEvent, FollowableItem, Item, ItemHandle, SaveOptions},
     register_project_item,
 };
+
+#[gpui::test]
+async fn test_guarded_quit_prompts_for_dirty_text_editor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "one.txt": "original\n" }))
+        .await;
+    let project = Project::test(fs, ["root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let worktree_id = project.update(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let editor = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path((worktree_id, rel_path("one.txt")), None, true, window, cx)
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text("modified\n", window, cx);
+    });
+    assert!(editor.read_with(cx, |editor, cx| editor.is_dirty(cx)));
+
+    let task = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.prepare_to_close_with_dirty_prompt(CloseIntent::Quit, window, cx)
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.has_pending_prompt(),
+        "guarded quit must prompt for an ordinary dirty text editor"
+    );
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+
+    assert!(!task.await.unwrap());
+    assert!(editor.read_with(cx, |editor, cx| editor.is_dirty(cx)));
+}
 
 fn display_ranges(editor: &Editor, cx: &mut Context<'_, Editor>) -> Vec<Range<DisplayPoint>> {
     editor
