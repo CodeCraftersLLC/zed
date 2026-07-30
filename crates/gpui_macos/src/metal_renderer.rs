@@ -137,6 +137,11 @@ pub(crate) struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+    /// The headless path has no drawable pool to backpressure GPU submission.
+    /// Retain the newest command buffer so teardown can wait for all work
+    /// submitted before it on the serial Metal command queue.
+    #[cfg(any(test, feature = "test-support"))]
+    last_headless_command_buffer: Option<metal::CommandBuffer>,
 }
 
 #[repr(C)]
@@ -353,6 +358,8 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
+            #[cfg(any(test, feature = "test-support"))]
+            last_headless_command_buffer: None,
         }
     }
 
@@ -793,6 +800,7 @@ impl MetalRenderer {
                     // Commit without waiting, mirroring presentation to a real
                     // window where the CPU doesn't block on the GPU.
                     command_buffer.commit();
+                    self.last_headless_command_buffer = Some(command_buffer);
                     return Ok(());
                 }
                 Err(err) => {
@@ -1564,6 +1572,18 @@ impl MetalRenderer {
             *instance_offset = next_offset;
         }
         true
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for MetalRenderer {
+    fn drop(&mut self) {
+        if let Some(command_buffer) = self.last_headless_command_buffer.take() {
+            // Metal command queues complete in submission order, so waiting on
+            // the newest buffer drains every earlier headless frame before the
+            // renderer releases textures, pipelines, and its device.
+            command_buffer.wait_until_completed();
+        }
     }
 }
 
