@@ -13,6 +13,8 @@ use gpui::{
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::VecDeque;
 
 use core_foundation::base::TCFType;
 use core_video::{
@@ -39,6 +41,7 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
@@ -137,11 +140,10 @@ pub(crate) struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
-    /// The headless path has no drawable pool to backpressure GPU submission.
-    /// Retain the newest command buffer so teardown can wait for all work
-    /// submitted before it on the serial Metal command queue.
+    /// Headless rendering has no drawable pool, so retain a production-sized
+    /// queue to backpressure GPU submission and drain it during teardown.
     #[cfg(any(test, feature = "test-support"))]
-    last_headless_command_buffer: Option<metal::CommandBuffer>,
+    headless_command_buffers: VecDeque<metal::CommandBuffer>,
 }
 
 #[repr(C)]
@@ -163,7 +165,7 @@ impl MetalRenderer {
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        layer.set_maximum_drawable_count(MAX_FRAMES_IN_FLIGHT as u64);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
@@ -359,7 +361,7 @@ impl MetalRenderer {
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
             #[cfg(any(test, feature = "test-support"))]
-            last_headless_command_buffer: None,
+            headless_command_buffers: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT),
         }
     }
 
@@ -755,6 +757,7 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene: {:?}", size);
         }
 
+        self.wait_for_headless_capacity();
         self.update_path_intermediate_textures(size);
 
         let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
@@ -798,9 +801,9 @@ impl MetalRenderer {
                     command_buffer.add_completed_handler(&block);
 
                     // Commit without waiting, mirroring presentation to a real
-                    // window where the CPU doesn't block on the GPU.
+                    // window until its bounded drawable pool is exhausted.
                     command_buffer.commit();
-                    self.last_headless_command_buffer = Some(command_buffer);
+                    self.headless_command_buffers.push_back(command_buffer);
                     return Ok(());
                 }
                 Err(err) => {
@@ -820,6 +823,17 @@ impl MetalRenderer {
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn wait_for_headless_capacity(&mut self) {
+        if self.headless_command_buffers.len() >= MAX_FRAMES_IN_FLIGHT {
+            let command_buffer = self
+                .headless_command_buffers
+                .pop_front()
+                .expect("headless command-buffer queue reached its capacity");
+            command_buffer.wait_until_completed();
         }
     }
 
@@ -1578,7 +1592,7 @@ impl MetalRenderer {
 #[cfg(any(test, feature = "test-support"))]
 impl Drop for MetalRenderer {
     fn drop(&mut self) {
-        if let Some(command_buffer) = self.last_headless_command_buffer.take() {
+        if let Some(command_buffer) = self.headless_command_buffers.pop_back() {
             // Metal command queues complete in submission order, so waiting on
             // the newest buffer drains every earlier headless frame before the
             // renderer releases textures, pipelines, and its device.
