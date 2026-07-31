@@ -15,6 +15,8 @@ use std::{
     sync::{self, Arc},
 };
 
+type SharedHeadlessRenderer = Rc<Mutex<Box<dyn PlatformHeadlessRenderer>>>;
+
 pub(crate) struct TestWindowState {
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) handle: AnyWindowHandle,
@@ -25,7 +27,7 @@ pub(crate) struct TestWindowState {
     platform: Weak<TestPlatform>,
     // TODO: Replace with `Rc`
     sprite_atlas: Arc<dyn PlatformAtlas>,
-    renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
+    renderer: Option<SharedHeadlessRenderer>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
@@ -64,8 +66,9 @@ impl TestWindow {
         display: Rc<dyn PlatformDisplay>,
         renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
     ) -> Self {
+        let renderer = renderer.map(|renderer| Rc::new(Mutex::new(renderer)));
         let sprite_atlas: Arc<dyn PlatformAtlas> = match &renderer {
-            Some(r) => r.sprite_atlas(),
+            Some(renderer) => renderer.lock().sprite_atlas(),
             None => Arc::new(TestAtlas::new()),
         };
         Self(Rc::new(Mutex::new(TestWindowState {
@@ -294,10 +297,18 @@ impl PlatformWindow for TestWindow {
 
     fn draw(&self, scene: &Scene) {
         let scale_factor = self.scale_factor();
-        let mut state = self.0.lock();
-        let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
-        if let Some(renderer) = &mut state.renderer {
-            renderer.render_scene(scene, device_size).warn_on_err();
+        let (device_size, renderer) = {
+            let state = self.0.lock();
+            (
+                state.bounds.size.to_device_pixels(scale_factor),
+                state.renderer.clone(),
+            )
+        };
+        if let Some(renderer) = renderer {
+            renderer
+                .lock()
+                .render_scene(scene, device_size)
+                .warn_on_err();
         }
     }
 
@@ -308,11 +319,13 @@ impl PlatformWindow for TestWindow {
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<RgbaImage> {
         let scale_factor = self.scale_factor();
-        let mut state = self.0.lock();
-        let size = state.bounds.size;
-        if let Some(renderer) = &mut state.renderer {
+        let (size, renderer) = {
+            let state = self.0.lock();
+            (state.bounds.size, state.renderer.clone())
+        };
+        if let Some(renderer) = renderer {
             let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
-            renderer.render_scene_to_image(scene, device_size)
+            renderer.lock().render_scene_to_image(scene, device_size)
         } else {
             anyhow::bail!("render_to_image not available: no HeadlessRenderer configured")
         }
