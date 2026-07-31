@@ -745,12 +745,14 @@ impl MetalRenderer {
     }
 
     /// Renders a scene to a reused offscreen texture without reading pixels
-    /// back or blocking on GPU completion.
+    /// back.
     ///
     /// This mirrors the CPU cost of presenting a frame to a window (scene
     /// encoding, instance buffer writes, command submission) and is used by
     /// headless benchmark rendering, where the produced pixels are never
-    /// inspected.
+    /// inspected. Like a `CAMetalLayer`, submission applies bounded
+    /// backpressure: after [`MAX_FRAMES_IN_FLIGHT`] queued frames, this may
+    /// block until the oldest command buffer completes.
     #[cfg(any(test, feature = "test-support"))]
     pub fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
@@ -828,11 +830,10 @@ impl MetalRenderer {
 
     #[cfg(any(test, feature = "test-support"))]
     fn wait_for_headless_capacity(&mut self) {
-        if self.headless_command_buffers.len() >= MAX_FRAMES_IN_FLIGHT {
-            let command_buffer = self
-                .headless_command_buffers
-                .pop_front()
-                .expect("headless command-buffer queue reached its capacity");
+        while self.headless_command_buffers.len() >= MAX_FRAMES_IN_FLIGHT {
+            let Some(command_buffer) = self.headless_command_buffers.pop_front() else {
+                break;
+            };
             command_buffer.wait_until_completed();
         }
     }

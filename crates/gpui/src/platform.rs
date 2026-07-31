@@ -760,7 +760,8 @@ pub trait PlatformHeadlessRenderer {
     ///
     /// This is the headless analogue of presenting a frame: it performs the
     /// same CPU-side scene encoding and GPU submission as drawing to a real
-    /// window, but doesn't block on GPU completion or copy pixels back.
+    /// window and does not copy pixels back. Implementations may block on GPU
+    /// completion when their bounded in-flight submission capacity is full.
     fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()>;
 
     /// Returns the sprite atlas used by this renderer.
