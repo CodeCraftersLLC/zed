@@ -631,6 +631,17 @@ impl<'a, 'measurement> BenchWindowContext<'a, 'measurement> {
         self.cx.run_until_idle();
     }
 
+    /// Waits for rendering submitted by this benchmark window to finish.
+    ///
+    /// Call this after the final lifecycle draw and before dropping the app's
+    /// entity graph so native renderer work cannot outlive the synthetic app
+    /// that produced it.
+    pub fn drain_headless_renderer(&mut self) {
+        self.update(|window, _cx| {
+            window.platform_window.drain_headless_renderer();
+        });
+    }
+
     /// Updates the benchmark window.
     pub fn update<R>(&mut self, update: impl FnOnce(&mut Window, &mut App) -> R) -> R {
         self.cx

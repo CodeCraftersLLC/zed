@@ -665,6 +665,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Wait for headless renderer work submitted by this window to complete.
+    ///
+    /// Production windows use their platform presentation lifecycle. Test and
+    /// benchmark windows override this so one synthetic app can release its
+    /// rendered entity graph before the next app is mounted in the same
+    /// process.
+    #[cfg(any(test, feature = "test-support"))]
+    fn drain_headless_renderer(&self) {}
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
@@ -763,6 +771,12 @@ pub trait PlatformHeadlessRenderer {
     /// window and does not copy pixels back. Implementations may block on GPU
     /// completion when their bounded in-flight submission capacity is full.
     fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()>;
+
+    /// Wait for all previously submitted headless rendering work to finish.
+    ///
+    /// Benchmark harnesses call this at an app-lifecycle boundary instead of
+    /// relying on renderer destruction to establish GPU completion.
+    fn drain(&mut self) {}
 
     /// Returns the sprite atlas used by this renderer.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
