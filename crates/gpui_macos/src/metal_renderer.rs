@@ -1826,15 +1826,18 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> anyhow::Result<image::RgbaImage> {
-        self.renderer.render_scene_to_image(scene, size)
+        // Unlike an AppKit event-loop iteration, a headless render has no
+        // surrounding autorelease pool. metal-rs returns command encoders as
+        // autoreleased Objective-C objects, so drain them after every frame.
+        objc::rc::autoreleasepool(|| self.renderer.render_scene_to_image(scene, size))
     }
 
     fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
-        self.renderer.render_scene(scene, size)
+        objc::rc::autoreleasepool(|| self.renderer.render_scene(scene, size))
     }
 
     fn drain(&mut self) {
-        self.renderer.drain_headless_work();
+        objc::rc::autoreleasepool(|| self.renderer.drain_headless_work());
     }
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
