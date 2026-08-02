@@ -284,7 +284,12 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         benchmark_name: Option<&'static str>,
         bencher: &'a mut criterion::Bencher<'measurement>,
     ) -> Self {
-        Self::build(platform, benchmark_name, bencher, BenchReport::default())
+        Self::build(
+            platform,
+            benchmark_name,
+            Some(bencher),
+            BenchReport::default(),
+        )
     }
 
     /// Creates a new benchmark app context backed by the provided platform.
@@ -299,13 +304,13 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
         bencher: &'a mut criterion::Bencher<'measurement>,
         report: BenchReport,
     ) -> Self {
-        Self::build(platform, benchmark_name, bencher, report)
+        Self::build(platform, benchmark_name, Some(bencher), report)
     }
 
     fn build(
         platform: Rc<dyn Platform>,
         benchmark_name: Option<&'static str>,
-        bencher: &'a mut criterion::Bencher<'measurement>,
+        bencher: Option<&'a mut criterion::Bencher<'measurement>>,
         report: BenchReport,
     ) -> Self {
         let background_executor = platform.background_executor();
@@ -326,7 +331,7 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
             background_executor,
             foreground_executor,
             benchmark_name,
-            bencher: Rc::new(RefCell::new(Some(bencher))),
+            bencher: Rc::new(RefCell::new(bencher)),
             report,
         }
     }
@@ -484,11 +489,19 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
 
     /// Runs GPUI benchmark teardown.
     ///
-    /// Cancels any timers still armed on the shared dispatcher and drains the
-    /// work that cancellation unblocks so they can't fire during a later
-    /// benchmark; assumes no other `BenchAppContext` is live on this thread.
+    /// Waits for submitted headless renderer work, cancels any timers still
+    /// armed on the shared dispatcher, and drains the work that cancellation
+    /// unblocks so none of it can outlive this app or fire during a later
+    /// benchmark. Assumes no other `BenchAppContext` is live on this thread.
     pub fn teardown(mut self) {
         self.run_until_idle();
+        let windows = self.read(App::windows);
+        for window in windows {
+            self.update_window(window, |_, window, _| {
+                window.platform_window.drain_headless_renderer();
+            })
+            .expect("benchmark window was unexpectedly closed during teardown");
+        }
         self.update(|cx| {
             cx.quit();
         });
@@ -512,6 +525,13 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
             "benchmark teardown kept scheduling timers: {}",
             dispatcher.debug_state()
         );
+    }
+}
+
+#[cfg(test)]
+impl BenchAppContext<'static, 'static> {
+    fn new_without_bencher(platform: Rc<dyn Platform>) -> Self {
+        Self::build(platform, None, None, BenchReport::default())
     }
 }
 
@@ -629,6 +649,17 @@ impl<'a, 'measurement> BenchWindowContext<'a, 'measurement> {
     /// background work to finish. Pending timers are not waited for.
     pub fn run_until_idle(&self) {
         self.cx.run_until_idle();
+    }
+
+    /// Waits for rendering submitted by this benchmark window to finish.
+    ///
+    /// Call this after the final lifecycle draw and before dropping the app's
+    /// entity graph so native renderer work cannot outlive the synthetic app
+    /// that produced it.
+    pub fn drain_headless_renderer(&mut self) {
+        self.update(|window, _cx| {
+            window.platform_window.drain_headless_renderer();
+        });
     }
 
     /// Updates the benchmark window.
@@ -777,5 +808,78 @@ impl VisualContext for BenchWindowContext<'_, '_> {
         self.window.update(&mut self.cx, |_, window, cx| {
             entity.read(cx).focus_handle(cx).focus(window, cx)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use anyhow::Result;
+    use image::RgbaImage;
+
+    use crate::{
+        DevicePixels, NoopTextSystem, PlatformAtlas, PlatformHeadlessRenderer, Scene, Size,
+        TestAtlas,
+    };
+
+    use super::{BenchAppContext, bench_platform};
+
+    struct DrainTrackingRenderer {
+        drain_count: Arc<AtomicUsize>,
+        atlas: Arc<TestAtlas>,
+    }
+
+    impl PlatformHeadlessRenderer for DrainTrackingRenderer {
+        fn render_scene_to_image(
+            &mut self,
+            _scene: &Scene,
+            size: Size<DevicePixels>,
+        ) -> Result<RgbaImage> {
+            Ok(RgbaImage::new(size.width.0 as u32, size.height.0 as u32))
+        }
+
+        fn render_scene(&mut self, _scene: &Scene, _size: Size<DevicePixels>) -> Result<()> {
+            Ok(())
+        }
+
+        fn drain(&mut self) {
+            self.drain_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+            self.atlas.clone()
+        }
+    }
+
+    #[test]
+    fn teardown_drains_every_headless_renderer() {
+        let renderer_count = Arc::new(AtomicUsize::new(0));
+        let drain_count = Arc::new(AtomicUsize::new(0));
+        let platform = bench_platform(
+            Some(Box::new({
+                let renderer_count = renderer_count.clone();
+                let drain_count = drain_count.clone();
+                move || {
+                    renderer_count.fetch_add(1, Ordering::Relaxed);
+                    Some(Box::new(DrainTrackingRenderer {
+                        drain_count: drain_count.clone(),
+                        atlas: Arc::new(TestAtlas::new()),
+                    }))
+                }
+            })),
+            Arc::new(NoopTextSystem::new()),
+        );
+        let mut cx = BenchAppContext::new_without_bencher(platform);
+        drop(cx.add_empty_window());
+        drop(cx.add_empty_window());
+        cx.teardown();
+
+        let renderer_count = renderer_count.load(Ordering::Relaxed);
+        assert_eq!(renderer_count, 2);
+        assert_eq!(drain_count.load(Ordering::Relaxed), renderer_count);
     }
 }

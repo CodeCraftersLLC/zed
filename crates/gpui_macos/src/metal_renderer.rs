@@ -838,6 +838,16 @@ impl MetalRenderer {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn drain_headless_work(&mut self) {
+        if let Some(command_buffer) = self.headless_command_buffers.pop_back() {
+            // Metal command queues complete in submission order. Waiting on
+            // the newest buffer therefore retires every older buffer too.
+            command_buffer.wait_until_completed();
+        }
+        self.headless_command_buffers.clear();
+    }
+
     fn draw_primitives(
         &mut self,
         scene: &Scene,
@@ -1593,12 +1603,7 @@ impl MetalRenderer {
 #[cfg(any(test, feature = "test-support"))]
 impl Drop for MetalRenderer {
     fn drop(&mut self) {
-        if let Some(command_buffer) = self.headless_command_buffers.pop_back() {
-            // Metal command queues complete in submission order, so waiting on
-            // the newest buffer drains every earlier headless frame before the
-            // renderer releases textures, pipelines, and its device.
-            command_buffer.wait_until_completed();
-        }
+        self.drain_headless_work();
     }
 }
 
@@ -1826,6 +1831,10 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
         self.renderer.render_scene(scene, size)
+    }
+
+    fn drain(&mut self) {
+        self.renderer.drain_headless_work();
     }
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {

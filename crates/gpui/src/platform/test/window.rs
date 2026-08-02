@@ -312,6 +312,14 @@ impl PlatformWindow for TestWindow {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn drain_headless_renderer(&self) {
+        let renderer = self.0.lock().renderer.clone();
+        if let Some(renderer) = renderer {
+            renderer.lock().drain();
+        }
+    }
+
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()
     }
