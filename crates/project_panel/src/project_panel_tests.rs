@@ -188,6 +188,48 @@ async fn test_opening_file(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_copy_file_contents_skips_directories(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/src"),
+        json!({
+            "test": {
+                "first.rs": "// First Rust file",
+            }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/src").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    toggle_expand_dir(&panel, "src/test", cx);
+    select_path(&panel, "src/test/first.rs", cx);
+    panel.update(cx, |panel, cx| {
+        assert_eq!(
+            panel.file_content_paths_for_copy(cx),
+            vec![PathBuf::from("test/first.rs")]
+        );
+    });
+
+    select_path(&panel, "src/test", cx);
+    panel.update(cx, |panel, cx| {
+        assert!(
+            panel.file_content_paths_for_copy(cx).is_empty(),
+            "directories must not offer copyable file contents"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_file_history_action_uses_focused_project_panel_selection(
     cx: &mut gpui::TestAppContext,
 ) {

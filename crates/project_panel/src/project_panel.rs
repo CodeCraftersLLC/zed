@@ -392,6 +392,8 @@ actions!(
         NewFile,
         /// Copies the selected file or directory.
         Copy,
+        /// Copies the selected file's UTF-8 contents to the clipboard.
+        CopyFileContents,
         /// Duplicates the selected file or directory.
         Duplicate,
         /// Reveals the selected item in the system file manager.
@@ -633,6 +635,9 @@ pub enum Event {
         split_direction: Option<SplitDirection>,
     },
     Focus,
+    CopyFileContents {
+        paths: Vec<PathBuf>,
+    },
 }
 
 struct DraggedProjectEntryView {
@@ -1230,6 +1235,9 @@ impl ProjectPanel {
                                 "Copy Relative Path",
                                 Box::new(zed_actions::workspace::CopyRelativePath),
                             )
+                            .when(!is_dir, |menu| {
+                                menu.action("Copy contents", Box::new(CopyFileContents))
+                            })
                             .when(has_git_repo, |menu| {
                                 menu.separator()
                                     .when(!is_dir && self.has_git_changes(entry_id), |menu| {
@@ -3604,6 +3612,38 @@ impl ProjectPanel {
         if !file_paths.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(file_paths.join("\n")));
         }
+    }
+
+    fn copy_file_contents(
+        &mut self,
+        _: &CopyFileContents,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = self.file_content_paths_for_copy(cx);
+        if !paths.is_empty() {
+            cx.emit(Event::CopyFileContents { paths });
+        }
+    }
+
+    fn file_content_paths_for_copy(&self, cx: &App) -> Vec<PathBuf> {
+        let project = self.project.read(cx);
+        self.effective_entries()
+            .into_iter()
+            .filter_map(|entry| {
+                let worktree = project.worktree_for_id(entry.worktree_id, cx)?.read(cx);
+                if worktree.entry_for_id(entry.entry_id)?.is_dir() {
+                    return None;
+                }
+                Some(
+                    project
+                        .path_for_entry(entry.entry_id, cx)?
+                        .path
+                        .as_std_path()
+                        .to_path_buf(),
+                )
+            })
+            .collect()
     }
 
     fn reveal_in_finder(
@@ -6890,6 +6930,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))
                 .on_action(cx.listener(Self::copy_relative_path))
+                .on_action(cx.listener(Self::copy_file_contents))
                 .on_action(cx.listener(Self::new_search_in_directory))
                 .on_action(cx.listener(Self::unfold_directory))
                 .on_action(cx.listener(Self::fold_directory))
