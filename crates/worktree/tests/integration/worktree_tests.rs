@@ -2740,6 +2740,80 @@ async fn test_create_file_in_expanded_gitignored_dir(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_expand_gitignored_unloaded_dir_without_load_file(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".gitignore": "ignored_dir\n",
+            "ignored_dir": {
+                "existing_file.txt": "existing content",
+                "nested": {
+                    "inner.txt": "inner"
+                }
+            },
+        }),
+    )
+    .await;
+
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    tree.read_with(cx, |tree, _| {
+        let ignored_dir = tree.entry_for_path(rel_path("ignored_dir")).unwrap();
+        assert!(ignored_dir.is_ignored);
+        assert_eq!(ignored_dir.kind, EntryKind::UnloadedDir);
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/existing_file.txt"))
+                .is_none()
+        );
+    });
+
+    tree.update(cx, |tree, cx| {
+        let entry_id = tree.entry_for_path(rel_path("ignored_dir")).unwrap().id;
+        tree.expand_entry(entry_id, cx)
+    })
+    .unwrap()
+    .await
+    .unwrap();
+
+    tree.read_with(cx, |tree, _| {
+        let ignored_dir = tree.entry_for_path(rel_path("ignored_dir")).unwrap();
+        assert!(ignored_dir.is_ignored);
+        assert_eq!(ignored_dir.kind, EntryKind::Dir);
+
+        let child = tree
+            .entry_for_path(rel_path("ignored_dir/existing_file.txt"))
+            .expect("expanding UnloadedDir must list ignored children without load_file");
+        assert!(child.is_ignored);
+
+        let nested = tree
+            .entry_for_path(rel_path("ignored_dir/nested"))
+            .expect("one-level expand lists nested ignored dirs");
+        assert!(nested.is_ignored);
+        assert_eq!(nested.kind, EntryKind::UnloadedDir);
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/nested/inner.txt"))
+                .is_none(),
+            "nested ignored dirs must stay unloaded until expanded"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_fs_event_for_gitignored_dir_does_not_lose_contents(cx: &mut TestAppContext) {
     // Tests the behavior of our worktree refresh when a directory modification for a gitignored directory
     // is triggered.
