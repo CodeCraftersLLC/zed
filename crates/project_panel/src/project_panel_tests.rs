@@ -13,7 +13,9 @@ use project::{FakeFs, ProjectPath};
 use serde_json::json;
 use settings::{ProjectPanelAutoOpenSettings, SettingsStore};
 use smallvec::smallvec;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use util::{path, paths::PathStyle, rel_path::rel_path};
 use workspace::{
     AppState, ItemHandle, MultiWorkspace, Pane, Workspace,
@@ -208,16 +210,22 @@ async fn test_copy_file_contents_skips_directories(cx: &mut gpui::TestAppContext
         .read_with(cx, |mw, _| mw.workspace().clone())
         .unwrap();
     let cx = &mut VisualTestContext::from_window(window.into(), cx);
-    let panel = workspace.update_in(cx, ProjectPanel::new);
+    // Added to the workspace so the panel renders and its `on_action` handler
+    // is reachable by a dispatched action, not just by a direct method call.
+    let panel = workspace.update_in(cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
+        panel
+    });
     cx.run_until_parked();
 
     toggle_expand_dir(&panel, "src/test", cx);
     select_path(&panel, "src/test/first.rs", cx);
-    panel.update(cx, |panel, cx| {
-        assert_eq!(
-            panel.file_content_paths_for_copy(cx),
-            vec![PathBuf::from("test/first.rs")]
-        );
+    let worktree_id = panel.update(cx, |panel, cx| {
+        let paths = panel.file_content_paths_for_copy(cx);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].path.as_std_path(), Path::new("test/first.rs"));
+        paths[0].worktree_id
     });
 
     select_path(&panel, "src/test", cx);
@@ -227,6 +235,72 @@ async fn test_copy_file_contents_skips_directories(cx: &mut gpui::TestAppContext
             "directories must not offer copyable file contents"
         );
     });
+
+    // The action is the user-facing surface: it must emit the event, carrying
+    // the worktree so a consumer cannot resolve a same-named file from another
+    // root. The panel deliberately does not touch the clipboard itself — the
+    // embedder reads the files under its own size and sensitive-path guards.
+    let events: Rc<RefCell<Vec<Vec<ProjectPath>>>> = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&panel, move |_, event: &Event, _| {
+            if let Event::CopyFileContents { paths } = event {
+                observed.borrow_mut().push(paths.clone());
+            }
+        })
+        .detach();
+    });
+
+    select_path(&panel, "src/test/first.rs", cx);
+    cx.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.focus_handle(cx).focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(CopyFileContents), cx);
+    });
+    cx.run_until_parked();
+
+    let emitted = events.borrow().clone();
+    assert_eq!(emitted.len(), 1, "the action must emit exactly one event");
+    assert_eq!(emitted[0].len(), 1);
+    assert_eq!(emitted[0][0].worktree_id, worktree_id);
+    assert_eq!(emitted[0][0].path.as_std_path(), Path::new("test/first.rs"));
+
+    // A directory selection must not emit at all.
+    events.borrow_mut().clear();
+    select_path(&panel, "src/test", cx);
+    cx.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.focus_handle(cx).focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(CopyFileContents), cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        events.borrow().is_empty(),
+        "a directory selection must not emit a copy-contents event"
+    );
+}
+
+#[test]
+fn test_copy_contents_menu_entry_is_host_only() {
+    // Nothing in standalone Zed consumes `Event::CopyFileContents`, so the menu
+    // entry must not be offered there; only an embedding host that performs the
+    // read and the clipboard write shows it.
+    assert!(
+        !ProjectPanelContextMenuPolicy::full().show_host_file_content_actions,
+        "standalone Zed must not offer an action nothing handles"
+    );
+    assert!(
+        ProjectPanelContextMenuPolicy::embedded().show_host_file_content_actions,
+        "the embedding host performs the copy, so it offers the entry"
+    );
 }
 
 #[gpui::test]

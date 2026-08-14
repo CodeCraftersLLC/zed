@@ -146,6 +146,11 @@ pub struct ProjectPanelContextMenuPolicy {
     pub show_compare_actions: bool,
     pub show_git_actions: bool,
     pub show_workspace_folder_actions: bool,
+    /// `CopyFileContents` only emits an event; the read and the clipboard write
+    /// belong to the embedding host. Standalone Zed has no such host, so the
+    /// entry stays hidden there rather than presenting an action that does
+    /// nothing.
+    pub show_host_file_content_actions: bool,
 }
 
 impl ProjectPanelContextMenuPolicy {
@@ -157,6 +162,7 @@ impl ProjectPanelContextMenuPolicy {
             show_compare_actions: true,
             show_git_actions: true,
             show_workspace_folder_actions: true,
+            show_host_file_content_actions: false,
         }
     }
 
@@ -168,6 +174,7 @@ impl ProjectPanelContextMenuPolicy {
             show_compare_actions: false,
             show_git_actions: false,
             show_workspace_folder_actions: false,
+            show_host_file_content_actions: true,
         }
     }
 }
@@ -392,7 +399,7 @@ actions!(
         NewFile,
         /// Copies the selected file or directory.
         Copy,
-        /// Copies the selected file's UTF-8 contents to the clipboard.
+        /// Copies the selected file's contents to the clipboard.
         CopyFileContents,
         /// Duplicates the selected file or directory.
         Duplicate,
@@ -635,8 +642,12 @@ pub enum Event {
         split_direction: Option<SplitDirection>,
     },
     Focus,
+    /// Emitted for the embedder to read and copy. Carries `ProjectPath` rather
+    /// than a bare relative path so the worktree stays identifiable: in a
+    /// multi-root workspace two worktrees can both hold `src/lib.rs`, and a
+    /// relative path alone would let a consumer resolve the wrong file.
     CopyFileContents {
-        paths: Vec<PathBuf>,
+        paths: Vec<ProjectPath>,
     },
 }
 
@@ -1235,9 +1246,10 @@ impl ProjectPanel {
                                 "Copy Relative Path",
                                 Box::new(zed_actions::workspace::CopyRelativePath),
                             )
-                            .when(!is_dir, |menu| {
-                                menu.action("Copy contents", Box::new(CopyFileContents))
-                            })
+                            .when(
+                                !is_dir && self.context_menu_policy.show_host_file_content_actions,
+                                |menu| menu.action("Copy Contents", Box::new(CopyFileContents)),
+                            )
                             .when(has_git_repo, |menu| {
                                 menu.separator()
                                     .when(!is_dir && self.has_git_changes(entry_id), |menu| {
@@ -3614,19 +3626,14 @@ impl ProjectPanel {
         }
     }
 
-    fn copy_file_contents(
-        &mut self,
-        _: &CopyFileContents,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn copy_file_contents(&mut self, _: &CopyFileContents, _: &mut Window, cx: &mut Context<Self>) {
         let paths = self.file_content_paths_for_copy(cx);
         if !paths.is_empty() {
             cx.emit(Event::CopyFileContents { paths });
         }
     }
 
-    fn file_content_paths_for_copy(&self, cx: &App) -> Vec<PathBuf> {
+    fn file_content_paths_for_copy(&self, cx: &App) -> Vec<ProjectPath> {
         let project = self.project.read(cx);
         self.effective_entries()
             .into_iter()
@@ -3635,13 +3642,7 @@ impl ProjectPanel {
                 if worktree.entry_for_id(entry.entry_id)?.is_dir() {
                     return None;
                 }
-                Some(
-                    project
-                        .path_for_entry(entry.entry_id, cx)?
-                        .path
-                        .as_std_path()
-                        .to_path_buf(),
-                )
+                project.path_for_entry(entry.entry_id, cx)
             })
             .collect()
     }
