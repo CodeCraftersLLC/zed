@@ -146,6 +146,11 @@ pub struct ProjectPanelContextMenuPolicy {
     pub show_compare_actions: bool,
     pub show_git_actions: bool,
     pub show_workspace_folder_actions: bool,
+    /// `CopyFileContents` only emits an event; the read and the clipboard write
+    /// belong to the embedding host. Standalone Zed has no such host, so the
+    /// entry stays hidden there rather than presenting an action that does
+    /// nothing.
+    pub show_host_file_content_actions: bool,
 }
 
 impl ProjectPanelContextMenuPolicy {
@@ -157,6 +162,7 @@ impl ProjectPanelContextMenuPolicy {
             show_compare_actions: true,
             show_git_actions: true,
             show_workspace_folder_actions: true,
+            show_host_file_content_actions: false,
         }
     }
 
@@ -168,6 +174,7 @@ impl ProjectPanelContextMenuPolicy {
             show_compare_actions: false,
             show_git_actions: false,
             show_workspace_folder_actions: false,
+            show_host_file_content_actions: true,
         }
     }
 }
@@ -392,6 +399,8 @@ actions!(
         NewFile,
         /// Copies the selected file or directory.
         Copy,
+        /// Copies the selected file's contents to the clipboard.
+        CopyFileContents,
         /// Duplicates the selected file or directory.
         Duplicate,
         /// Reveals the selected item in the system file manager.
@@ -633,6 +642,13 @@ pub enum Event {
         split_direction: Option<SplitDirection>,
     },
     Focus,
+    /// Emitted for the embedder to read and copy. Carries `ProjectPath` rather
+    /// than a bare relative path so the worktree stays identifiable: in a
+    /// multi-root workspace two worktrees can both hold `src/lib.rs`, and a
+    /// relative path alone would let a consumer resolve the wrong file.
+    CopyFileContents {
+        paths: Vec<ProjectPath>,
+    },
 }
 
 struct DraggedProjectEntryView {
@@ -1173,6 +1189,13 @@ impl ProjectPanel {
                         menu.when(is_dir && context_menu_policy.show_search_actions, |menu| {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
+                        // Copying contents reads; it never mutates the project.
+                        // A read-only project is exactly where a host offers it
+                        // — a commit blob or a remote tree.
+                        .when(
+                            !is_dir && context_menu_policy.show_host_file_content_actions,
+                            |menu| menu.action("Copy Contents", Box::new(CopyFileContents)),
+                        )
                     } else {
                         menu.action("New File", Box::new(NewFile))
                             .action("New Folder", Box::new(NewDirectory))
@@ -1229,6 +1252,10 @@ impl ProjectPanel {
                             .action(
                                 "Copy Relative Path",
                                 Box::new(zed_actions::workspace::CopyRelativePath),
+                            )
+                            .when(
+                                !is_dir && self.context_menu_policy.show_host_file_content_actions,
+                                |menu| menu.action("Copy Contents", Box::new(CopyFileContents)),
                             )
                             .when(has_git_repo, |menu| {
                                 menu.separator()
@@ -3604,6 +3631,27 @@ impl ProjectPanel {
         if !file_paths.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(file_paths.join("\n")));
         }
+    }
+
+    fn copy_file_contents(&mut self, _: &CopyFileContents, _: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.file_content_paths_for_copy(cx);
+        if !paths.is_empty() {
+            cx.emit(Event::CopyFileContents { paths });
+        }
+    }
+
+    fn file_content_paths_for_copy(&self, cx: &App) -> Vec<ProjectPath> {
+        let project = self.project.read(cx);
+        self.effective_entries()
+            .into_iter()
+            .filter_map(|entry| {
+                let worktree = project.worktree_for_id(entry.worktree_id, cx)?.read(cx);
+                if worktree.entry_for_id(entry.entry_id)?.is_dir() {
+                    return None;
+                }
+                project.path_for_entry(entry.entry_id, cx)
+            })
+            .collect()
     }
 
     fn reveal_in_finder(
@@ -6890,6 +6938,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))
                 .on_action(cx.listener(Self::copy_relative_path))
+                .on_action(cx.listener(Self::copy_file_contents))
                 .on_action(cx.listener(Self::new_search_in_directory))
                 .on_action(cx.listener(Self::unfold_directory))
                 .on_action(cx.listener(Self::fold_directory))
