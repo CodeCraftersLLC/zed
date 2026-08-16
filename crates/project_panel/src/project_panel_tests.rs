@@ -269,6 +269,35 @@ async fn test_copy_file_contents_skips_directories(cx: &mut gpui::TestAppContext
     assert_eq!(emitted[0][0].worktree_id, worktree_id);
     assert_eq!(emitted[0][0].path.as_std_path(), Path::new("test/first.rs"));
 
+    // A mixed selection is where the directory filter actually earns its keep:
+    // marking a file and a directory together must emit the file alone. A
+    // file-only selection would pass even if directories were never filtered.
+    events.borrow_mut().clear();
+    select_path_with_mark(&panel, "src/test/first.rs", cx);
+    select_path_with_mark(&panel, "src/test", cx);
+    cx.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.focus_handle(cx).focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(CopyFileContents), cx);
+    });
+    cx.run_until_parked();
+
+    let mixed = events.borrow().clone();
+    assert_eq!(mixed.len(), 1, "the mixed selection must still emit once");
+    assert_eq!(
+        mixed[0].len(),
+        1,
+        "the directory must be filtered out of a mixed selection: {:?}",
+        mixed[0]
+    );
+    assert_eq!(mixed[0][0].path.as_std_path(), Path::new("test/first.rs"));
+
+    panel.update(cx, |panel, _| panel.marked_entries.clear());
+
     // A directory selection must not emit at all.
     events.borrow_mut().clear();
     select_path(&panel, "src/test", cx);
