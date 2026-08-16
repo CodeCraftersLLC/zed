@@ -1189,6 +1189,13 @@ impl ProjectPanel {
                         menu.when(is_dir && context_menu_policy.show_search_actions, |menu| {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
+                        // Copying contents reads; it never mutates the project.
+                        // A read-only project is exactly where a host offers it
+                        // — a commit blob or a remote tree.
+                        .when(
+                            !is_dir && context_menu_policy.show_host_file_content_actions,
+                            |menu| menu.action("Copy Contents", Box::new(CopyFileContents)),
+                        )
                     } else {
                         menu.action("New File", Box::new(NewFile))
                             .action("New Folder", Box::new(NewDirectory))
