@@ -4120,7 +4120,7 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
-        use crate::PaintSurface;
+        use crate::{PaintSurface, SurfaceContent};
 
         self.invalidator.debug_assert_paint();
 
@@ -4130,7 +4130,37 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            content: SurfaceContent::PixelBuffer(image_buffer),
+        });
+    }
+
+    /// Paint a caller-owned texture into the scene at the current z-index.
+    ///
+    /// The renderer keeps one GPU texture per [`crate::ExternalTextureId`] and
+    /// uploads only what the source reports as dirty, so a source that has
+    /// stopped producing frames costs a draw call and no bandwidth.
+    ///
+    /// This deliberately does **not** go through the sprite atlas. Atlas tiles
+    /// are for icons and glyphs; a 1080p frame arriving at 60 Hz would evict
+    /// the entire atlas every frame. See [`crate::external_texture`].
+    ///
+    /// Call only during the paint phase of element drawing.
+    pub fn paint_external_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        source: Arc<dyn crate::ExternalTextureSource>,
+    ) {
+        use crate::{PaintSurface, SurfaceContent};
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            content: SurfaceContent::ExternalTexture(source),
         });
     }
 

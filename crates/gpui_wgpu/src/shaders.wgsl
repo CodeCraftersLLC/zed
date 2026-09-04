@@ -1362,3 +1362,57 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- external textures --- //
+//
+// A caller-owned RGBA/BGRA texture composited inside the scene, used by the
+// embedded browser's off-screen Chromium frames. Unlike polychrome sprites
+// this never samples the shared sprite atlas: the texture bound at
+// group(1) binding(1) belongs to one producer and holds exactly one frame,
+// so a 1080p page cannot evict every icon in the app.
+
+struct ExternalTexture {
+    bounds: Bounds,
+    content_mask: Bounds,
+    opacity: f32,
+    pad: u32,
+}
+@group(1) @binding(0) var<storage, read> b_external_textures: array<ExternalTexture>;
+
+struct ExternalTextureVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texture_position: vec2<f32>,
+    @location(1) @interpolate(flat) external_id: u32,
+    @location(2) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_external_texture(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ExternalTextureVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    // Not named `external`: that is a reserved keyword in WGSL, and naga
+    // rejects the whole shader module for it. The failure is not local to this
+    // quad either, because every GPUI shader is compiled as one module, so the
+    // app panics before it can draw anything at all.
+    let quad = b_external_textures[instance_id];
+
+    var out = ExternalTextureVarying();
+    out.position = to_device_position(unit_vertex, quad.bounds);
+    // The texture holds exactly this rect, so unit coordinates are the
+    // texture coordinates. No atlas tile arithmetic.
+    out.texture_position = unit_vertex;
+    out.external_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_external_texture(input: ExternalTextureVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.texture_position);
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let quad = b_external_textures[input.external_id];
+    return blend_color(sample, quad.opacity);
+}

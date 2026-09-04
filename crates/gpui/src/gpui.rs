@@ -21,6 +21,7 @@ pub mod colors;
 mod element;
 mod elements;
 mod executor;
+mod external_texture;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
@@ -97,6 +98,7 @@ pub use ctor::ctor;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
+pub use external_texture::*;
 pub use geometry::*;
 pub use global::*;
 pub use gpui_macros::{

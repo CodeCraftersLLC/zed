@@ -721,8 +721,52 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub content: SurfaceContent,
+}
+
+/// What a [`PaintSurface`] samples from.
+///
+/// Both variants bypass the sprite atlas: a surface owns its texture. That is
+/// the point of the primitive. See [`crate::external_texture`] for why a live
+/// video frame or web page must never be atlased.
+#[derive(Clone)]
+pub enum SurfaceContent {
+    /// A CoreVideo buffer, as produced by macOS video decode. YUV, sampled by
+    /// the Metal renderer's two-plane surface shader.
     #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    PixelBuffer(core_video::pixel_buffer::CVPixelBuffer),
+    /// A caller-owned RGBA/BGRA frame, uploaded to a dedicated texture the
+    /// renderer caches per [`crate::ExternalTextureId`]. This is the
+    /// cross-platform path, and the one Chromium off-screen rendering uses.
+    ExternalTexture(std::sync::Arc<dyn crate::ExternalTextureSource>),
+}
+
+impl SurfaceContent {
+    /// The caller-owned texture this surface samples, if it is one.
+    ///
+    /// Renderers use this rather than destructuring, because off macOS the enum
+    /// has a single variant and a `let ... else` on it is irrefutable. It also
+    /// keeps the mapping in one place instead of once per backend.
+    pub fn external_texture(&self) -> Option<&std::sync::Arc<dyn crate::ExternalTextureSource>> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::PixelBuffer(_) => None,
+            Self::ExternalTexture(source) => Some(source),
+        }
+    }
+}
+
+impl Debug for SurfaceContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::PixelBuffer(_) => f.write_str("SurfaceContent::PixelBuffer"),
+            Self::ExternalTexture(source) => f
+                .debug_tuple("SurfaceContent::ExternalTexture")
+                .field(&source.id())
+                .finish(),
+        }
+    }
 }
 
 impl From<PaintSurface> for Primitive {

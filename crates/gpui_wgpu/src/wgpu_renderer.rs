@@ -1,14 +1,17 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, ExternalTextureCacheKey,
+    ExternalTextureFormat, ExternalTextureId, ExternalTextureUpdate, GpuSpecs, MonochromeSprite,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
+    plan_external_texture_update,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -35,6 +38,25 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
             size: [bounds.size.width.0, bounds.size.height.0],
         }
     }
+}
+
+/// One external-texture draw. Mirrors `ExternalTexture` in `shaders.wgsl`;
+/// changing either side without the other silently corrupts the geometry.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ExternalTextureInstance {
+    bounds: PodBounds,
+    content_mask: PodBounds,
+    opacity: f32,
+    pad: u32,
+}
+
+/// A GPU texture owned by one external source, kept across frames so a page
+/// that is not repainting costs no upload bandwidth (PERF-B04).
+struct CachedExternalTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    key: ExternalTextureCacheKey,
 }
 
 #[repr(C)]
@@ -92,6 +114,7 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    external_textures: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -120,6 +143,10 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// One cached texture per external source. Interior mutability because the
+    /// draw path holds `&self` while recording a render pass, and a device loss
+    /// drops the whole `WgpuResources`, which is exactly when these must go.
+    external_textures: RefCell<HashMap<ExternalTextureId, CachedExternalTexture>>,
 }
 
 impl WgpuResources {
@@ -463,6 +490,7 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            external_textures: RefCell::new(HashMap::new()),
         };
 
         Ok(Self {
@@ -865,6 +893,7 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let external_color_target = color_target.clone();
         let surfaces = create_pipeline(
             "surfaces",
             "vs_surface",
@@ -873,6 +902,22 @@ impl WgpuRenderer {
             &layouts.surfaces,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
+            1,
+            &shader_module,
+        );
+
+        // Deliberately built on `instances_with_texture`, the same layout the
+        // atlas sprites use, but bound to a caller-owned texture rather than an
+        // atlas page. See `external_texture.rs` in gpui for why atlasing a live
+        // browser frame is not an option.
+        let external_textures = create_pipeline(
+            "external_textures",
+            "vs_external_texture",
+            "fs_external_texture",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(external_color_target)],
             1,
             &shader_module,
         );
@@ -887,6 +932,7 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            external_textures,
         }
     }
 
@@ -1300,11 +1346,11 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
-                        PrimitiveBatch::Surfaces(_surfaces) => {
-                            // Surfaces are macOS-only for video playback
-                            // Not implemented for Linux/wgpu
-                            true
-                        }
+                        PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                            &scene.surfaces[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ),
                     };
                     if !ok {
                         overflow = true;
@@ -1444,6 +1490,196 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    /// Composite caller-owned textures (embedded browser frames) into the
+    /// scene.
+    ///
+    /// CoreVideo surfaces are a macOS path and never reach here; on Linux a
+    /// `PaintSurface` is always an external texture.
+    fn draw_surfaces(
+        &self,
+        surfaces: &[PaintSurface],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        for surface in surfaces {
+            let Some(source) = surface.content.external_texture() else {
+                continue;
+            };
+            let mut ok = true;
+            source.with_frame(&mut |frame| {
+                if !frame.is_well_formed() {
+                    // A producer that mis-declares its geometry is a bug, but
+                    // it must not become an out-of-bounds GPU read.
+                    log::error!(
+                        "external texture {:?} offered a malformed frame ({:?}, stride {})",
+                        source.id(),
+                        frame.size,
+                        frame.stride
+                    );
+                    return;
+                }
+
+                let cached_key = self
+                    .resources()
+                    .external_textures
+                    .borrow()
+                    .get(&source.id())
+                    .map(|cached| cached.key);
+                let plan = plan_external_texture_update(cached_key, &frame);
+
+                if !matches!(plan, ExternalTextureUpdate::Reuse) {
+                    if !self.upload_external_texture(source.id(), &frame, plan) {
+                        ok = false;
+                        return;
+                    }
+                    source.mark_uploaded(frame.sequence);
+                }
+
+                let instances = [ExternalTextureInstance {
+                    bounds: surface.bounds.into(),
+                    content_mask: surface.content_mask.bounds.into(),
+                    opacity: 1.0,
+                    pad: 0,
+                }];
+                let data = unsafe { Self::instance_bytes(&instances) };
+
+                let textures = self.resources().external_textures.borrow();
+                let Some(cached) = textures.get(&source.id()) else {
+                    return;
+                };
+                ok = self.draw_instances_with_texture(
+                    data,
+                    1,
+                    &cached.view,
+                    &self.resources().pipelines.external_textures,
+                    instance_offset,
+                    pass,
+                );
+            });
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Create or refresh the cached texture for one external source. Returns
+    /// false only when the frame cannot be represented at all.
+    fn upload_external_texture(
+        &self,
+        id: ExternalTextureId,
+        frame: &gpui::ExternalFrameView<'_>,
+        plan: ExternalTextureUpdate,
+    ) -> bool {
+        let resources = self.resources();
+        let format = match frame.format {
+            ExternalTextureFormat::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,
+            ExternalTextureFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let width = frame.size.width.0.max(0) as u32;
+        let height = frame.size.height.0.max(0) as u32;
+        if width == 0 || height == 0 {
+            return true;
+        }
+
+        let mut textures = resources.external_textures.borrow_mut();
+        if matches!(plan, ExternalTextureUpdate::Recreate) {
+            let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("external_texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            textures.insert(
+                id,
+                CachedExternalTexture {
+                    texture,
+                    view,
+                    key: ExternalTextureCacheKey {
+                        id,
+                        generation: frame.generation,
+                        sequence: 0,
+                        size: frame.size,
+                    },
+                },
+            );
+        }
+
+        let Some(cached) = textures.get_mut(&id) else {
+            return false;
+        };
+
+        // A recreated texture has no pixels yet, so it takes the whole frame
+        // regardless of what the producer reported as dirty.
+        let regions = if matches!(plan, ExternalTextureUpdate::Recreate) {
+            vec![Bounds {
+                origin: gpui::point(DevicePixels(0), DevicePixels(0)),
+                size: frame.size,
+            }]
+        } else {
+            frame.dirty_regions()
+        };
+
+        for region in regions {
+            let x = region.origin.x.0.max(0) as u32;
+            let y = region.origin.y.0.max(0) as u32;
+            let region_width = region.size.width.0.max(0) as u32;
+            let region_height = region.size.height.0.max(0) as u32;
+            if region_width == 0 || region_height == 0 {
+                continue;
+            }
+            let offset = y as usize * frame.stride + x as usize * 4;
+            // `write_texture` reads `region_height` rows of `region_width * 4`
+            // bytes at `frame.stride` pitch starting here. A slice shorter than
+            // that is a wgpu validation panic, so the whole span is checked
+            // rather than just its first byte.
+            let span_end = (y + region_height - 1) as usize * frame.stride
+                + (x + region_width) as usize * 4;
+            if span_end > frame.bytes.len() {
+                log::error!(
+                    "external texture {id:?} reported a dirty region outside its own buffer"
+                );
+                continue;
+            }
+            resources.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &cached.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &frame.bytes[offset..],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(frame.stride as u32),
+                    rows_per_image: Some(region_height),
+                },
+                wgpu::Extent3d {
+                    width: region_width,
+                    height: region_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        cached.key = ExternalTextureCacheKey {
+            id,
+            generation: frame.generation,
+            sequence: frame.sequence,
+            size: frame.size,
+        };
+        true
     }
 
     fn draw_instances(
