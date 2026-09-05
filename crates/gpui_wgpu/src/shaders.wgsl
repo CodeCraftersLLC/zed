@@ -1375,7 +1375,7 @@ struct ExternalTexture {
     bounds: Bounds,
     content_mask: Bounds,
     opacity: f32,
-    pad: u32,
+    swap_red_blue: u32,
 }
 @group(1) @binding(0) var<storage, read> b_external_textures: array<ExternalTexture>;
 
@@ -1414,5 +1414,6 @@ fn fs_external_texture(input: ExternalTextureVarying) -> @location(0) vec4<f32> 
     }
 
     let quad = b_external_textures[input.external_id];
-    return blend_color(sample, quad.opacity);
+    let color = select(sample, sample.bgra, quad.swap_red_blue != 0u);
+    return blend_color(color, quad.opacity);
 }

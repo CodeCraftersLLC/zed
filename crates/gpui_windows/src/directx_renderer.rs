@@ -333,6 +333,15 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        // Prune once against the complete scene, including frames with no surfaces.
+        self.external_textures.retain(|id, _| {
+            scene.surfaces.iter().any(|surface| {
+                surface
+                    .content
+                    .external_texture()
+                    .is_some_and(|source| source.id() == *id)
+            })
+        });
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
@@ -812,10 +821,18 @@ impl DirectXRenderer {
                     MiscFlags: 0,
                 };
                 let mut texture = None;
-                unsafe { devices.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-                    .context("Creating an external browser texture")?;
+                // SAFETY: desc is initialized, dimensions were validated, and the
+                // output slot lives through the COM call; no initial data is read.
+                unsafe {
+                    devices
+                        .device
+                        .CreateTexture2D(&desc, None, Some(&mut texture))
+                }
+                .context("Creating an external browser texture")?;
                 let texture = texture.context("CreateTexture2D returned nothing")?;
                 let mut view = None;
+                // SAFETY: texture is a live COM resource with shader-resource
+                // binding enabled; the output slot is valid for this call.
                 unsafe {
                     devices
                         .device

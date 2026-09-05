@@ -113,10 +113,16 @@ impl ExternalFrameView<'_> {
         if width == 0 || height == 0 {
             return false;
         }
-        if self.stride < width * self.format.bytes_per_pixel() {
+        let Some(row_bytes) = width.checked_mul(self.format.bytes_per_pixel()) else {
             return false;
-        }
-        self.bytes.len() >= self.stride * height
+        };
+        // Both native upload APIs represent the row pitch as u32.
+        self.stride >= row_bytes
+            && u32::try_from(self.stride).is_ok()
+            && self
+                .stride
+                .checked_mul(height)
+                .is_some_and(|needed| needed <= self.bytes.len())
     }
 
     /// The dirty regions, clamped to the buffer, with an empty list meaning the
@@ -129,13 +135,38 @@ impl ExternalFrameView<'_> {
         if self.dirty.is_empty() {
             return vec![full];
         }
-        self.dirty
+        let regions: Vec<_> = self
+            .dirty
             .iter()
             .filter_map(|rect| {
-                let clamped = rect.intersect(&full);
-                (!clamped.is_empty()).then_some(clamped)
+                // External coordinates are untrusted. Widen before adding so
+                // malformed i32 endpoints cannot wrap into a native GPU box.
+                if rect.size.width.0 <= 0 || rect.size.height.0 <= 0 {
+                    return None;
+                }
+                let left = i64::from(rect.origin.x.0).clamp(0, i64::from(self.size.width.0.max(0)));
+                let top = i64::from(rect.origin.y.0).clamp(0, i64::from(self.size.height.0.max(0)));
+                let right = (i64::from(rect.origin.x.0) + i64::from(rect.size.width.0))
+                    .clamp(left, i64::from(self.size.width.0.max(0)));
+                let bottom = (i64::from(rect.origin.y.0) + i64::from(rect.size.height.0))
+                    .clamp(top, i64::from(self.size.height.0.max(0)));
+                (right > left && bottom > top).then_some(Bounds {
+                    origin: crate::point(DevicePixels(left as i32), DevicePixels(top as i32)),
+                    size: crate::size(
+                        DevicePixels((right - left) as i32),
+                        DevicePixels((bottom - top) as i32),
+                    ),
+                })
             })
-            .collect()
+            .collect();
+        // Dirty rectangles are hints about a complete frame. If every hint
+        // falls outside the current texture, acknowledging the sequence with
+        // no upload would leave stale pixels cached indefinitely.
+        if regions.is_empty() {
+            vec![full]
+        } else {
+            regions
+        }
     }
 }
 
@@ -252,6 +283,11 @@ impl ExternalTextureBuffer {
         self.sequence.load(Ordering::Acquire)
     }
 
+    /// Last frame committed by a renderer. CPU submissions do not advance it.
+    pub fn uploaded_sequence(&self) -> u64 {
+        self.acknowledged.load(Ordering::Acquire)
+    }
+
     /// Current buffer dimensions, or zero before the first frame.
     pub fn size(&self) -> Size<DevicePixels> {
         self.state.lock().size
@@ -277,7 +313,13 @@ impl ExternalTextureBuffer {
     ) -> bool {
         let width = size.width.0.max(0) as usize;
         let height = size.height.0.max(0) as usize;
-        if width == 0 || height == 0 || stride < width * format.bytes_per_pixel() {
+        if width == 0
+            || height == 0
+            || u32::try_from(stride).is_err()
+            || width
+                .checked_mul(format.bytes_per_pixel())
+                .is_none_or(|minimum| stride < minimum)
+        {
             return false;
         }
         let needed = stride
@@ -312,13 +354,22 @@ impl ExternalTextureBuffer {
             // The renderer has not consumed the previous frame, so this frame's
             // dirt is added to it rather than replacing it. Dropping it would
             // leave half the page showing stale pixels.
-            state.dirty.extend_from_slice(dirty);
+            // Empty means a full repaint. It must dominate in either order;
+            // appending a small rectangle to it would lose that full repaint.
+            // Bound the list when a hidden/slow consumer misses many frames.
+            if dirty.is_empty() || state.dirty.len().saturating_add(dirty.len()) > 64 {
+                state.dirty.clear();
+            } else if !state.dirty.is_empty() {
+                state.dirty.extend_from_slice(dirty);
+            }
         } else {
             // Everything up to here has been uploaded, so the previous rects
             // are spent. This is also where an acknowledgement's clean-up
             // happens, which is why `mark_uploaded` does not need the lock.
             state.dirty.clear();
-            state.dirty.extend_from_slice(dirty);
+            if dirty.len() <= 64 {
+                state.dirty.extend_from_slice(dirty);
+            }
         }
 
         state.sequence += 1;
@@ -867,5 +918,131 @@ mod tests {
         let mut seen = 0;
         buffer.with_frame(&mut |_| seen += 1);
         assert_eq!(seen, 0);
+    }
+    #[test]
+    fn full_repaint_dominates_partial_frames_in_both_orders() {
+        for full_first in [true, false] {
+            let buffer = ExternalTextureBuffer::new();
+            let pixels = bgra(8, 8, 1);
+            buffer.submit(dims(8, 8), 32, ExternalTextureFormat::Bgra8, &pixels, &[]);
+            buffer.with_frame(&mut |frame| buffer.mark_uploaded(frame.sequence));
+            let partial = [Bounds {
+                origin: point(DevicePixels(1), DevicePixels(1)),
+                size: dims(2, 2),
+            }];
+            let (first, second): (&[_], &[_]) = if full_first {
+                (&[], &partial)
+            } else {
+                (&partial, &[])
+            };
+            buffer.submit(dims(8, 8), 32, ExternalTextureFormat::Bgra8, &pixels, first);
+            buffer.submit(
+                dims(8, 8),
+                32,
+                ExternalTextureFormat::Bgra8,
+                &pixels,
+                second,
+            );
+            buffer.with_frame(&mut |frame| {
+                assert_eq!(
+                    frame.dirty_regions(),
+                    vec![Bounds {
+                        origin: point(DevicePixels(0), DevicePixels(0)),
+                        size: dims(8, 8)
+                    }]
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn missed_partial_frames_have_bounded_dirty_bookkeeping() {
+        let buffer = ExternalTextureBuffer::new();
+        let pixels = bgra(8, 8, 1);
+        buffer.submit(dims(8, 8), 32, ExternalTextureFormat::Bgra8, &pixels, &[]);
+        buffer.with_frame(&mut |frame| buffer.mark_uploaded(frame.sequence));
+        let partial = [Bounds {
+            origin: point(DevicePixels(1), DevicePixels(1)),
+            size: dims(2, 2),
+        }];
+        for _ in 0..1000 {
+            buffer.submit(
+                dims(8, 8),
+                32,
+                ExternalTextureFormat::Bgra8,
+                &pixels,
+                &partial,
+            );
+        }
+        buffer.with_frame(&mut |frame| assert!(frame.dirty.is_empty()));
+    }
+
+    #[test]
+    fn overflowing_frame_geometry_is_rejected() {
+        let frame = ExternalFrameView {
+            size: dims(1, 2),
+            stride: usize::MAX / 2 + 1,
+            format: ExternalTextureFormat::Bgra8,
+            bytes: &[],
+            generation: 1,
+            sequence: 1,
+            dirty: &[],
+        };
+        assert!(!frame.is_well_formed());
+    }
+
+    #[test]
+    fn dirty_rectangles_cannot_overflow_when_clipped() {
+        let dirty = [Bounds {
+            origin: point(DevicePixels(i32::MAX - 1), DevicePixels(0)),
+            size: dims(8, 8),
+        }];
+        let pixels = bgra(8, 8, 0);
+        let frame = ExternalFrameView {
+            size: dims(8, 8),
+            stride: 32,
+            format: ExternalTextureFormat::Bgra8,
+            bytes: &pixels,
+            generation: 1,
+            sequence: 1,
+            dirty: &dirty,
+        };
+        assert_eq!(
+            frame.dirty_regions(),
+            vec![Bounds {
+                origin: point(DevicePixels(0), DevicePixels(0)),
+                size: dims(8, 8),
+            }]
+        );
+    }
+
+    #[test]
+    fn unusable_dirty_hints_cannot_acknowledge_stale_pixels() {
+        let buffer = ExternalTextureBuffer::new();
+        let mut texture = bgra(4, 4, 0);
+        buffer.submit(dims(4, 4), 16, ExternalTextureFormat::Bgra8, &texture, &[]);
+        buffer.with_frame(&mut |frame| buffer.mark_uploaded(frame.sequence));
+        let next = bgra(4, 4, 17);
+        let dirty = [Bounds {
+            origin: point(DevicePixels(100), DevicePixels(100)),
+            size: dims(1, 1),
+        }];
+        buffer.submit(dims(4, 4), 16, ExternalTextureFormat::Bgra8, &next, &dirty);
+        buffer.with_frame(&mut |frame| {
+            for region in frame.dirty_regions() {
+                let left = region.origin.x.0 as usize * 4;
+                let right = left + region.size.width.0 as usize * 4;
+                for y in region.origin.y.0..region.origin.y.0 + region.size.height.0 {
+                    let row = y as usize * frame.stride;
+                    texture[row + left..row + right]
+                        .copy_from_slice(&frame.bytes[row + left..row + right]);
+                }
+            }
+            buffer.mark_uploaded(frame.sequence);
+        });
+        assert_eq!(
+            texture, next,
+            "an acknowledged frame must update the texture"
+        );
     }
 }

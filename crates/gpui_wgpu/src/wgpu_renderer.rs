@@ -4,8 +4,7 @@ use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, ExternalTextureCacheKey,
     ExternalTextureFormat, ExternalTextureId, ExternalTextureUpdate, GpuSpecs, MonochromeSprite,
     PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
-    Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
-    plan_external_texture_update,
+    Size, SubpixelSprite, Underline, get_gamma_correction_ratios, plan_external_texture_update,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -48,7 +47,7 @@ struct ExternalTextureInstance {
     bounds: PodBounds,
     content_mask: PodBounds,
     opacity: f32,
-    pad: u32,
+    swap_red_blue: u32,
 }
 
 /// A GPU texture owned by one external source, kept across frames so a page
@@ -147,6 +146,7 @@ struct WgpuResources {
     /// draw path holds `&self` while recording a render pass, and a device loss
     /// drops the whole `WgpuResources`, which is exactly when these must go.
     external_textures: RefCell<HashMap<ExternalTextureId, CachedExternalTexture>>,
+    external_texture_format: wgpu::TextureFormat,
 }
 
 impl WgpuResources {
@@ -491,6 +491,7 @@ impl WgpuRenderer {
             path_msaa_texture: None,
             path_msaa_view: None,
             external_textures: RefCell::new(HashMap::new()),
+            external_texture_format: context.color_texture_format(),
         };
 
         Ok(Self {
@@ -1126,6 +1127,18 @@ impl WgpuRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        // Drop GPU resources for sources absent from the complete next scene.
+        if let Some(resources) = self.resources.as_mut() {
+            resources.external_textures.get_mut().retain(|id, _| {
+                scene.surfaces.iter().any(|surface| {
+                    surface
+                        .content
+                        .external_texture()
+                        .is_some_and(|source| source.id() == *id)
+                })
+            });
+        }
+
         // Bail out early if the surface has been unconfigured (e.g. during
         // Android background/rotation transitions).  Attempting to acquire
         // a texture from an unconfigured surface can block indefinitely on
@@ -1541,8 +1554,14 @@ impl WgpuRenderer {
                     bounds: surface.bounds.into(),
                     content_mask: surface.content_mask.bounds.into(),
                     opacity: 1.0,
-                    pad: 0,
+                    swap_red_blue: u32::from(
+                        matches!(frame.format, ExternalTextureFormat::Bgra8)
+                            != (self.resources().external_texture_format
+                                == wgpu::TextureFormat::Bgra8Unorm),
+                    ),
                 }];
+                // SAFETY: ExternalTextureInstance is Pod and its layout matches
+                // the ExternalTexture storage-buffer element in shaders.wgsl.
                 let data = unsafe { Self::instance_bytes(&instances) };
 
                 let textures = self.resources().external_textures.borrow();
@@ -1574,10 +1593,9 @@ impl WgpuRenderer {
         plan: ExternalTextureUpdate,
     ) -> bool {
         let resources = self.resources();
-        let format = match frame.format {
-            ExternalTextureFormat::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,
-            ExternalTextureFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
-        };
+        // The context validated sampled/copy support for this format. Upload
+        // producer bytes directly; the draw instance swaps channels if needed.
+        let format = resources.external_texture_format;
         let width = frame.size.width.0.max(0) as u32;
         let height = frame.size.height.0.max(0) as u32;
         if width == 0 || height == 0 {
@@ -1644,8 +1662,8 @@ impl WgpuRenderer {
             // bytes at `frame.stride` pitch starting here. A slice shorter than
             // that is a wgpu validation panic, so the whole span is checked
             // rather than just its first byte.
-            let span_end = (y + region_height - 1) as usize * frame.stride
-                + (x + region_width) as usize * 4;
+            let span_end =
+                (y + region_height - 1) as usize * frame.stride + (x + region_width) as usize * 4;
             if span_end > frame.bytes.len() {
                 log::error!(
                     "external texture {id:?} reported a dirty region outside its own buffer"
