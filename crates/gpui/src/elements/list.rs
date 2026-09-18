@@ -296,6 +296,7 @@ struct ListItemSummary {
     height: Pixels,
     has_focus_handles: bool,
     has_unknown_height: bool,
+    unknown_height_count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -683,6 +684,26 @@ impl ListState {
             }
         }
         None
+    }
+
+    /// Top of item `ix` within the list content, and the content height.
+    /// Items with no known height count as the mean known height, so the
+    /// numbers stay proportional before every item has been laid out.
+    pub fn item_top_and_content_height(&self, ix: usize) -> (Pixels, Pixels) {
+        let state = &*self.0.borrow();
+        let total = state.items.summary();
+        let known = total.count - total.unknown_height_count;
+        let mean = if known > 0 {
+            total.height.0 / known as f32
+        } else {
+            0.
+        };
+        let mut cursor = state.items.cursor::<ListItemSummary>(());
+        let before: ListItemSummary = cursor.summary(&Count(ix), Bias::Right);
+        (
+            px(before.height.0 + mean * before.unknown_height_count as f32),
+            px(total.height.0 + mean * total.unknown_height_count as f32),
+        )
     }
 
     /// Call this method when the user starts dragging the scrollbar.
@@ -1597,6 +1618,7 @@ impl sum_tree::Item for ListItem {
                 },
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: size_hint.is_none(),
+                unknown_height_count: usize::from(size_hint.is_none()),
             },
             ListItem::Measured {
                 size, focus_handle, ..
@@ -1607,6 +1629,7 @@ impl sum_tree::Item for ListItem {
                 height: size.height,
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: false,
+                unknown_height_count: 0,
             },
         }
     }
@@ -1624,6 +1647,7 @@ impl sum_tree::ContextLessSummary for ListItemSummary {
         self.height += summary.height;
         self.has_focus_handles |= summary.has_focus_handles;
         self.has_unknown_height |= summary.has_unknown_height;
+        self.unknown_height_count += summary.unknown_height_count;
     }
 }
 
@@ -1949,6 +1973,45 @@ mod test {
         assert_eq!(state.logical_scroll_top().item_ix, state.item_count());
         assert_eq!(state.item_is_above_viewport(0), Some(true));
         assert_eq!(state.item_is_below_viewport(0), Some(false));
+    }
+
+    #[gpui::test]
+    fn test_item_top_tracks_measured_and_unmeasured_heights(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |ix, _, _| {
+                    div().h(px(10. * (ix + 1) as f32)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let state = ListState::new(4, crate::ListAlignment::Top, px(0.)).measure_all();
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+        assert_eq!(state.item_top_and_content_height(2), (px(30.), px(100.)));
+
+        struct Uniform(ListState);
+        impl Render for Uniform {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| div().h(px(50.)).w_full().into_any())
+                    .w_full()
+                    .h_full()
+            }
+        }
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+        let view = cx.update(|_, cx| cx.new(|_| Uniform(state.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            view.into_any_element()
+        });
+        // Only the visible items are measured; the rest count as the mean.
+        assert_eq!(state.item_top_and_content_height(5), (px(250.), px(500.)));
     }
 
     #[gpui::test]
