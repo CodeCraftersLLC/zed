@@ -116,6 +116,25 @@ struct ExternalTextureInstance {
 }
 
 /// A GPU texture owned by one external source, kept across frames.
+/// What one external-texture upload managed to copy.
+///
+/// A frame is only acknowledged when every region the producer reported reached
+/// the GPU. Acknowledging a partial upload would let the producer drop dirty
+/// regions whose pixels were never copied, and nothing would ever resend them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ExternalTextureUpload {
+    /// Nothing needed uploading: the cached texture already held this frame, or
+    /// the frame had no pixels to copy. Not an upload, so not acknowledged.
+    Reused,
+    /// Every region was copied.
+    Complete,
+    /// Not every region reached the GPU: the texture may be stale or only
+    /// partly updated. The producer keeps its dirty regions for a later frame.
+    Partial,
+}
+
+/// A GPU texture owned by one external source, kept across frames so a page
+/// that is not repainting costs no upload bandwidth (PERF-B04).
 struct CachedExternalTexture {
     texture: ID3D11Texture2D,
     view: Option<ID3D11ShaderResourceView>,
@@ -795,16 +814,15 @@ impl DirectXRenderer {
                     return;
                 }
                 match self.draw_external_frame(surface, source, &frame) {
-                    // Only an actual upload is acknowledged. Acknowledging a
+                    // Only a complete upload is acknowledged. Acknowledging a
                     // reuse would make `upload_count` report the compositing
                     // rate, and PERF-B04 reads that counter to prove a settled
-                    // page stops uploading.
-                    Ok(uploaded) => {
-                        if uploaded {
-                            source
-                                .mark_uploaded_for(self.external_texture_consumer, frame.sequence);
-                        }
+                    // page stops uploading; acknowledging a partial upload
+                    // would let the producer drop pixels that never arrived.
+                    Ok(ExternalTextureUpload::Complete) => {
+                        source.mark_uploaded_for(self.external_texture_consumer, frame.sequence);
                     }
+                    Ok(ExternalTextureUpload::Reused | ExternalTextureUpload::Partial) => {}
                     Err(error) => result = Err(error),
                 }
             });
@@ -815,19 +833,22 @@ impl DirectXRenderer {
 
     /// Upload what changed and draw one external texture.
     ///
-    /// Returns whether pixels were actually sent to the GPU, so the caller can
-    /// acknowledge an upload and not a reuse.
+    /// The outcome tells the caller whether to acknowledge the frame: only
+    /// [`ExternalTextureUpload::Complete`] means pixels were copied, and only
+    /// every region the producer reported reaching the GPU counts.
     fn draw_external_frame(
         &mut self,
         surface: &PaintSurface,
         source: &Arc<dyn gpui::ExternalTextureSource>,
         frame: &ExternalFrameView<'_>,
-    ) -> Result<bool> {
+    ) -> Result<ExternalTextureUpload> {
         let id = source.id();
         let width = frame.size.width.0.max(0) as u32;
         let height = frame.size.height.0.max(0) as u32;
         if width == 0 || height == 0 {
-            return Ok(false);
+            // Nothing to copy. This is not an upload, so the caller must not
+            // count it as one.
+            return Ok(ExternalTextureUpload::Reused);
         }
         if width > MAX_TEXTURE2D_DIMENSION || height > MAX_TEXTURE2D_DIMENSION {
             // A frame past the device's limit cannot be a texture at all, and
@@ -838,7 +859,7 @@ impl DirectXRenderer {
                 "external texture {id:?} is {width}x{height}, past D3D11's \
                  {MAX_TEXTURE2D_DIMENSION}-pixel limit; skipping it"
             );
-            return Ok(false);
+            return Ok(ExternalTextureUpload::Partial);
         }
 
         let plan = plan_external_texture_update(
@@ -904,6 +925,7 @@ impl DirectXRenderer {
                 );
             }
 
+            let mut rejected = false;
             if !matches!(plan, ExternalTextureUpdate::Reuse) {
                 let cached = self
                     .external_textures
@@ -919,6 +941,10 @@ impl DirectXRenderer {
                 } else {
                     frame.dirty_regions()
                 };
+                // A region the producer got wrong is dropped rather than
+                // turned into an out-of-bounds read or an invalid box, and the
+                // frame is then not acknowledged, so the dirt it covered comes
+                // back on a later frame.
                 for region in regions {
                     let x = region.origin.x.0.max(0) as u32;
                     let y = region.origin.y.0.max(0) as u32;
@@ -927,10 +953,36 @@ impl DirectXRenderer {
                     if region_width == 0 || region_height == 0 {
                         continue;
                     }
-                    let offset = y as usize * frame.stride + x as usize * 4;
-                    let last_row = (y + region_height - 1) as usize * frame.stride
-                        + (x + region_width) as usize * 4;
+                    // The region must fit the frame's own dimensions:
+                    // `dirty_regions` clamps to them, but this function does not
+                    // rely on its caller for a bound the device will reject.
+                    if x.saturating_add(region_width) > width
+                        || y.saturating_add(region_height) > height
+                    {
+                        log::error!(
+                            "external texture {id:?} reported a dirty region outside its own frame"
+                        );
+                        rejected = true;
+                        continue;
+                    }
+                    let offset = (y as usize)
+                        .checked_mul(frame.stride)
+                        .and_then(|row| row.checked_add(x as usize * 4));
+                    let last_row = ((y + region_height - 1) as usize)
+                        .checked_mul(frame.stride)
+                        .and_then(|end| end.checked_add((x + region_width) as usize * 4));
+                    let (Some(offset), Some(last_row)) = (offset, last_row) else {
+                        log::error!(
+                            "external texture {id:?} reported a region that overflows its stride"
+                        );
+                        rejected = true;
+                        continue;
+                    };
                     if last_row > frame.bytes.len() {
+                        log::error!(
+                            "external texture {id:?} reported a dirty region outside its own buffer"
+                        );
+                        rejected = true;
                         continue;
                     }
                     let destination = D3D11_BOX {
@@ -941,12 +993,12 @@ impl DirectXRenderer {
                         bottom: y + region_height,
                         back: 1,
                     };
-                    // SAFETY: `destination` is clipped to the texture by
-                    // `dirty_regions`, and the bounds check above proves the
-                    // source rows for that box are inside `frame.bytes`, which
-                    // stays alive for this call because `with_frame` clones the
-                    // frame snapshot before the visit and the visitor's borrow
-                    // is bounded by this closure.
+                    // SAFETY: `destination` is inside the texture (the frame
+                    // dimensions were checked above) and the bounds check
+                    // proves the source rows for that box are inside
+                    // `frame.bytes`, which stays alive for this call because
+                    // `with_frame` clones the frame snapshot before the visit
+                    // and the visitor's borrow is bounded by this closure.
                     unsafe {
                         devices.device_context.UpdateSubresource(
                             &cached.texture,
@@ -958,12 +1010,18 @@ impl DirectXRenderer {
                         );
                     }
                 }
-                cached.key = ExternalTextureCacheKey {
-                    id,
-                    generation: frame.generation,
-                    sequence: frame.sequence,
-                    size: frame.size,
-                };
+                if !rejected {
+                    cached.key = ExternalTextureCacheKey {
+                        id,
+                        generation: frame.generation,
+                        sequence: frame.sequence,
+                        size: frame.size,
+                    };
+                }
+                // A rejected region leaves the key where it was, so the next
+                // frame plans an upload again and the producer's dirt is still
+                // there to retry. The draw below still runs, so the pane keeps
+                // showing the last complete texture instead of vanishing.
             }
         }
 
@@ -996,7 +1054,13 @@ impl DirectXRenderer {
             0,
             1,
         )?;
-        Ok(!matches!(plan, ExternalTextureUpdate::Reuse))
+        if rejected {
+            return Ok(ExternalTextureUpload::Partial);
+        }
+        if matches!(plan, ExternalTextureUpdate::Reuse) {
+            return Ok(ExternalTextureUpload::Reused);
+        }
+        Ok(ExternalTextureUpload::Complete)
     }
 
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {

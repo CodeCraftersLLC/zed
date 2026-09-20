@@ -1597,6 +1597,7 @@ impl MetalRenderer {
                     SurfaceBounds {
                         bounds: surface.bounds,
                         content_mask: surface.content_mask,
+                        opacity: surface.opacity,
                     },
                 );
             }
@@ -1806,11 +1807,14 @@ pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Opacity of the element the surface was painted inside, so a video
+    /// surface fades with its ancestors instead of staying fully opaque.
+    pub opacity: f32,
 }
 
 #[cfg(any(test, feature = "test-support"))]

@@ -505,19 +505,25 @@ impl ExternalTextureBuffer {
     /// Forget the frame without dropping the identity, so a hidden pane stops
     /// holding a framebuffer while keeping its renderer (PRD HID-01).
     pub fn release_frame(&self) {
-        {
-            let mut state = self.state.lock();
-            state.size = Size::default();
-            state.stride = 0;
-            state.format = None;
-            state.dirty.clear();
-            state.generation += 1;
-            state.sequence = 0;
-        }
-        *self.frame.lock() = None;
+        // Everything happens under the state lock, which is also the lock
+        // `submit` holds while it publishes: a producer cannot slip a frame in
+        // between, which would either be erased by this call or leave
+        // `has_frame()` true with no frame behind it.
+        //
+        // Lock invariant: `state` is always taken first and is the only lock
+        // ever held while acquiring another; `consumers`, `spare` and `frame`
+        // are leaves that are never held while taking anything.
+        let mut state = self.state.lock();
+        state.size = Size::default();
+        state.stride = 0;
+        state.format = None;
+        state.dirty.clear();
+        state.generation += 1;
+        state.sequence = 0;
         // The spare is a framebuffer as well, and this call exists to stop a
         // hidden pane holding one (PRD HID-01), so it goes too.
         *self.spare.lock() = Vec::new();
+        *self.frame.lock() = None;
         // A renderer that draws this source again starts from a recreate and
         // registers itself again on its first upload.
         self.consumers.lock().clear();

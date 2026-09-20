@@ -692,8 +692,8 @@ impl ListState {
     ///
     /// Both numbers are in the list's own content space, padding included:
     /// [`List`] places the first item at `padding.top` and the content it
-    /// scrolls spans both edges, matching [`ListState::scroll`] and
-    /// [`ListState::is_scrolled_to_end`]. Note that
+    /// scrolls spans both edges, which is what
+    /// [`ListState::is_scrolled_to_end`] measures. Note that
     /// [`ListState::max_offset_for_scrollbar`] and
     /// [`ListState::scroll_px_offset_for_scrollbar`] still measure the items
     /// without padding, so a caller mixing the two is off by the padding.

@@ -725,9 +725,10 @@ pub struct PaintSurface {
     /// Opacity of the element this surface was painted inside.
     ///
     /// A surface is drawn from its own texture, so the renderer cannot inherit
-    /// the sprite atlas's element opacity: without this an external texture
-    /// inside a faded ancestor would stay fully opaque. The CoreVideo path does
-    /// not consume it yet.
+    /// the sprite atlas's element opacity: without this a surface inside a
+    /// faded ancestor would stay fully opaque. Both surface paths consume it —
+    /// the CoreVideo shader multiplies its fragment alpha by it, and the
+    /// external-texture instance carries it to each backend's shader.
     pub opacity: f32,
 }
 

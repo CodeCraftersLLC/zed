@@ -50,6 +50,25 @@ struct ExternalTextureInstance {
     swap_red_blue: u32,
 }
 
+/// What one external-texture upload managed to copy.
+///
+/// A frame is only acknowledged when every region the producer reported reached
+/// the GPU. Acknowledging a partial upload would let the producer drop dirty
+/// regions whose pixels were never copied, and nothing would ever resend them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ExternalTextureUpload {
+    /// Nothing needed uploading: the frame had no pixels to copy. Not an
+    /// upload, so not acknowledged.
+    Reused,
+    /// Every region was copied.
+    Complete,
+    /// Not every region reached the GPU: the texture may be stale or only
+    /// partly updated. The producer keeps its dirty regions for a later frame.
+    Partial,
+    /// Nothing could be cached for this source.
+    Failed,
+}
+
 /// A GPU texture owned by one external source, kept across frames so a page
 /// that is not repainting costs no upload bandwidth (PERF-B04).
 struct CachedExternalTexture {
@@ -1582,11 +1601,23 @@ impl WgpuRenderer {
                 let plan = plan_external_texture_update(cached_key, &frame);
 
                 if !matches!(plan, ExternalTextureUpdate::Reuse) {
-                    if !self.upload_external_texture(source, &frame, plan) {
-                        ok = false;
-                        return;
+                    match self.upload_external_texture(source, &frame, plan) {
+                        ExternalTextureUpload::Complete => {
+                            source
+                                .mark_uploaded_for(self.external_texture_consumer, frame.sequence);
+                        }
+                        ExternalTextureUpload::Reused => {}
+                        ExternalTextureUpload::Partial => {
+                            // Deliberately unacknowledged: the pixels this frame
+                            // could not copy are still dirty as far as the
+                            // producer is concerned, so a later frame retries
+                            // them instead of leaving stale pixels forever.
+                        }
+                        ExternalTextureUpload::Failed => {
+                            ok = false;
+                            return;
+                        }
                     }
-                    source.mark_uploaded_for(self.external_texture_consumer, frame.sequence);
                 }
 
                 let instances = [ExternalTextureInstance {
@@ -1623,14 +1654,18 @@ impl WgpuRenderer {
         true
     }
 
-    /// Create or refresh the cached texture for one external source. Returns
-    /// false only when the frame cannot be represented at all.
+    /// Create or refresh the cached texture for one external source.
+    ///
+    /// Returns [`ExternalTextureUpload::Failed`] only when the frame cannot be
+    /// cached at all; a region rejected as malformed yields
+    /// [`ExternalTextureUpload::Partial`], which the caller must not
+    /// acknowledge.
     fn upload_external_texture(
         &self,
         source: &Arc<dyn gpui::ExternalTextureSource>,
         frame: &gpui::ExternalFrameView<'_>,
         plan: ExternalTextureUpdate,
-    ) -> bool {
+    ) -> ExternalTextureUpload {
         let id = source.id();
         let resources = self.resources();
         // The context validated sampled/copy support for this format. Upload
@@ -1639,7 +1674,9 @@ impl WgpuRenderer {
         let width = frame.size.width.0.max(0) as u32;
         let height = frame.size.height.0.max(0) as u32;
         if width == 0 || height == 0 {
-            return true;
+            // Nothing to copy. This is not an upload, so the caller must not
+            // count it as one.
+            return ExternalTextureUpload::Reused;
         }
 
         let mut textures = resources.external_textures.borrow_mut();
@@ -1677,7 +1714,7 @@ impl WgpuRenderer {
         }
 
         let Some(cached) = textures.get_mut(&id) else {
-            return false;
+            return ExternalTextureUpload::Failed;
         };
 
         // A recreated texture has no pixels yet, so it takes the whole frame
@@ -1691,6 +1728,10 @@ impl WgpuRenderer {
             frame.dirty_regions()
         };
 
+        // A region the producer got wrong is dropped rather than turned into an
+        // out-of-bounds read or a validation panic, and the frame is then not
+        // acknowledged, so the dirt it covered comes back on a later frame.
+        let mut rejected = false;
         for region in regions {
             let x = region.origin.x.0.max(0) as u32;
             let y = region.origin.y.0.max(0) as u32;
@@ -1699,17 +1740,36 @@ impl WgpuRenderer {
             if region_width == 0 || region_height == 0 {
                 continue;
             }
-            let offset = y as usize * frame.stride + x as usize * 4;
+            // The region must fit the frame's own dimensions: `dirty_regions`
+            // clamps to them, but this function does not rely on its caller for
+            // a bound the GPU will enforce with a validation error.
+            if x.saturating_add(region_width) > width || y.saturating_add(region_height) > height {
+                log::error!(
+                    "external texture {id:?} reported a dirty region outside its own frame"
+                );
+                rejected = true;
+                continue;
+            }
+            let offset = (y as usize)
+                .checked_mul(frame.stride)
+                .and_then(|row| row.checked_add(x as usize * 4));
             // `write_texture` reads `region_height` rows of `region_width * 4`
             // bytes at `frame.stride` pitch starting here. A slice shorter than
             // that is a wgpu validation panic, so the whole span is checked
-            // rather than just its first byte.
-            let span_end =
-                (y + region_height - 1) as usize * frame.stride + (x + region_width) as usize * 4;
+            // rather than just its first byte, with arithmetic that cannot wrap.
+            let span_end = ((y + region_height - 1) as usize)
+                .checked_mul(frame.stride)
+                .and_then(|end| end.checked_add((x + region_width) as usize * 4));
+            let (Some(offset), Some(span_end)) = (offset, span_end) else {
+                log::error!("external texture {id:?} reported a region that overflows its stride");
+                rejected = true;
+                continue;
+            };
             if span_end > frame.bytes.len() {
                 log::error!(
                     "external texture {id:?} reported a dirty region outside its own buffer"
                 );
+                rejected = true;
                 continue;
             }
             resources.queue.write_texture(
@@ -1733,13 +1793,18 @@ impl WgpuRenderer {
             );
         }
 
+        if rejected {
+            // The key stays where it was, so the next frame plans an upload
+            // again and the producer's dirt is still there to retry.
+            return ExternalTextureUpload::Partial;
+        }
         cached.key = ExternalTextureCacheKey {
             id,
             generation: frame.generation,
             sequence: frame.sequence,
             size: frame.size,
         };
-        true
+        ExternalTextureUpload::Complete
     }
 
     fn draw_instances(
