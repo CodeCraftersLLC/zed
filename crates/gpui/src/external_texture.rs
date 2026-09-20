@@ -23,9 +23,11 @@
 //! The producer (a Chromium OSR paint callback, on a Chromium thread) writes
 //! into its own buffer and bumps [`ExternalFrameView::sequence`]. The consumer
 //! (a GPUI renderer, on the UI thread during paint) calls
-//! [`ExternalTextureSource::with_frame`], which is expected to take whatever
-//! lock the producer uses. Implementations must keep that critical section to a
-//! memcpy's worth of work — it runs inside the frame budget.
+//! [`ExternalTextureSource::with_frame`]. [`ExternalTextureBuffer`] publishes
+//! each frame as an immutable snapshot, so the visit — which uploads to the GPU
+//! — runs without any producer lock held and a submit never waits for a render.
+//! A source that does take a lock in `with_frame` must keep that critical
+//! section to a memcpy's worth of work; it runs inside the frame budget.
 //!
 //! # Resize
 //!
@@ -96,9 +98,11 @@ pub struct ExternalFrameView<'a> {
     /// sequence must not upload again — this is what makes a settled page cost
     /// zero bandwidth.
     pub sequence: u64,
-    /// The regions that changed since `sequence - 1`, in texture pixels. Empty
-    /// means "assume everything changed", which is correct but expensive; a
-    /// producer should always fill this in when it knows.
+    /// The regions that changed since the oldest frame a renderer still needs,
+    /// in texture pixels: a union, not just this frame's changes, because a
+    /// renderer that missed a frame needs everything that moved while it was
+    /// away. Empty means "assume everything changed", which is correct but
+    /// expensive; a producer should always fill this in when it knows.
     pub dirty: &'a [Bounds<DevicePixels>],
 }
 
@@ -194,10 +198,56 @@ pub trait ExternalTextureSource: fmt::Debug + Send + Sync + 'static {
     /// place a renderer can see the sequence it just uploaded. An
     /// implementation must therefore not take any lock that `with_frame`
     /// holds, or the render thread deadlocks on the first painted frame.
+    ///
+    /// This is the single-consumer shorthand, and it counts as an
+    /// acknowledgement from [`ExternalTextureConsumerId::LEGACY`]. A renderer
+    /// that may share the source with another renderer should call
+    /// [`Self::mark_uploaded_for`] with its own consumer id instead.
     fn mark_uploaded(&self, sequence: u64);
+
+    /// Told to the source after `consumer` uploads `sequence`.
+    ///
+    /// The default forwards to [`Self::mark_uploaded`], which is all a source
+    /// with one consumer needs. [`ExternalTextureBuffer`] overrides it so dirty
+    /// regions are kept until *every* renderer that has drawn the source has
+    /// caught up, because one renderer acknowledging a frame must not make a
+    /// second renderer's texture stale.
+    fn mark_uploaded_for(&self, _consumer: ExternalTextureConsumerId, sequence: u64) {
+        self.mark_uploaded(sequence);
+    }
+
+    /// The renderer behind `consumer` no longer draws this source.
+    ///
+    /// Called when a renderer drops the texture it cached for this source — a
+    /// closed window, a GPU device loss, or a cache prune. A source that keeps
+    /// per-consumer state must forget the consumer, or a renderer that will
+    /// never upload again would hold dirty regions for the rest of the source's
+    /// life. The default does nothing, for sources that keep no such state.
+    fn remove_consumer(&self, _consumer: ExternalTextureConsumerId) {}
 
     /// How many uploads this source has served. Instrumentation only.
     fn upload_count(&self) -> u64;
+}
+
+/// Identity of one renderer drawing a source's frames.
+///
+/// A source can be drawn by more than one renderer — the same pane shown in two
+/// windows — and each renderer uploads on its own schedule. Acknowledgements are
+/// per consumer so that the renderer which draws second is not left with stale
+/// pixels because the renderer which drew first acknowledged the frame.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExternalTextureConsumerId(pub u64);
+
+impl ExternalTextureConsumerId {
+    /// The slot [`ExternalTextureSource::mark_uploaded`] acknowledges, for
+    /// sources and callers that only ever have one consumer.
+    pub const LEGACY: Self = Self(0);
+
+    /// Hand out an id no other renderer in this process will get.
+    pub fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 /// A frame producer plus the bookkeeping every implementation would otherwise
@@ -208,28 +258,42 @@ pub trait ExternalTextureSource: fmt::Debug + Send + Sync + 'static {
 /// methods. Neither side needs to know about the other's thread.
 pub struct ExternalTextureBuffer {
     id: ExternalTextureId,
+    /// Producer-side bookkeeping. It holds no pixels, so a renderer never holds
+    /// this lock while it uploads and a producer never waits for one.
     state: parking_lot::Mutex<BufferState>,
-    /// Read by perf assertions from another thread, so it lives outside the
+    /// The frame renderers see. `submit` swaps a fresh snapshot in and
+    /// `with_frame` clones the `Arc` out before the visit, so a GPU upload
+    /// cannot block the producer's next frame.
+    frame: parking_lot::Mutex<Option<Arc<ExternalFrame>>>,
+    /// The allocation the next snapshot reuses. A steady stream of same-sized
+    /// frames therefore does not churn the allocator.
+    spare: parking_lot::Mutex<Vec<u8>>,
+    /// Read by perf assertions from another thread, so it lives outside every
     /// lock.
     uploads: AtomicU64,
     /// Mirrors `state.sequence` for lock-free reads.
     sequence: AtomicU64,
-    /// The last sequence a renderer said it uploaded.
-    ///
-    /// Outside the mutex on purpose. Renderers acknowledge from inside the
-    /// [`ExternalTextureSource::with_frame`] visitor, because that is the only
-    /// place they can see the sequence they just uploaded, and the lock is held
-    /// for the whole visit. An acknowledgement that took the lock would
-    /// deadlock the render thread on the first painted frame.
-    acknowledged: AtomicU64,
+    /// Last uploaded sequence per renderer that has drawn this source.
+    consumers: parking_lot::Mutex<std::collections::BTreeMap<ExternalTextureConsumerId, u64>>,
 }
 
 #[derive(Default)]
 struct BufferState {
-    bytes: Vec<u8>,
     size: Size<DevicePixels>,
     stride: usize,
     format: Option<ExternalTextureFormat>,
+    generation: u64,
+    sequence: u64,
+    dirty: Vec<Bounds<DevicePixels>>,
+}
+
+/// The pixels and metadata of one published frame, shared with whichever
+/// renderers are drawing the source.
+struct ExternalFrame {
+    bytes: Vec<u8>,
+    size: Size<DevicePixels>,
+    stride: usize,
+    format: ExternalTextureFormat,
     generation: u64,
     sequence: u64,
     dirty: Vec<Bounds<DevicePixels>>,
@@ -261,9 +325,11 @@ impl ExternalTextureBuffer {
         Self {
             id: ExternalTextureId::next(),
             state: parking_lot::Mutex::new(BufferState::default()),
+            frame: parking_lot::Mutex::new(None),
+            spare: parking_lot::Mutex::new(Vec::new()),
             uploads: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
-            acknowledged: AtomicU64::new(0),
+            consumers: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -283,9 +349,9 @@ impl ExternalTextureBuffer {
         self.sequence.load(Ordering::Acquire)
     }
 
-    /// Last frame committed by a renderer. CPU submissions do not advance it.
+    /// Last frame committed by any renderer. CPU submissions do not advance it.
     pub fn uploaded_sequence(&self) -> u64 {
-        self.acknowledged.load(Ordering::Acquire)
+        self.consumers.lock().values().copied().max().unwrap_or(0)
     }
 
     /// Current buffer dimensions, or zero before the first frame.
@@ -329,43 +395,39 @@ impl ExternalTextureBuffer {
             return false;
         };
 
+        // Bookkeeping and publication share one critical section, so two
+        // producers cannot publish frames out of sequence order. The lock holds
+        // a frame-sized memcpy, exactly as it did before the pixels moved into
+        // a snapshot — but it is *not* held across a visit, which is the part
+        // that used to stall a producer behind a GPU upload.
         let mut state = self.state.lock();
         let reallocated =
             state.size != size || state.stride != stride || state.format != Some(format);
         if reallocated {
-            state.bytes.clear();
-            state.bytes.resize(needed, 0);
             state.size = size;
             state.stride = stride;
             state.format = Some(format);
             state.generation += 1;
+            // A recreated texture is uploaded whole; per-rect bookkeeping
+            // would just be thrown away.
             state.dirty.clear();
-        } else if state.bytes.len() < needed {
-            state.bytes.resize(needed, 0);
-        }
-        state.bytes[..needed].copy_from_slice(&bytes[..needed]);
-
-        let acknowledged = self.acknowledged.load(Ordering::Acquire);
-        if reallocated {
-            // A recreated texture is uploaded whole; per-rect bookkeeping would
-            // just be thrown away.
-            state.dirty.clear();
-        } else if state.sequence > acknowledged {
-            // The renderer has not consumed the previous frame, so this frame's
+        } else if self.has_unconsumed(&state) {
+            // Some renderer has not seen the previous frame, so this frame's
             // dirt is added to it rather than replacing it. Dropping it would
             // leave half the page showing stale pixels.
             // Empty means a full repaint. It must dominate in either order;
             // appending a small rectangle to it would lose that full repaint.
-            // Bound the list when a hidden/slow consumer misses many frames.
+            // Bound the list when a hidden or slow consumer misses many frames:
+            // an empty list is a full upload, which is correct and only
+            // expensive.
             if dirty.is_empty() || state.dirty.len().saturating_add(dirty.len()) > 64 {
                 state.dirty.clear();
             } else if !state.dirty.is_empty() {
                 state.dirty.extend_from_slice(dirty);
             }
         } else {
-            // Everything up to here has been uploaded, so the previous rects
-            // are spent. This is also where an acknowledgement's clean-up
-            // happens, which is why `mark_uploaded` does not need the lock.
+            // Every renderer that has drawn this source is caught up, so the
+            // previous rects are spent.
             state.dirty.clear();
             if dirty.len() <= 64 {
                 state.dirty.extend_from_slice(dirty);
@@ -373,23 +435,93 @@ impl ExternalTextureBuffer {
         }
 
         state.sequence += 1;
-        self.sequence.store(state.sequence, Ordering::Release);
+        let sequence = state.sequence;
+
+        let mut spare = self.spare.lock();
+        let mut staged = std::mem::take(&mut *spare);
+        // `resize` truncates a larger spare and zero-fills only the tail that
+        // grows, so a clear() first would memset every byte the copy is about
+        // to overwrite — 8 MB per 1080p frame, inside the producer's lock.
+        staged.resize(needed, 0);
+        staged.copy_from_slice(&bytes[..needed]);
+        let previous = self.frame.lock().replace(Arc::new(ExternalFrame {
+            bytes: staged,
+            size,
+            stride,
+            format,
+            generation: state.generation,
+            sequence,
+            dirty: state.dirty.clone(),
+        }));
+        // Reuse the previous snapshot's allocation when no renderer is still
+        // looking at it, so a steady stream of frames settles at zero
+        // allocations.
+        if let Some(previous) = previous
+            && let Ok(previous) = Arc::try_unwrap(previous)
+        {
+            *spare = previous.bytes;
+        }
+        // Stored under the state lock: two producers must not write the mirror
+        // out of order, and a concurrent `release_frame` must not leave it
+        // ahead of a frame that no longer exists.
+        self.sequence.store(sequence, Ordering::Release);
+        drop(spare);
+        drop(state);
+
         true
+    }
+
+    /// Whether any renderer that has drawn this source is behind the frame the
+    /// pending dirty regions belong to.
+    fn has_unconsumed(&self, state: &BufferState) -> bool {
+        if state.sequence == 0 {
+            return false;
+        }
+        let consumers = self.consumers.lock();
+        consumers.values().any(|ack| *ack < state.sequence)
+    }
+
+    /// Record one renderer's upload. Lock-free from the producer's point of
+    /// view, and safe from inside a visit: it takes no lock `with_frame` holds.
+    fn acknowledge(&self, consumer: ExternalTextureConsumerId, sequence: u64) {
+        self.consumers
+            .lock()
+            .entry(consumer)
+            .and_modify(|ack| *ack = (*ack).max(sequence))
+            .or_insert(sequence);
+        self.uploads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Forget a renderer that has dropped this source's texture.
+    ///
+    /// Without this a renderer that will never draw again — a closed window, a
+    /// recovered GPU device — would keep `has_unconsumed` true forever, and the
+    /// dirty list would degrade to periodic full-frame uploads for every
+    /// remaining consumer.
+    pub fn remove_consumer(&self, consumer: ExternalTextureConsumerId) {
+        self.consumers.lock().remove(&consumer);
     }
 
     /// Forget the frame without dropping the identity, so a hidden pane stops
     /// holding a framebuffer while keeping its renderer (PRD HID-01).
     pub fn release_frame(&self) {
-        let mut state = self.state.lock();
-        state.bytes = Vec::new();
-        state.size = Size::default();
-        state.stride = 0;
-        state.format = None;
-        state.dirty.clear();
-        state.generation += 1;
-        state.sequence = 0;
+        {
+            let mut state = self.state.lock();
+            state.size = Size::default();
+            state.stride = 0;
+            state.format = None;
+            state.dirty.clear();
+            state.generation += 1;
+            state.sequence = 0;
+        }
+        *self.frame.lock() = None;
+        // The spare is a framebuffer as well, and this call exists to stop a
+        // hidden pane holding one (PRD HID-01), so it goes too.
+        *self.spare.lock() = Vec::new();
+        // A renderer that draws this source again starts from a recreate and
+        // registers itself again on its first upload.
+        self.consumers.lock().clear();
         self.sequence.store(0, Ordering::Release);
-        self.acknowledged.store(0, Ordering::Release);
     }
 }
 
@@ -399,29 +531,30 @@ impl ExternalTextureSource for ExternalTextureBuffer {
     }
 
     fn with_frame(&self, visit: &mut dyn FnMut(ExternalFrameView<'_>)) {
-        let state = self.state.lock();
-        let Some(format) = state.format else {
+        // Clone the snapshot out and let the lock go before the visit: the
+        // visitor uploads to the GPU, and the producer's next frame must not
+        // wait for that.
+        let frame = self.frame.lock().clone();
+        let Some(frame) = frame else {
             return;
         };
-        if state.sequence == 0 {
-            return;
-        }
         visit(ExternalFrameView {
-            size: state.size,
-            stride: state.stride,
-            format,
-            bytes: &state.bytes,
-            generation: state.generation,
-            sequence: state.sequence,
-            dirty: &state.dirty,
+            size: frame.size,
+            stride: frame.stride,
+            format: frame.format,
+            bytes: &frame.bytes,
+            generation: frame.generation,
+            sequence: frame.sequence,
+            dirty: &frame.dirty,
         });
     }
 
     fn mark_uploaded(&self, sequence: u64) {
-        // Deliberately lock-free: this is called from inside `with_frame`,
-        // which holds the state lock for the whole visit.
-        self.acknowledged.fetch_max(sequence, Ordering::AcqRel);
-        self.uploads.fetch_add(1, Ordering::Relaxed);
+        self.acknowledge(ExternalTextureConsumerId::LEGACY, sequence);
+    }
+
+    fn mark_uploaded_for(&self, consumer: ExternalTextureConsumerId, sequence: u64) {
+        self.acknowledge(consumer, sequence);
     }
 
     fn upload_count(&self) -> u64 {
@@ -542,6 +675,110 @@ mod tests {
             1,
             "a settled page must stop adding to the upload counter"
         );
+    }
+
+    /// Two renderers drawing one source must both see the pixels that changed
+    /// while they were behind. The first one to acknowledge must not make the
+    /// source discard the dirt the second one still needs.
+    #[test]
+    fn dirty_regions_wait_for_every_consumer() {
+        let buffer = ExternalTextureBuffer::new();
+        let pixels = bgra(8, 8, 0x22);
+        let first = ExternalTextureConsumerId::next();
+        let second = ExternalTextureConsumerId::next();
+        let dirty = |x: i32, y: i32| Bounds {
+            origin: point(DevicePixels(x), DevicePixels(y)),
+            size: size(DevicePixels(2), DevicePixels(2)),
+        };
+
+        // Both renderers upload the first frame (a recreate is a full upload).
+        assert!(buffer.submit(dims(8, 8), 32, ExternalTextureFormat::Bgra8, &pixels, &[]));
+        buffer.with_frame(&mut |frame| {
+            buffer.mark_uploaded_for(first, frame.sequence);
+            buffer.mark_uploaded_for(second, frame.sequence);
+        });
+
+        // Frame 2: the first renderer uploads it, the second has not yet.
+        assert!(buffer.submit(
+            dims(8, 8),
+            32,
+            ExternalTextureFormat::Bgra8,
+            &pixels,
+            &[dirty(0, 0)]
+        ));
+        buffer.with_frame(&mut |frame| {
+            assert_eq!(frame.dirty, [dirty(0, 0)]);
+            buffer.mark_uploaded_for(first, frame.sequence);
+        });
+
+        // Frame 3 arrives before the second renderer drew frame 2, so its
+        // regions are the union, not just this frame's.
+        assert!(buffer.submit(
+            dims(8, 8),
+            32,
+            ExternalTextureFormat::Bgra8,
+            &pixels,
+            &[dirty(4, 4)]
+        ));
+        buffer.with_frame(&mut |frame| {
+            assert_eq!(
+                frame.dirty,
+                [dirty(0, 0), dirty(4, 4)],
+                "a renderer that has not drawn frame 2 still needs its pixels"
+            );
+            buffer.mark_uploaded_for(second, frame.sequence);
+            buffer.mark_uploaded_for(first, frame.sequence);
+        });
+
+        // Both are caught up, so the next frame's dirt replaces the list.
+        assert!(buffer.submit(
+            dims(8, 8),
+            32,
+            ExternalTextureFormat::Bgra8,
+            &pixels,
+            &[dirty(6, 6)]
+        ));
+        buffer.with_frame(&mut |frame| {
+            assert_eq!(frame.dirty, [dirty(6, 6)]);
+        });
+    }
+
+    /// The visit uploads to the GPU. A producer submitting the next frame must
+    /// not wait for that, or Chromium's paint callback blocks on our bandwidth.
+    #[test]
+    fn a_visit_does_not_block_the_producer() {
+        use std::sync::mpsc;
+
+        let buffer = Arc::new(ExternalTextureBuffer::new());
+        let pixels = bgra(4, 4, 0x33);
+        assert!(buffer.submit(dims(4, 4), 16, ExternalTextureFormat::Bgra8, &pixels, &[]));
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let visitor_buffer = Arc::clone(&buffer);
+        let visitor = std::thread::spawn(move || {
+            visitor_buffer.with_frame(&mut |frame| {
+                entered_tx.send(()).unwrap();
+                // Stand in for a GPU upload: the producer's next submit has to
+                // get through while this is in flight.
+                release_rx.recv().unwrap();
+                assert!(frame.is_well_formed());
+            });
+        });
+        entered_rx.recv().unwrap();
+
+        let (submitted_tx, submitted_rx) = mpsc::channel();
+        let producer_buffer = Arc::clone(&buffer);
+        let producer = std::thread::spawn(move || {
+            let ok =
+                producer_buffer.submit(dims(4, 4), 16, ExternalTextureFormat::Bgra8, &pixels, &[]);
+            submitted_tx.send(ok).unwrap();
+        });
+        let submitted = submitted_rx.recv_timeout(std::time::Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        visitor.join().unwrap();
+        producer.join().unwrap();
+        assert_eq!(submitted.expect("a submit must not wait for a visit"), true);
     }
 
     #[test]
@@ -834,9 +1071,9 @@ mod tests {
     fn acknowledging_from_inside_the_visitor_does_not_deadlock() {
         // The renderers do exactly this: they learn the sequence they uploaded
         // from the frame view, and acknowledge it before the view goes out of
-        // scope. `with_frame` holds the state lock for the whole visit, so an
-        // acknowledgement that took the same lock would hang the render thread
-        // on the very first painted frame.
+        // scope. The visit must stay free of every lock a source holds, or a
+        // source that takes one in `with_frame` would hang the render thread on
+        // the very first painted frame.
         let buffer = ExternalTextureBuffer::new();
         buffer.submit(
             dims(4, 4),

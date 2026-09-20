@@ -722,6 +722,13 @@ pub struct PaintSurface {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub content: SurfaceContent,
+    /// Opacity of the element this surface was painted inside.
+    ///
+    /// A surface is drawn from its own texture, so the renderer cannot inherit
+    /// the sprite atlas's element opacity: without this an external texture
+    /// inside a faded ancestor would stay fully opaque. The CoreVideo path does
+    /// not consume it yet.
+    pub opacity: f32,
 }
 
 /// What a [`PaintSurface`] samples from.

@@ -56,6 +56,21 @@ struct CachedExternalTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     key: ExternalTextureCacheKey,
+    /// The source this texture belongs to, and this renderer's slot in its
+    /// acknowledgement table.
+    ///
+    /// Both are here so `Drop` can retire the consumer: a renderer that loses
+    /// its device, prunes the cache, or goes away must stop counting as a
+    /// consumer that has not uploaded, or the source would keep dirty regions
+    /// for a renderer that will never draw again.
+    source: Arc<dyn gpui::ExternalTextureSource>,
+    consumer: gpui::ExternalTextureConsumerId,
+}
+
+impl Drop for CachedExternalTexture {
+    fn drop(&mut self) {
+        self.source.remove_consumer(self.consumer);
+    }
 }
 
 #[repr(C)]
@@ -180,6 +195,12 @@ pub struct WgpuRenderer {
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
+    /// This renderer's slot in every external source's acknowledgement table.
+    ///
+    /// Stable for the renderer's life, because a source holds dirty regions
+    /// until the *oldest* consumer has uploaded them: a per-frame id would look
+    /// like a new, un-caught-up renderer every frame.
+    external_texture_consumer: gpui::ExternalTextureConsumerId,
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -512,6 +533,7 @@ impl WgpuRenderer {
             transparent_alpha_mode,
             opaque_alpha_mode,
             max_texture_size,
+            external_texture_consumer: gpui::ExternalTextureConsumerId::next(),
             last_error,
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
@@ -1534,6 +1556,23 @@ impl WgpuRenderer {
                     return;
                 }
 
+                // A frame past the adapter's limit cannot be a texture at all.
+                // `create_texture` would fail validation and poison the frame,
+                // so the surface is skipped: nothing is uploaded, nothing is
+                // acknowledged (the producer keeps its dirt), and the rest of
+                // the scene still draws.
+                let width = frame.size.width.0.max(0) as u32;
+                let height = frame.size.height.0.max(0) as u32;
+                if width > self.max_texture_size || height > self.max_texture_size {
+                    log::error!(
+                        "external texture {:?} is {width}x{height}, past the adapter's \
+                         {}-pixel limit; skipping it",
+                        source.id(),
+                        self.max_texture_size
+                    );
+                    return;
+                }
+
                 let cached_key = self
                     .resources()
                     .external_textures
@@ -1543,17 +1582,17 @@ impl WgpuRenderer {
                 let plan = plan_external_texture_update(cached_key, &frame);
 
                 if !matches!(plan, ExternalTextureUpdate::Reuse) {
-                    if !self.upload_external_texture(source.id(), &frame, plan) {
+                    if !self.upload_external_texture(source, &frame, plan) {
                         ok = false;
                         return;
                     }
-                    source.mark_uploaded(frame.sequence);
+                    source.mark_uploaded_for(self.external_texture_consumer, frame.sequence);
                 }
 
                 let instances = [ExternalTextureInstance {
                     bounds: surface.bounds.into(),
                     content_mask: surface.content_mask.bounds.into(),
-                    opacity: 1.0,
+                    opacity: surface.opacity,
                     swap_red_blue: u32::from(
                         matches!(frame.format, ExternalTextureFormat::Bgra8)
                             != (self.resources().external_texture_format
@@ -1588,10 +1627,11 @@ impl WgpuRenderer {
     /// false only when the frame cannot be represented at all.
     fn upload_external_texture(
         &self,
-        id: ExternalTextureId,
+        source: &Arc<dyn gpui::ExternalTextureSource>,
         frame: &gpui::ExternalFrameView<'_>,
         plan: ExternalTextureUpdate,
     ) -> bool {
+        let id = source.id();
         let resources = self.resources();
         // The context validated sampled/copy support for this format. Upload
         // producer bytes directly; the draw instance swaps channels if needed.
@@ -1630,6 +1670,8 @@ impl WgpuRenderer {
                         sequence: 0,
                         size: frame.size,
                     },
+                    source: Arc::clone(source),
+                    consumer: self.external_texture_consumer,
                 },
             );
         }

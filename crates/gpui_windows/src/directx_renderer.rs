@@ -49,6 +49,12 @@ pub(crate) struct DirectXRenderer {
     /// a page that is not repainting costs a draw call and no upload
     /// (PERF-B04). Dropped with the device on a device-lost recovery.
     external_textures: HashMap<ExternalTextureId, CachedExternalTexture>,
+    /// This renderer's slot in every external source's acknowledgement table.
+    ///
+    /// Stable for the renderer's life, because a source holds dirty regions
+    /// until the *oldest* consumer has uploaded them: a per-frame id would look
+    /// like a new, un-caught-up renderer every frame.
+    external_texture_consumer: gpui::ExternalTextureConsumerId,
 
     width: u32,
     height: u32,
@@ -114,11 +120,39 @@ struct CachedExternalTexture {
     texture: ID3D11Texture2D,
     view: Option<ID3D11ShaderResourceView>,
     key: ExternalTextureCacheKey,
+    /// The source this texture belongs to, and this renderer's slot in its
+    /// acknowledgement table.
+    ///
+    /// Both are here so `Drop` can retire the consumer: a renderer that loses
+    /// its device, prunes the cache, or goes away must stop counting as a
+    /// consumer that has not uploaded, or the source would keep dirty regions
+    /// for a renderer that will never draw again.
+    source: Arc<dyn gpui::ExternalTextureSource>,
+    consumer: gpui::ExternalTextureConsumerId,
 }
+
+impl Drop for CachedExternalTexture {
+    fn drop(&mut self) {
+        self.source.remove_consumer(self.consumer);
+    }
+}
+
+/// `D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION`: the largest 2D texture D3D11
+/// guarantees. The header defines it as a macro, which windows-rs does not
+/// export, so it is spelled out here.
+const MAX_TEXTURE2D_DIMENSION: u32 = 16_384;
 
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    /// Clamped sibling of `sampler`, for surfaces that are not atlas tiles.
+    ///
+    /// The shared sampler wraps, which is right for a sprite tile whose UVs sit
+    /// inside the atlas: it keeps bilinear taps from sampling the neighbouring
+    /// tile. An external texture drawn at a size other than its own would wrap
+    /// the page around and bleed the opposite edge into the frame, so it gets a
+    /// sampler that clamps to the edge instead.
+    external_texture_sampler: Option<ID3D11SamplerState>,
 }
 
 struct DirectComposition {
@@ -196,6 +230,7 @@ impl DirectXRenderer {
             direct_composition,
             font_info: Self::get_font_info(),
             external_textures: HashMap::new(),
+            external_texture_consumer: gpui::ExternalTextureConsumerId::next(),
             width: 1,
             height: 1,
             skip_draws: false,
@@ -759,14 +794,15 @@ impl DirectXRenderer {
                     );
                     return;
                 }
-                match self.draw_external_frame(surface, source.id(), &frame) {
+                match self.draw_external_frame(surface, source, &frame) {
                     // Only an actual upload is acknowledged. Acknowledging a
                     // reuse would make `upload_count` report the compositing
                     // rate, and PERF-B04 reads that counter to prove a settled
                     // page stops uploading.
                     Ok(uploaded) => {
                         if uploaded {
-                            source.mark_uploaded(frame.sequence);
+                            source
+                                .mark_uploaded_for(self.external_texture_consumer, frame.sequence);
                         }
                     }
                     Err(error) => result = Err(error),
@@ -784,12 +820,24 @@ impl DirectXRenderer {
     fn draw_external_frame(
         &mut self,
         surface: &PaintSurface,
-        id: ExternalTextureId,
+        source: &Arc<dyn gpui::ExternalTextureSource>,
         frame: &ExternalFrameView<'_>,
     ) -> Result<bool> {
+        let id = source.id();
         let width = frame.size.width.0.max(0) as u32;
         let height = frame.size.height.0.max(0) as u32;
         if width == 0 || height == 0 {
+            return Ok(false);
+        }
+        if width > MAX_TEXTURE2D_DIMENSION || height > MAX_TEXTURE2D_DIMENSION {
+            // A frame past the device's limit cannot be a texture at all, and
+            // `CreateTexture2D` would fail the whole window's frame. Skipping
+            // the surface leaves the rest of the scene drawing; nothing is
+            // acknowledged, so the producer keeps its dirt.
+            log::error!(
+                "external texture {id:?} is {width}x{height}, past D3D11's \
+                 {MAX_TEXTURE2D_DIMENSION}-pixel limit; skipping it"
+            );
             return Ok(false);
         }
 
@@ -850,6 +898,8 @@ impl DirectXRenderer {
                             sequence: 0,
                             size: frame.size,
                         },
+                        source: Arc::clone(source),
+                        consumer: self.external_texture_consumer,
                     },
                 );
             }
@@ -894,8 +944,9 @@ impl DirectXRenderer {
                     // SAFETY: `destination` is clipped to the texture by
                     // `dirty_regions`, and the bounds check above proves the
                     // source rows for that box are inside `frame.bytes`, which
-                    // stays alive for this call because the producer holds its
-                    // lock for the duration of `with_frame`.
+                    // stays alive for this call because `with_frame` clones the
+                    // frame snapshot before the visit and the visitor's borrow
+                    // is bounded by this closure.
                     unsafe {
                         devices.device_context.UpdateSubresource(
                             &cached.texture,
@@ -919,7 +970,7 @@ impl DirectXRenderer {
         let instance = ExternalTextureInstance {
             bounds: surface.bounds,
             content_mask: surface.content_mask.bounds,
-            opacity: 1.0,
+            opacity: surface.opacity,
             pad: 0,
         };
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -941,7 +992,7 @@ impl DirectXRenderer {
             slice::from_ref(&view),
             slice::from_ref(&resources.viewport),
             slice::from_ref(&self.globals.global_params_buffer),
-            slice::from_ref(&self.globals.sampler),
+            slice::from_ref(&self.globals.external_texture_sampler),
             0,
             1,
         )?;
@@ -1205,9 +1256,28 @@ impl DirectXGlobalElements {
             output
         };
 
+        let external_texture_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         Ok(Self {
             global_params_buffer,
             sampler,
+            external_texture_sampler,
         })
     }
 }

@@ -4126,11 +4126,13 @@ impl Window {
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
             content: SurfaceContent::PixelBuffer(image_buffer),
+            opacity,
         });
     }
 
@@ -4145,6 +4147,12 @@ impl Window {
     /// the entire atlas every frame. See [`crate::external_texture`].
     ///
     /// Call only during the paint phase of element drawing.
+    ///
+    /// **Not available on macOS.** The Metal backend composites CoreVideo
+    /// surfaces only ([`Self::paint_surface`]), which is the path macOS browser
+    /// and video panes use; a caller-owned RGBA texture has no Metal pipeline
+    /// here. On macOS this records nothing and warns once, rather than
+    /// appearing to paint and showing no pixels.
     pub fn paint_external_texture(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -4154,13 +4162,27 @@ impl Window {
 
         self.invalidator.debug_assert_paint();
 
+        if cfg!(target_os = "macos") {
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if WARNED.set(()).is_ok() {
+                log::warn!(
+                    "paint_external_texture is unavailable on macOS: the Metal backend \
+                     composites CoreVideo surfaces only; use paint_surface instead"
+                );
+            }
+            let _ = (bounds, source);
+            return;
+        }
+
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
             content: SurfaceContent::ExternalTexture(source),
+            opacity,
         });
     }
 
