@@ -1256,3 +1256,58 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              External textures
+**
+*/
+// A caller-owned RGBA/BGRA texture composited inside the scene, used by the
+// embedded browser's off-screen Chromium frames. Unlike a polychrome sprite
+// this samples a texture that belongs to one producer and holds exactly one
+// frame, so a 1080p page never touches the shared sprite atlas.
+
+struct ExternalTexture {
+    Bounds bounds;
+    Bounds content_mask;
+    float opacity;
+    uint pad;
+};
+StructuredBuffer<ExternalTexture> external_textures: register(t1);
+
+struct ExternalTextureVertexOutput {
+    nointerpolation uint external_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_position: POSITION;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct ExternalTextureFragmentInput {
+    nointerpolation uint external_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_position: POSITION;
+};
+
+ExternalTextureVertexOutput external_texture_vertex(uint vertex_id: SV_VertexID, uint external_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    ExternalTexture external = external_textures[external_id];
+    float4 device_position = to_device_position(unit_vertex, external.bounds);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, external.bounds,
+                                                   external.content_mask);
+
+    ExternalTextureVertexOutput output;
+    output.position = device_position;
+    // The texture holds exactly this rect, so unit coordinates are the texture
+    // coordinates. No atlas tile arithmetic.
+    output.texture_position = unit_vertex;
+    output.external_id = external_id;
+    output.clip_distance = clip_distance;
+    return output;
+}
+
+float4 external_texture_fragment(ExternalTextureFragmentInput input): SV_Target {
+    ExternalTexture external = external_textures[input.external_id];
+    float4 color = t_sprite.Sample(s_sprite, input.texture_position);
+    color.a *= external.opacity;
+    return color;
+}

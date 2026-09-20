@@ -296,6 +296,7 @@ struct ListItemSummary {
     height: Pixels,
     has_focus_handles: bool,
     has_unknown_height: bool,
+    unknown_height_count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -683,6 +684,37 @@ impl ListState {
             }
         }
         None
+    }
+
+    /// Top of item `ix` within the list content, and the content height.
+    /// Items with no known height count as the mean known height, so the
+    /// numbers stay proportional before every item has been laid out.
+    ///
+    /// Both numbers are in the list's own content space, padding included:
+    /// [`List`] places the first item at `padding.top` and the content it
+    /// scrolls spans both edges, which is what
+    /// [`ListState::is_scrolled_to_end`] measures. Note that
+    /// [`ListState::max_offset_for_scrollbar`] and
+    /// [`ListState::scroll_px_offset_for_scrollbar`] still measure the items
+    /// without padding, so a caller mixing the two is off by the padding.
+    pub fn item_top_and_content_height(&self, ix: usize) -> (Pixels, Pixels) {
+        let state = &*self.0.borrow();
+        let padding = state.last_padding.unwrap_or_default();
+        let total = state.items.summary();
+        let known = total.count - total.unknown_height_count;
+        let mean = if known > 0 {
+            total.height.0 / known as f32
+        } else {
+            0.
+        };
+        let mut cursor = state.items.cursor::<ListItemSummary>(());
+        let before: ListItemSummary = cursor.summary(&Count(ix), Bias::Right);
+        let measured_top = px(before.height.0 + mean * before.unknown_height_count as f32);
+        let measured_total = px(total.height.0 + mean * total.unknown_height_count as f32);
+        (
+            padding.top + measured_top,
+            measured_total + padding.top + padding.bottom,
+        )
     }
 
     /// Call this method when the user starts dragging the scrollbar.
@@ -1597,6 +1629,7 @@ impl sum_tree::Item for ListItem {
                 },
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: size_hint.is_none(),
+                unknown_height_count: usize::from(size_hint.is_none()),
             },
             ListItem::Measured {
                 size, focus_handle, ..
@@ -1607,6 +1640,7 @@ impl sum_tree::Item for ListItem {
                 height: size.height,
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: false,
+                unknown_height_count: 0,
             },
         }
     }
@@ -1624,6 +1658,7 @@ impl sum_tree::ContextLessSummary for ListItemSummary {
         self.height += summary.height;
         self.has_focus_handles |= summary.has_focus_handles;
         self.has_unknown_height |= summary.has_unknown_height;
+        self.unknown_height_count += summary.unknown_height_count;
     }
 }
 
@@ -1949,6 +1984,113 @@ mod test {
         assert_eq!(state.logical_scroll_top().item_ix, state.item_count());
         assert_eq!(state.item_is_above_viewport(0), Some(true));
         assert_eq!(state.item_is_below_viewport(0), Some(false));
+    }
+
+    #[gpui::test]
+    fn test_item_top_tracks_measured_and_unmeasured_heights(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |ix, _, _| {
+                    div().h(px(10. * (ix + 1) as f32)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let state = ListState::new(4, crate::ListAlignment::Top, px(0.)).measure_all();
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+        assert_eq!(state.item_top_and_content_height(2), (px(30.), px(100.)));
+
+        struct Uniform(ListState);
+        impl Render for Uniform {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(50.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+        let view = cx.update(|_, cx| cx.new(|_| Uniform(state.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            view.into_any_element()
+        });
+        // Only the visible items are measured; the rest count as the mean.
+        assert_eq!(state.item_top_and_content_height(5), (px(250.), px(500.)));
+    }
+
+    /// An item whose height is not known yet still has to report a top: the
+    /// mean known height is what keeps a scroll position proportional while a
+    /// long list is still measuring.
+    #[gpui::test]
+    fn test_item_top_extrapolates_unmeasured_items_from_the_mean(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        struct Mixed(ListState);
+        impl Render for Mixed {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |ix, _, _| {
+                    // The first two are 20px, the rest would be 40px if they
+                    // were ever measured.
+                    div()
+                        .h(if ix < 2 { px(20.) } else { px(40.) })
+                        .w_full()
+                        .into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        // The viewport fits exactly two items, so items 2 and up stay unknown.
+        let state = ListState::new(6, crate::ListAlignment::Top, px(0.));
+        let view = cx.update(|_, cx| cx.new(|_| Mixed(state.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.into_any_element()
+        });
+
+        // Two 20px items are known: mean 20. Item 3's top is therefore
+        // 20 + 20 + 20, not 20 + 20 + 40.
+        let (top, total) = state.item_top_and_content_height(3);
+        assert_eq!(top, px(60.));
+        assert_eq!(total, px(120.));
+    }
+
+    #[gpui::test]
+    fn test_item_top_includes_list_padding(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        struct Padded(ListState);
+        impl Render for Padded {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(20.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+                .p(px(7.))
+            }
+        }
+
+        let state = ListState::new(3, crate::ListAlignment::Top, px(0.)).measure_all();
+        let view = cx.update(|_, cx| cx.new(|_| Padded(state.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+
+        // `List` puts the first item at `padding.top` and its scrollable
+        // content spans both padded edges, so both reported numbers carry the
+        // padding: item 2 sits 7 + 2*20 from the top of the content, and the
+        // content is 3*20 + 2*7 tall.
+        assert_eq!(state.item_top_and_content_height(2), (px(47.), px(74.)));
     }
 
     #[gpui::test]

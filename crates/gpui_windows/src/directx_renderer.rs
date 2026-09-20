@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     slice,
     sync::{Arc, OnceLock},
 };
@@ -44,6 +45,16 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
+    /// One cached D3D texture per external source (embedded browser panes), so
+    /// a page that is not repainting costs a draw call and no upload
+    /// (PERF-B04). Dropped with the device on a device-lost recovery.
+    external_textures: HashMap<ExternalTextureId, CachedExternalTexture>,
+    /// This renderer's slot in every external source's acknowledgement table.
+    ///
+    /// Stable for the renderer's life, because a source holds dirty regions
+    /// until the *oldest* consumer has uploaded them: a per-frame id would look
+    /// like a new, un-caught-up renderer every frame.
+    external_texture_consumer: gpui::ExternalTextureConsumerId,
 
     width: u32,
     height: u32,
@@ -90,11 +101,77 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    external_textures: PipelineState<ExternalTextureInstance>,
 }
+
+/// One external-texture draw. Mirrors `ExternalTexture` in `shaders.hlsl`;
+/// changing either side without the other silently corrupts the geometry.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ExternalTextureInstance {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
+    opacity: f32,
+    pad: u32,
+}
+
+/// A GPU texture owned by one external source, kept across frames.
+/// What one external-texture upload managed to copy.
+///
+/// A frame is only acknowledged when every region the producer reported reached
+/// the GPU. Acknowledging a partial upload would let the producer drop dirty
+/// regions whose pixels were never copied, and nothing would ever resend them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ExternalTextureUpload {
+    /// Nothing needed uploading: the cached texture already held this frame, or
+    /// the frame had no pixels to copy. Not an upload, so not acknowledged.
+    Reused,
+    /// Every region was copied.
+    Complete,
+    /// Not every region reached the GPU: the texture may be stale or only
+    /// partly updated. The producer keeps its dirty regions for a later frame.
+    Partial,
+}
+
+/// A GPU texture owned by one external source, kept across frames so a page
+/// that is not repainting costs no upload bandwidth (PERF-B04).
+struct CachedExternalTexture {
+    texture: ID3D11Texture2D,
+    view: Option<ID3D11ShaderResourceView>,
+    key: ExternalTextureCacheKey,
+    /// The source this texture belongs to, and this renderer's slot in its
+    /// acknowledgement table.
+    ///
+    /// Both are here so `Drop` can retire the consumer: a renderer that loses
+    /// its device, prunes the cache, or goes away must stop counting as a
+    /// consumer that has not uploaded, or the source would keep dirty regions
+    /// for a renderer that will never draw again.
+    source: Arc<dyn gpui::ExternalTextureSource>,
+    consumer: gpui::ExternalTextureConsumerId,
+}
+
+impl Drop for CachedExternalTexture {
+    fn drop(&mut self) {
+        self.source.remove_consumer(self.consumer);
+    }
+}
+
+/// `D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION`: the largest 2D texture D3D11
+/// guarantees. The header defines it as a macro, which windows-rs does not
+/// export, so it is spelled out here.
+const MAX_TEXTURE2D_DIMENSION: u32 = 16_384;
 
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    /// Clamped sibling of `sampler`, for surfaces that are not atlas tiles.
+    ///
+    /// The shared sampler wraps, which is right for a sprite tile whose UVs sit
+    /// inside the atlas: it keeps bilinear taps from sampling the neighbouring
+    /// tile. An external texture drawn at a size other than its own would wrap
+    /// the page around and bleed the opposite edge into the frame, so it gets a
+    /// sampler that clamps to the edge instead.
+    external_texture_sampler: Option<ID3D11SamplerState>,
 }
 
 struct DirectComposition {
@@ -171,6 +248,8 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             font_info: Self::get_font_info(),
+            external_textures: HashMap::new(),
+            external_texture_consumer: gpui::ExternalTextureConsumerId::next(),
             width: 1,
             height: 1,
             skip_draws: false,
@@ -259,6 +338,8 @@ impl DirectXRenderer {
             self.direct_composition.take();
             self.devices.take();
         }
+        // These hold textures created on the dead device.
+        self.external_textures.clear();
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
             .context("Recreating DirectX devices")?;
@@ -306,6 +387,15 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        // Prune once against the complete scene, including frames with no surfaces.
+        self.external_textures.retain(|id, _| {
+            scene.surfaces.iter().any(|surface| {
+                surface
+                    .content
+                    .external_texture()
+                    .is_some_and(|source| source.id() == *id)
+            })
+        });
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
@@ -697,11 +787,280 @@ impl DirectXRenderer {
         )
     }
 
+    /// Composite caller-owned textures (embedded browser frames) into the
+    /// scene.
+    ///
+    /// CoreVideo surfaces are a macOS path and never reach here; on Windows a
+    /// `PaintSurface` is always an external texture.
     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
         }
+        for surface in surfaces {
+            let Some(source) = surface.content.external_texture() else {
+                continue;
+            };
+            let mut result = Ok(());
+            source.with_frame(&mut |frame| {
+                if !frame.is_well_formed() {
+                    // A producer that mis-declares its geometry is a bug, but it
+                    // must not become an out-of-bounds read.
+                    log::error!(
+                        "external texture {:?} offered a malformed frame ({:?}, stride {})",
+                        source.id(),
+                        frame.size,
+                        frame.stride
+                    );
+                    return;
+                }
+                match self.draw_external_frame(surface, source, &frame) {
+                    // Only a complete upload is acknowledged. Acknowledging a
+                    // reuse would make `upload_count` report the compositing
+                    // rate, and PERF-B04 reads that counter to prove a settled
+                    // page stops uploading; acknowledging a partial upload
+                    // would let the producer drop pixels that never arrived.
+                    Ok(ExternalTextureUpload::Complete) => {
+                        source.mark_uploaded_for(self.external_texture_consumer, frame.sequence);
+                    }
+                    Ok(ExternalTextureUpload::Reused | ExternalTextureUpload::Partial) => {}
+                    Err(error) => result = Err(error),
+                }
+            });
+            result?;
+        }
         Ok(())
+    }
+
+    /// Upload what changed and draw one external texture.
+    ///
+    /// The outcome tells the caller whether to acknowledge the frame: only
+    /// [`ExternalTextureUpload::Complete`] means pixels were copied, and only
+    /// every region the producer reported reaching the GPU counts.
+    fn draw_external_frame(
+        &mut self,
+        surface: &PaintSurface,
+        source: &Arc<dyn gpui::ExternalTextureSource>,
+        frame: &ExternalFrameView<'_>,
+    ) -> Result<ExternalTextureUpload> {
+        let id = source.id();
+        let width = frame.size.width.0.max(0) as u32;
+        let height = frame.size.height.0.max(0) as u32;
+        if width == 0 || height == 0 {
+            // Nothing to copy. This is not an upload, so the caller must not
+            // count it as one.
+            return Ok(ExternalTextureUpload::Reused);
+        }
+        if width > MAX_TEXTURE2D_DIMENSION || height > MAX_TEXTURE2D_DIMENSION {
+            // A frame past the device's limit cannot be a texture at all, and
+            // `CreateTexture2D` would fail the whole window's frame. Skipping
+            // the surface leaves the rest of the scene drawing; nothing is
+            // acknowledged, so the producer keeps its dirt.
+            log::error!(
+                "external texture {id:?} is {width}x{height}, past D3D11's \
+                 {MAX_TEXTURE2D_DIMENSION}-pixel limit; skipping it"
+            );
+            return Ok(ExternalTextureUpload::Partial);
+        }
+
+        let plan = plan_external_texture_update(
+            self.external_textures.get(&id).map(|cached| cached.key),
+            frame,
+        );
+
+        {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            if matches!(plan, ExternalTextureUpdate::Recreate) {
+                let format = match frame.format {
+                    ExternalTextureFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
+                    ExternalTextureFormat::Rgba8 => DXGI_FORMAT_R8G8B8A8_UNORM,
+                };
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: width,
+                    Height: height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                let mut texture = None;
+                // SAFETY: desc is initialized, dimensions were validated, and the
+                // output slot lives through the COM call; no initial data is read.
+                unsafe {
+                    devices
+                        .device
+                        .CreateTexture2D(&desc, None, Some(&mut texture))
+                }
+                .context("Creating an external browser texture")?;
+                let texture = texture.context("CreateTexture2D returned nothing")?;
+                let mut view = None;
+                // SAFETY: texture is a live COM resource with shader-resource
+                // binding enabled; the output slot is valid for this call.
+                unsafe {
+                    devices
+                        .device
+                        .CreateShaderResourceView(&texture, None, Some(&mut view))
+                }
+                .context("Creating an external browser texture view")?;
+                self.external_textures.insert(
+                    id,
+                    CachedExternalTexture {
+                        texture,
+                        view,
+                        key: ExternalTextureCacheKey {
+                            id,
+                            generation: frame.generation,
+                            sequence: 0,
+                            size: frame.size,
+                        },
+                        source: Arc::clone(source),
+                        consumer: self.external_texture_consumer,
+                    },
+                );
+            }
+
+            let mut rejected = false;
+            if !matches!(plan, ExternalTextureUpdate::Reuse) {
+                let cached = self
+                    .external_textures
+                    .get_mut(&id)
+                    .context("external texture went missing between create and upload")?;
+                // A recreated texture has no pixels yet, so it takes the whole
+                // frame regardless of what the producer reported as dirty.
+                let regions = if matches!(plan, ExternalTextureUpdate::Recreate) {
+                    vec![Bounds {
+                        origin: point(DevicePixels(0), DevicePixels(0)),
+                        size: frame.size,
+                    }]
+                } else {
+                    frame.dirty_regions()
+                };
+                // A region the producer got wrong is dropped rather than
+                // turned into an out-of-bounds read or an invalid box, and the
+                // frame is then not acknowledged, so the dirt it covered comes
+                // back on a later frame.
+                for region in regions {
+                    let x = region.origin.x.0.max(0) as u32;
+                    let y = region.origin.y.0.max(0) as u32;
+                    let region_width = region.size.width.0.max(0) as u32;
+                    let region_height = region.size.height.0.max(0) as u32;
+                    if region_width == 0 || region_height == 0 {
+                        continue;
+                    }
+                    // The region must fit the frame's own dimensions:
+                    // `dirty_regions` clamps to them, but this function does not
+                    // rely on its caller for a bound the device will reject.
+                    if x.saturating_add(region_width) > width
+                        || y.saturating_add(region_height) > height
+                    {
+                        log::error!(
+                            "external texture {id:?} reported a dirty region outside its own frame"
+                        );
+                        rejected = true;
+                        continue;
+                    }
+                    let offset = (y as usize)
+                        .checked_mul(frame.stride)
+                        .and_then(|row| row.checked_add(x as usize * 4));
+                    let last_row = ((y + region_height - 1) as usize)
+                        .checked_mul(frame.stride)
+                        .and_then(|end| end.checked_add((x + region_width) as usize * 4));
+                    let (Some(offset), Some(last_row)) = (offset, last_row) else {
+                        log::error!(
+                            "external texture {id:?} reported a region that overflows its stride"
+                        );
+                        rejected = true;
+                        continue;
+                    };
+                    if last_row > frame.bytes.len() {
+                        log::error!(
+                            "external texture {id:?} reported a dirty region outside its own buffer"
+                        );
+                        rejected = true;
+                        continue;
+                    }
+                    let destination = D3D11_BOX {
+                        left: x,
+                        top: y,
+                        front: 0,
+                        right: x + region_width,
+                        bottom: y + region_height,
+                        back: 1,
+                    };
+                    // SAFETY: `destination` is inside the texture (the frame
+                    // dimensions were checked above) and the bounds check
+                    // proves the source rows for that box are inside
+                    // `frame.bytes`, which stays alive for this call because
+                    // `with_frame` clones the frame snapshot before the visit
+                    // and the visitor's borrow is bounded by this closure.
+                    unsafe {
+                        devices.device_context.UpdateSubresource(
+                            &cached.texture,
+                            0,
+                            Some(&destination),
+                            frame.bytes[offset..].as_ptr() as *const _,
+                            frame.stride as u32,
+                            0,
+                        );
+                    }
+                }
+                if !rejected {
+                    cached.key = ExternalTextureCacheKey {
+                        id,
+                        generation: frame.generation,
+                        sequence: frame.sequence,
+                        size: frame.size,
+                    };
+                }
+                // A rejected region leaves the key where it was, so the next
+                // frame plans an upload again and the producer's dirt is still
+                // there to retry. The draw below still runs, so the pane keeps
+                // showing the last complete texture instead of vanishing.
+            }
+        }
+
+        let instance = ExternalTextureInstance {
+            bounds: surface.bounds,
+            content_mask: surface.content_mask.bounds,
+            opacity: surface.opacity,
+            pad: 0,
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let view = self
+            .external_textures
+            .get(&id)
+            .context("external texture missing at draw time")?
+            .view
+            .clone();
+        self.pipelines.external_textures.update_buffer(
+            &devices.device,
+            &devices.device_context,
+            slice::from_ref(&instance),
+        )?;
+        self.pipelines.external_textures.draw_range_with_texture(
+            &devices.device,
+            &devices.device_context,
+            slice::from_ref(&view),
+            slice::from_ref(&resources.viewport),
+            slice::from_ref(&self.globals.global_params_buffer),
+            slice::from_ref(&self.globals.external_texture_sampler),
+            0,
+            1,
+        )?;
+        if rejected {
+            return Ok(ExternalTextureUpload::Partial);
+        }
+        if matches!(plan, ExternalTextureUpdate::Reuse) {
+            return Ok(ExternalTextureUpload::Reused);
+        }
+        Ok(ExternalTextureUpload::Complete)
     }
 
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
@@ -881,6 +1240,15 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        // One instance per visible browser pane; the 8-pane cap (PRD) is the
+        // real bound, so this starts small and grows if it ever needs to.
+        let external_textures = PipelineState::new(
+            device,
+            "external_texture_pipeline",
+            ShaderModule::ExternalTexture,
+            8,
+            create_blend_state(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -891,6 +1259,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            external_textures,
         })
     }
 }
@@ -951,9 +1320,28 @@ impl DirectXGlobalElements {
             output
         };
 
+        let external_texture_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         Ok(Self {
             global_params_buffer,
             sampler,
+            external_texture_sampler,
         })
     }
 }
@@ -1603,6 +1991,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        ExternalTexture,
         EmojiRasterization,
     }
 
@@ -1676,6 +2065,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::ExternalTexture => match target {
+                    ShaderTarget::Vertex => EXTERNAL_TEXTURE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => EXTERNAL_TEXTURE_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -1767,6 +2160,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::ExternalTexture => "external_texture",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }
