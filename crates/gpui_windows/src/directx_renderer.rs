@@ -866,6 +866,10 @@ impl DirectXRenderer {
             self.external_textures.get(&id).map(|cached| cached.key),
             frame,
         );
+        // Declared outside the device block: the draw below reports a partial
+        // upload when a dirty region was rejected, and that check runs after
+        // the device borrow ends.
+        let mut rejected = false;
 
         {
             let devices = self.devices.as_ref().context("devices missing")?;
@@ -925,7 +929,6 @@ impl DirectXRenderer {
                 );
             }
 
-            let mut rejected = false;
             if !matches!(plan, ExternalTextureUpdate::Reuse) {
                 let cached = self
                     .external_textures
