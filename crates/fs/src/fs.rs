@@ -1075,13 +1075,15 @@ impl Fs for RealFs {
         let (tx, rx) = async_channel::unbounded();
         let pending_paths: Arc<Mutex<Vec<PathEvent>>> = Default::default();
 
-        let watcher: Arc<dyn Watcher> = Arc::new(fs_watcher::FsWatcher::new(
+        let watcher = Arc::new(fs_watcher::FsWatcher::new(
             executor.clone(),
             tx.clone(),
             pending_paths.clone(),
         ));
 
-        if let Err(e) = watcher.add(path) {
+        // Awaited rather than queued, so a change made after `watch` returns is
+        // never missed; the OS work runs on the watcher thread either way.
+        if let Err(e) = watcher.add_and_wait(path).await {
             log::warn!("Failed to watch {}:\n{e}", path.display());
         }
 
@@ -1097,11 +1099,12 @@ impl Fs for RealFs {
                     target = SanitizedPath::new(&canonical).as_path().to_path_buf();
                 }
             }
-            watcher.add(&target).ok();
+            watcher.add_and_wait(&target).await.ok();
             if let Some(parent) = target.parent() {
-                watcher.add(parent).log_err();
+                watcher.add_and_wait(parent).await.log_err();
             }
         }
+        let watcher: Arc<dyn Watcher> = watcher;
 
         (
             Box::pin(rx.filter_map({
