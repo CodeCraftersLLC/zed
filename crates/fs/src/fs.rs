@@ -71,6 +71,14 @@ use std::ffi::OsStr;
 pub trait Watcher: Send + Sync {
     fn add(&self, path: &Path) -> Result<()>;
     fn remove(&self, path: &Path) -> Result<()>;
+
+    /// Add `path` and resolve once its OS watch is in place, so no change made
+    /// after it resolves can be missed. `add` may return before then (a new
+    /// FSEvents watch is applied on a watcher thread). Waiting never blocks a
+    /// thread.
+    fn add_and_wait<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.add(path) })
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]

@@ -71,17 +71,6 @@ impl FsWatcher {
         applied
     }
 
-    /// Adds `path` and waits until its OS watch is in place, so no change made
-    /// after this returns can be missed. Waiting never blocks a thread.
-    pub async fn add_and_wait(&self, path: &Path) -> anyhow::Result<()> {
-        let Some(applied) = self.add_path(path) else {
-            return Ok(());
-        };
-        // Cancelled means the registration was removed before its watch was
-        // applied, so there is nothing left to wait for.
-        applied.await.unwrap_or(Ok(()))
-    }
-
     fn add_path(&self, path: &Path) -> Option<WatchApplied> {
         log::trace!("watcher add: {path:?}");
 
@@ -148,10 +137,25 @@ impl Drop for FsWatcher {
 
 impl Watcher for FsWatcher {
     /// Queues the watch and returns without waiting for the OS; a failure is
-    /// logged by the watcher thread. Use [`FsWatcher::add_and_wait`] to wait.
+    /// logged by the watcher thread. Use [`Watcher::add_and_wait`] to wait.
     fn add(&self, path: &std::path::Path) -> anyhow::Result<()> {
         self.add_path(path);
         Ok(())
+    }
+
+    fn add_and_wait<'a>(
+        &'a self,
+        path: &'a std::path::Path,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+        let applied = self.add_path(path);
+        Box::pin(async move {
+            let Some(applied) = applied else {
+                return Ok(());
+            };
+            // Cancelled means the registration was removed before its watch was
+            // applied, so there is nothing left to wait for.
+            applied.await.unwrap_or(Ok(()))
+        })
     }
 
     fn remove(&self, path: &std::path::Path) -> anyhow::Result<()> {
@@ -1458,6 +1462,8 @@ mod tests {
         /// Ops per `update_paths` call, i.e. per backend restart.
         batches: Vec<usize>,
         fail_with_watch_limit: bool,
+        /// Watches of these paths fail; every other op succeeds.
+        failing_paths: HashSet<PathBuf>,
         /// How long each `update_paths` call takes, like a busy `fseventsd`.
         delay: Duration,
     }
@@ -1483,7 +1489,7 @@ mod tests {
                 let result = match &op {
                     notify::PathOp::Watch(path, _) => {
                         backend.watch_calls.push(path.clone());
-                        if fail {
+                        if fail || backend.failing_paths.contains(path) {
                             Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch))
                         } else {
                             backend.watched_paths.insert(path.clone());
@@ -1619,6 +1625,67 @@ mod tests {
 
     fn poll_path(path: &str) -> Arc<Path> {
         Arc::<Path>::from(Path::new(path))
+    }
+
+    #[test]
+    fn a_failed_op_in_a_batch_leaves_the_ops_around_it_applied() {
+        let backend = slow_backend(Duration::from_millis(200));
+        backend
+            .lock()
+            .failing_paths
+            .insert(PathBuf::from("/repo/bad"));
+        let watcher = test_watcher(backend.clone());
+
+        watcher
+            .add(poll_path("/repo/busy"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        std::thread::sleep(Duration::from_millis(50));
+        let first = watcher
+            .add(poll_path("/repo/first"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        let bad = watcher
+            .add(poll_path("/repo/bad"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        let last = watcher
+            .add(poll_path("/repo/last"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        watcher.flush();
+
+        let backend = backend.lock();
+        // The busy watch, then one batch that stops at the failure, then the
+        // untried op retried on its own.
+        assert_eq!(backend.batches, vec![1, 3, 1]);
+        assert!(backend.watched_paths.contains(Path::new("/repo/first")));
+        assert!(backend.watched_paths.contains(Path::new("/repo/last")));
+        assert!(!backend.watched_paths.contains(Path::new("/repo/bad")));
+        assert!(watcher.is_registered(first.id));
+        assert!(watcher.is_registered(last.id));
+        assert!(
+            !watcher.is_registered(bad.id),
+            "only the failed watch is rolled back"
+        );
+    }
+
+    #[test]
+    fn the_watcher_thread_exits_when_the_watcher_is_dropped() {
+        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
+        let watcher = test_watcher(backend.clone());
+        watcher
+            .add(poll_path("/repo/root"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        watcher.flush();
+
+        drop(watcher);
+
+        // The thread owns a handle to the backend until it exits.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&backend) > 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the watcher thread outlived its watcher"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
