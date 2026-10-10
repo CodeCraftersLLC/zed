@@ -3,7 +3,9 @@ use buffer_diff::BufferDiff;
 use editor::{Editor, EditorEvent, MultiBuffer};
 use gpui::{
     AnyElement, App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Font, IntoElement, Render, SharedString, Task, Window,
+    Focusable, Font, ImageSource, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, img,
+    prelude::FluentBuilder as _, px,
 };
 use language::{
     Buffer, Capability, DiskState, File as LanguageFile, HighlightedText, OffsetRangeExt, Point,
@@ -18,7 +20,8 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use ui::{Color, Icon, IconName, Label, LabelCommon as _};
+use theme::ActiveTheme as _;
+use ui::{Color, Icon, IconName, Label, LabelCommon as _, h_flex, v_flex};
 use util::ResultExt as _;
 use util::paths::PathStyle;
 use util::rel_path::RelPath;
@@ -38,6 +41,22 @@ pub enum CommitDiffPreviewStatus {
     Typechange,
 }
 
+/// One side of a binary change: its size, and the picture when it is an image
+/// small enough to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinaryBlob {
+    pub size: u64,
+    pub image: Option<Arc<gpui::Image>>,
+}
+
+/// Both sides of a binary file's change. An absent side did not exist (the file
+/// was added or deleted).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BinaryPreview {
+    pub old: Option<BinaryBlob>,
+    pub new: Option<BinaryBlob>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CommitDiffPreviewFile {
     pub display_path: Arc<str>,
@@ -47,6 +66,8 @@ pub struct CommitDiffPreviewFile {
     pub old_text: Option<Arc<str>>,
     pub new_text: Option<Arc<str>>,
     pub is_binary: bool,
+    /// What a binary file looked like before and after, when known.
+    pub binary: Option<BinaryPreview>,
     pub is_truncated: bool,
     pub load_error: Option<Arc<str>>,
 }
@@ -72,7 +93,17 @@ pub struct CommitDiffPreview {
     editor: Entity<Editor>,
     title: SharedString,
     file_count: usize,
+    /// Binary files, drawn as before/after cards above the text diff instead of
+    /// as fake text.
+    binary_cards: Vec<BinaryCard>,
+    has_text_entries: bool,
     _populate_task: Task<Result<()>>,
+}
+
+struct BinaryCard {
+    display_path: Arc<str>,
+    status: CommitDiffPreviewStatus,
+    binary: BinaryPreview,
 }
 
 struct PreviewEntry {
@@ -166,7 +197,8 @@ impl CommitDiffPreviewFile {
             status,
             old_text,
             new_text,
-            is_binary,
+            is_binary: _,
+            binary: _,
             is_truncated,
             load_error,
         } = self;
@@ -184,17 +216,6 @@ impl CommitDiffPreviewFile {
                 was_deleted,
                 old_text: None,
                 new_text: format!("Unable to load diff for {display_path}: {error}\n").into(),
-            };
-        }
-
-        if is_binary {
-            return PreviewEntry {
-                index,
-                display_path: display_path.clone(),
-                metadata_path,
-                was_deleted,
-                old_text: None,
-                new_text: format!("Binary file: {display_path}\n").into(),
             };
         }
 
@@ -276,11 +297,23 @@ impl CommitDiffPreview {
         });
 
         let language_registry = project.read(cx).languages().clone();
-        let entries = files
+        let (binary_files, text_files): (Vec<_>, Vec<_>) = files
             .into_iter()
             .enumerate()
+            .partition(|(_, file)| file.is_binary && file.load_error.is_none());
+        let binary_cards = binary_files
+            .into_iter()
+            .map(|(_, file)| BinaryCard {
+                display_path: file.display_path,
+                status: file.status,
+                binary: file.binary.unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+        let entries = text_files
+            .into_iter()
             .map(|(index, file)| file.into_entry(index))
             .collect::<Vec<_>>();
+        let has_text_entries = !entries.is_empty();
         let context_lines = options.context_lines;
         let populate_task = cx.spawn(async move |_, cx| {
             populate_entries(multibuffer, entries, context_lines, language_registry, cx)
@@ -294,6 +327,8 @@ impl CommitDiffPreview {
             editor,
             title: options.title,
             file_count,
+            binary_cards,
+            has_text_entries,
             _populate_task: populate_task,
         }
     }
@@ -608,9 +643,114 @@ impl Item for CommitDiffPreview {
     }
 }
 
+/// "12 B", "3.4 KB", "5.0 MB".
+fn format_binary_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let size = bytes as f64;
+    if size < KB {
+        format!("{bytes} B")
+    } else if size < KB * KB {
+        format!("{:.1} KB", size / KB)
+    } else {
+        format!("{:.1} MB", size / (KB * KB))
+    }
+}
+
+fn status_label(status: &CommitDiffPreviewStatus) -> &'static str {
+    match status {
+        CommitDiffPreviewStatus::Added => "Added",
+        CommitDiffPreviewStatus::Deleted => "Deleted",
+        CommitDiffPreviewStatus::Modified => "Modified",
+        CommitDiffPreviewStatus::Renamed => "Renamed",
+        CommitDiffPreviewStatus::Copied => "Copied",
+        CommitDiffPreviewStatus::Typechange => "Type changed",
+    }
+}
+
+/// What the "before" or "after" half of a binary card says when it has no
+/// picture: the size, or that nothing was there.
+fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
+    match blob {
+        None => "\u{2014}".to_string(),
+        Some(blob) if blob.image.is_some() => format_binary_size(blob.size),
+        Some(blob) => format!("Binary, {} (no preview)", format_binary_size(blob.size)),
+    }
+}
+
+fn render_binary_side(
+    label: &'static str,
+    blob: Option<&BinaryBlob>,
+    cx: &App,
+) -> impl IntoElement {
+    let border = cx.theme().colors().border;
+    let picture = blob.and_then(|blob| blob.image.clone()).map(|image| {
+        div()
+            .border_1()
+            .border_color(border)
+            .child(
+                img(ImageSource::Image(image))
+                    .max_w(px(360.))
+                    .max_h(px(360.)),
+            )
+            .into_any_element()
+    });
+    v_flex()
+        .gap_1()
+        .child(Label::new(label).color(Color::Muted))
+        .children(picture)
+        .child(Label::new(binary_blob_caption(blob)))
+}
+
+fn render_binary_card(card: &BinaryCard, cx: &App) -> impl IntoElement {
+    let colors = cx.theme().colors();
+    v_flex()
+        .gap_2()
+        .p_3()
+        .border_1()
+        .border_color(colors.border)
+        .rounded_md()
+        .child(Label::new(format!(
+            "{} \u{2014} {}",
+            card.display_path,
+            status_label(&card.status)
+        )))
+        .child(
+            h_flex()
+                .gap_4()
+                .items_start()
+                .when(
+                    card.binary.old.is_some() || card.binary.new.is_none(),
+                    |row| row.child(render_binary_side("Before", card.binary.old.as_ref(), cx)),
+                )
+                .when(
+                    card.binary.new.is_some() || card.binary.old.is_none(),
+                    |row| row.child(render_binary_side("After", card.binary.new.as_ref(), cx)),
+                ),
+        )
+}
+
 impl Render for CommitDiffPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        self.editor.clone()
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.binary_cards.is_empty() {
+            return self.editor.clone().into_any_element();
+        }
+        let cards = self
+            .binary_cards
+            .iter()
+            .map(|card| render_binary_card(card, cx).into_any_element())
+            .collect::<Vec<_>>();
+        v_flex()
+            .id("commit-diff-binary-cards")
+            .size_full()
+            .gap_3()
+            .p_3()
+            .bg(cx.theme().colors().editor_background)
+            .overflow_y_scroll()
+            .children(cards)
+            .when(self.has_text_entries, |this| {
+                this.child(div().flex_1().min_h(px(240.)).child(self.editor.clone()))
+            })
+            .into_any_element()
     }
 }
 
@@ -651,6 +791,7 @@ mod tests {
             old_text: Some("old".into()),
             new_text: Some("new".into()),
             is_binary: false,
+            binary: None,
             is_truncated: false,
             load_error: None,
         }
@@ -670,6 +811,35 @@ mod tests {
         assert_eq!(
             key.path.display(PathStyle::Posix).to_string(),
             "crates/cherrypick-ui/src/app_shell.rs"
+        );
+    }
+
+    #[test]
+    fn binary_sizes_read_naturally() {
+        assert_eq!(format_binary_size(12), "12 B");
+        assert_eq!(format_binary_size(3482), "3.4 KB");
+        assert_eq!(format_binary_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn a_binary_side_says_what_it_has() {
+        let image = Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            vec![1, 2, 3],
+        ));
+        let shown = BinaryBlob {
+            size: 2048,
+            image: Some(image),
+        };
+        let too_big = BinaryBlob {
+            size: 30 * 1024 * 1024,
+            image: None,
+        };
+        assert_eq!(binary_blob_caption(None), "\u{2014}");
+        assert_eq!(binary_blob_caption(Some(&shown)), "2.0 KB");
+        assert_eq!(
+            binary_blob_caption(Some(&too_big)),
+            "Binary, 30.0 MB (no preview)"
         );
     }
 }

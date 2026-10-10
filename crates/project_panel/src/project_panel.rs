@@ -2151,6 +2151,9 @@ impl ProjectPanel {
     }
 
     fn add_entry(&mut self, is_dir: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         let Some((worktree_id, entry_id)) = self
             .selection
             .map(|entry| (entry.worktree_id, entry.entry_id))
@@ -2244,11 +2247,17 @@ impl ProjectPanel {
         }
     }
 
-    pub fn undo(&mut self, _: &Undo, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         self.undo_manager.undo().log_err();
     }
 
-    pub fn redo(&mut self, _: &Redo, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         self.undo_manager.redo().log_err();
     }
 
@@ -2258,6 +2267,9 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         if let Some(SelectedEntry {
             worktree_id,
             entry_id,
@@ -2527,6 +2539,9 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<ProjectPanel>,
     ) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         maybe!({
             let items_to_delete = self.disjoint_effective_entries(cx);
             if items_to_delete.is_empty() {
@@ -3200,6 +3215,9 @@ impl ProjectPanel {
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         let entries = self.disjoint_effective_entries(cx);
         if !entries.is_empty() {
             self.write_entries_to_system_clipboard(&entries, cx);
@@ -3282,6 +3300,9 @@ impl ProjectPanel {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         if let Some(external_paths) = self.external_paths_from_system_clipboard(cx) {
             let target_entry_id = self
                 .selection

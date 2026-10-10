@@ -97,6 +97,9 @@ pub struct BufferSearchBar {
     replace_enabled: bool,
     selection_search_enabled: Option<FilteredSearchRange>,
     scroll_handle: ScrollHandle,
+    /// Sized by the toolbar it sits in rather than by the whole window (an
+    /// embedder that shows the bar in a pane narrower than the window).
+    embedded: bool,
     regex_language: Option<Arc<Language>>,
     splittable_editor: Option<WeakEntity<SplittableEditor>>,
     _splittable_editor_subscription: Option<Subscription>,
@@ -343,11 +346,21 @@ impl Render for BufferSearchBar {
         let container_width = window.viewport_size().width;
         let input_width = SearchInputWidth::calc_width(container_width);
 
-        let input_base_styles =
-            |border_color| input_base_styles(border_color, |div| div.w(input_width));
+        let embedded = self.embedded;
+        // Embedded: the input takes what the toolbar leaves (never below ~12
+        // rem) and the option buttons wrap under it, instead of every width
+        // being derived from the window.
+        let size_input = move |div: Div| -> Div {
+            if embedded {
+                div.flex_1().min_w_48()
+            } else {
+                div.w(input_width)
+            }
+        };
+        let input_base_styles = |border_color| input_base_styles(border_color, size_input);
 
         let input_style = if find_in_results {
-            filter_search_results_input(query_border, |div| div.w(input_width), cx)
+            filter_search_results_input(query_border, size_input, cx)
         } else {
             input_base_styles(query_border)
         };
@@ -387,7 +400,7 @@ impl Render for BufferSearchBar {
 
         let mode_column = h_flex()
             .gap_1()
-            .min_w_64()
+            .when(!embedded, |this| this.min_w_64())
             .when(replacement, |this| {
                 this.child(render_action_button(
                     "buffer-search-bar-toggle",
@@ -493,6 +506,7 @@ impl Render for BufferSearchBar {
         let search_line = h_flex()
             .w_full()
             .gap_2()
+            .when(embedded, |el| el.flex_wrap())
             .when(find_in_results, |el| el.child(alignment_element()))
             .when(!find_in_results && has_collapse_button, |el| {
                 el.pl_0p5().child(collapse_expand_button.expect("button"))
@@ -510,7 +524,7 @@ impl Render for BufferSearchBar {
             let focus_handle = self.replacement_editor.read(cx).focus_handle(cx);
 
             let replace_actions = h_flex()
-                .min_w_64()
+                .when(!embedded, |this| this.min_w_64())
                 .gap_1()
                 .child(render_action_button(
                     "buffer-search-replace-button",
@@ -854,6 +868,15 @@ impl BufferSearchBar {
         ));
     }
 
+    /// Size the bar from the toolbar it is shown in, not the window. For an
+    /// embedder whose editor pane is narrower than the window.
+    pub fn set_embedded(&mut self, embedded: bool, cx: &mut Context<Self>) {
+        if self.embedded != embedded {
+            self.embedded = embedded;
+            cx.notify();
+        }
+    }
+
     pub fn new(
         languages: Option<Arc<LanguageRegistry>>,
         window: &mut Window,
@@ -929,6 +952,7 @@ impl BufferSearchBar {
             replace_enabled: false,
             selection_search_enabled: None,
             scroll_handle: ScrollHandle::new(),
+            embedded: false,
             regex_language: None,
             splittable_editor: None,
             _splittable_editor_subscription: None,
@@ -1029,6 +1053,14 @@ impl BufferSearchBar {
 
         cx.propagate();
         false
+    }
+
+    /// Put the cursor in the query box if the bar is open. For an embedder
+    /// that opens the bar from a button, where a later click can move focus.
+    pub fn focus_query_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dismissed {
+            self.focus(&self.query_editor.focus_handle(cx), window, cx);
+        }
     }
 
     pub fn toggle(&mut self, action: &Deploy, window: &mut Window, cx: &mut Context<Self>) {

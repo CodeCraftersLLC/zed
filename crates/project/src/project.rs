@@ -232,6 +232,8 @@ pub struct Project {
     client_subscriptions: Vec<client::Subscription>,
     worktree_store: Entity<WorktreeStore>,
     buffer_store: Entity<BufferStore>,
+    /// A local project an embedder has made read-only (see `set_local_read_only`).
+    local_read_only: bool,
     context_server_store: Entity<ContextServerStore>,
     image_store: Entity<ImageStore>,
     lsp_store: Entity<LspStore>,
@@ -1337,6 +1339,7 @@ impl Project {
                 context_server_store,
                 join_project_response_message_id: 0,
                 client_state: ProjectClientState::Local,
+                local_read_only: false,
                 git_store,
                 client_subscriptions: Vec::new(),
                 _subscriptions: vec![cx.on_release(Self::release)],
@@ -1566,6 +1569,7 @@ impl Project {
                 dap_store,
                 join_project_response_message_id: 0,
                 client_state: ProjectClientState::Local,
+                local_read_only: false,
                 git_store,
                 agent_server_store,
                 client_subscriptions: Vec::new(),
@@ -1881,6 +1885,7 @@ impl Project {
                     remote_id,
                     replica_id,
                 },
+                local_read_only: false,
                 bookmark_store: bookmark_store.clone(),
                 breakpoint_store: breakpoint_store.clone(),
                 dap_store: dap_store.clone(),
@@ -2540,6 +2545,9 @@ impl Project {
         is_directory: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<CreatedEntry>> {
+        if !self.capability().editable() {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         let project_path = project_path.into();
         let Some(worktree) = self.worktree_for_id(project_path.worktree_id, cx) else {
             return Task::ready(Err(anyhow!(format!(
@@ -2558,6 +2566,9 @@ impl Project {
         new_project_path: ProjectPath,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<Entry>>> {
+        if !self.capability().editable() {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         self.worktree_store.update(cx, |worktree_store, cx| {
             worktree_store.copy_entry(entry_id, new_project_path, cx)
         })
@@ -2573,6 +2584,9 @@ impl Project {
         new_path: ProjectPath,
         cx: &mut Context<Self>,
     ) -> Task<Result<CreatedEntry>> {
+        if !self.capability().editable() {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         let worktree_store = self.worktree_store.clone();
         let Some((worktree, old_path, is_dir)) = worktree_store
             .read(cx)
@@ -2652,6 +2666,9 @@ impl Project {
         trash: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<Option<TrashedEntry>>>> {
+        if !self.capability().editable() {
+            return Some(Task::ready(Err(anyhow!("This project is read-only"))));
+        }
         let worktree = self.worktree_for_entry(entry_id, cx)?;
         cx.emit(Event::DeletedEntry(worktree.read(cx).id(), entry_id));
         worktree.update(cx, |worktree, cx| {
@@ -2959,8 +2976,23 @@ impl Project {
     pub fn capability(&self) -> Capability {
         match &self.client_state {
             ProjectClientState::Collab { capability, .. } => *capability,
+            ProjectClientState::Shared { .. } | ProjectClientState::Local
+                if self.local_read_only =>
+            {
+                Capability::Read
+            }
             ProjectClientState::Shared { .. } | ProjectClientState::Local => Capability::ReadWrite,
         }
+    }
+
+    /// Make this local project read-only: its buffers cannot be edited and
+    /// creating, renaming, copying or deleting entries is refused. For
+    /// embedders that show a snapshot or a tree they cannot write back to.
+    pub fn set_local_read_only(&mut self, cx: &mut Context<Self>) {
+        self.local_read_only = true;
+        self.buffer_store
+            .update(cx, |buffer_store, cx| buffer_store.set_force_read_only(cx));
+        cx.notify();
     }
 
     #[inline]

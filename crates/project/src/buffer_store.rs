@@ -42,6 +42,9 @@ pub struct BufferStore {
     shared_buffers: HashMap<proto::PeerId, HashMap<BufferId, SharedBuffer>>,
     non_searchable_buffers: HashSet<BufferId>,
     project_search: RemoteProjectSearchState,
+    /// Every buffer loaded from disk is read-only (an embedder showing a
+    /// snapshot or a remote tree it cannot write back to).
+    force_read_only: bool,
 }
 
 #[derive(Default)]
@@ -684,6 +687,9 @@ impl LocalBufferStore {
             };
             this.update(cx, |this, cx| {
                 this.add_buffer(buffer.clone(), cx)?;
+                if this.force_read_only {
+                    buffer.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+                }
                 let buffer_id = buffer.read(cx).remote_id();
                 if let Some(file) = File::from_dyn(buffer.read(cx).file()) {
                     let project_path = ProjectPath {
@@ -798,6 +804,7 @@ impl BufferStore {
             shared_buffers: Default::default(),
             loading_buffers: Default::default(),
             non_searchable_buffers: Default::default(),
+            force_read_only: false,
             worktree_store,
             project_search: Default::default(),
         }
@@ -824,6 +831,7 @@ impl BufferStore {
             loading_buffers: Default::default(),
             shared_buffers: Default::default(),
             non_searchable_buffers: Default::default(),
+            force_read_only: false,
             worktree_store,
             project_search: Default::default(),
         }
@@ -1008,6 +1016,14 @@ impl BufferStore {
         cx.subscribe(&buffer_entity, Self::on_buffer_event).detach();
         cx.emit(BufferStoreEvent::BufferAdded(buffer_entity));
         Ok(())
+    }
+
+    /// Make every buffer, open now or loaded later, read-only.
+    pub fn set_force_read_only(&mut self, cx: &mut Context<Self>) {
+        self.force_read_only = true;
+        for buffer in self.buffers().collect::<Vec<_>>() {
+            buffer.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+        }
     }
 
     pub fn buffers(&self) -> impl '_ + Iterator<Item = Entity<Buffer>> {
