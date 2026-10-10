@@ -688,7 +688,9 @@ impl LocalBufferStore {
             this.update(cx, |this, cx| {
                 this.add_buffer(buffer.clone(), cx)?;
                 if this.force_read_only {
-                    buffer.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.set_capability(Capability::ReadOnly, cx)
+                    });
                 }
                 let buffer_id = buffer.read(cx).remote_id();
                 if let Some(file) = File::from_dyn(buffer.read(cx).file()) {
@@ -705,7 +707,7 @@ impl LocalBufferStore {
                     } else {
                         settings.is_path_read_only(&project_path.path)
                     };
-                    if is_read_only {
+                    if is_read_only && !this.force_read_only {
                         buffer.update(cx, |buffer, cx| {
                             buffer.set_capability(Capability::Read, cx);
                         });
@@ -1022,7 +1024,9 @@ impl BufferStore {
     pub fn set_force_read_only(&mut self, cx: &mut Context<Self>) {
         self.force_read_only = true;
         for buffer in self.buffers().collect::<Vec<_>>() {
-            buffer.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_capability(Capability::ReadOnly, cx)
+            });
         }
     }
 

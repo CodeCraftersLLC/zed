@@ -1829,11 +1829,11 @@ impl ProjectPanel {
                 return;
             };
 
-            if let Some(message) = self
-                .name_validator
-                .as_ref()
-                .and_then(|validate| validate(filename.as_unix_str()))
-            {
+            if let Some(message) = Self::name_rejection(
+                self.name_validator.as_ref(),
+                filename.as_unix_str(),
+                PathStyle::Posix,
+            ) {
                 edit_state.validation_state = ValidationState::Error(message);
                 cx.notify();
                 return;
@@ -1888,6 +1888,10 @@ impl ProjectPanel {
         let is_new_entry = edit_state.is_new_entry();
         let mut filename = self.filename_editor.read(cx).text(cx);
         let path_style = self.project.read(cx).path_style(cx);
+        // The host judges what was typed, before trailing dots and spaces are
+        // quietly dropped below.
+        let host_rejection =
+            Self::name_rejection(self.name_validator.as_ref(), &filename, path_style);
         if path_style.is_windows() {
             // on windows, trailing dots are ignored in paths
             // this can cause project panel to create a new entry with a trailing dot
@@ -1899,11 +1903,7 @@ impl ProjectPanel {
         if filename.trim().is_empty() {
             return None;
         }
-        if let Some(message) = self
-            .name_validator
-            .as_ref()
-            .and_then(|validate| validate(filename.trim().trim_start_matches(['/', '\\'])))
-        {
+        if let Some(message) = host_rejection {
             edit_state.validation_state = ValidationState::Error(message);
             cx.notify();
             return None;
@@ -4054,6 +4054,21 @@ impl ProjectPanel {
             worktree_id: worktree.read(cx).id(),
             path: entry.path.clone(),
         })
+    }
+
+    /// The host validator's verdict on a typed name. Windows separators are
+    /// normalised first, so `src\\new.rs` is the nested path it means.
+    fn name_rejection(
+        validator: Option<&NameValidator>,
+        typed: &str,
+        path_style: PathStyle,
+    ) -> Option<String> {
+        let validate = validator?;
+        if path_style.is_windows() {
+            validate(typed.replace('\\', "/").trim_start_matches('/'))
+        } else {
+            validate(typed.trim_start_matches('/'))
+        }
     }
 
     /// Installs a check run on every name typed into the rename and new-entry

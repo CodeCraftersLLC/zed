@@ -2979,7 +2979,7 @@ impl Project {
             ProjectClientState::Shared { .. } | ProjectClientState::Local
                 if self.local_read_only =>
             {
-                Capability::Read
+                Capability::ReadOnly
             }
             ProjectClientState::Shared { .. } | ProjectClientState::Local => Capability::ReadWrite,
         }
@@ -3323,6 +3323,9 @@ impl Project {
     }
 
     pub fn save_buffer(&self, buffer: Entity<Buffer>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if !self.capability().editable() {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         self.buffer_store
             .update(cx, |buffer_store, cx| buffer_store.save_buffer(buffer, cx))
     }
@@ -3333,6 +3336,9 @@ impl Project {
         path: ProjectPath,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if !self.capability().editable() {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         self.buffer_store.update(cx, |buffer_store, cx| {
             buffer_store.save_buffer_as(buffer.clone(), path, cx)
         })

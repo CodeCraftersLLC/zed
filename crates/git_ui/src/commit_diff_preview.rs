@@ -43,7 +43,7 @@ pub enum CommitDiffPreviewStatus {
 
 /// One side of a binary change: its size, and the picture when it is an image
 /// small enough to show.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct BinaryBlob {
     pub size: u64,
     pub image: Option<Arc<gpui::Image>>,
@@ -51,10 +51,22 @@ pub struct BinaryBlob {
 
 /// Both sides of a binary file's change. An absent side did not exist (the file
 /// was added or deleted).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct BinaryPreview {
     pub old: Option<BinaryBlob>,
     pub new: Option<BinaryBlob>,
+}
+
+impl BinaryPreview {
+    /// Bytes of picture data held for both sides (what a cache must account for).
+    pub fn image_bytes(&self) -> usize {
+        [&self.old, &self.new]
+            .into_iter()
+            .flatten()
+            .filter_map(|blob| blob.image.as_ref())
+            .map(|image| image.bytes.len())
+            .sum()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -100,10 +112,27 @@ pub struct CommitDiffPreview {
     _populate_task: Task<Result<()>>,
 }
 
+/// The most binary cards drawn at once; the rest are counted in a closing line.
+/// Cards are laid out and painted every frame, and a commit can touch hundreds
+/// of binary files.
+const MAX_BINARY_CARDS: usize = 40;
+
 struct BinaryCard {
-    display_path: Arc<str>,
-    status: CommitDiffPreviewStatus,
+    title: SharedString,
+    old_caption: SharedString,
+    new_caption: SharedString,
     binary: BinaryPreview,
+}
+
+impl BinaryCard {
+    fn new(display_path: &str, status: &CommitDiffPreviewStatus, binary: BinaryPreview) -> Self {
+        Self {
+            title: format!("{display_path} \u{2014} {}", status_label(status)).into(),
+            old_caption: binary_blob_caption(binary.old.as_ref()).into(),
+            new_caption: binary_blob_caption(binary.new.as_ref()).into(),
+            binary,
+        }
+    }
 }
 
 struct PreviewEntry {
@@ -303,10 +332,12 @@ impl CommitDiffPreview {
             .partition(|(_, file)| file.is_binary && file.load_error.is_none());
         let binary_cards = binary_files
             .into_iter()
-            .map(|(_, file)| BinaryCard {
-                display_path: file.display_path,
-                status: file.status,
-                binary: file.binary.unwrap_or_default(),
+            .map(|(_, file)| {
+                BinaryCard::new(
+                    &file.display_path,
+                    &file.status,
+                    file.binary.unwrap_or_default(),
+                )
             })
             .collect::<Vec<_>>();
         let entries = text_files
@@ -680,6 +711,7 @@ fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
 fn render_binary_side(
     label: &'static str,
     blob: Option<&BinaryBlob>,
+    caption: &SharedString,
     cx: &App,
 ) -> impl IntoElement {
     let border = cx.theme().colors().border;
@@ -698,7 +730,7 @@ fn render_binary_side(
         .gap_1()
         .child(Label::new(label).color(Color::Muted))
         .children(picture)
-        .child(Label::new(binary_blob_caption(blob)))
+        .child(Label::new(caption.clone()))
 }
 
 fn render_binary_card(card: &BinaryCard, cx: &App) -> impl IntoElement {
@@ -709,22 +741,32 @@ fn render_binary_card(card: &BinaryCard, cx: &App) -> impl IntoElement {
         .border_1()
         .border_color(colors.border)
         .rounded_md()
-        .child(Label::new(format!(
-            "{} \u{2014} {}",
-            card.display_path,
-            status_label(&card.status)
-        )))
+        .child(Label::new(card.title.clone()))
         .child(
             h_flex()
                 .gap_4()
                 .items_start()
                 .when(
                     card.binary.old.is_some() || card.binary.new.is_none(),
-                    |row| row.child(render_binary_side("Before", card.binary.old.as_ref(), cx)),
+                    |row| {
+                        row.child(render_binary_side(
+                            "Before",
+                            card.binary.old.as_ref(),
+                            &card.old_caption,
+                            cx,
+                        ))
+                    },
                 )
                 .when(
                     card.binary.new.is_some() || card.binary.old.is_none(),
-                    |row| row.child(render_binary_side("After", card.binary.new.as_ref(), cx)),
+                    |row| {
+                        row.child(render_binary_side(
+                            "After",
+                            card.binary.new.as_ref(),
+                            &card.new_caption,
+                            cx,
+                        ))
+                    },
                 ),
         )
 }
@@ -734,9 +776,11 @@ impl Render for CommitDiffPreview {
         if self.binary_cards.is_empty() {
             return self.editor.clone().into_any_element();
         }
+        let hidden = self.binary_cards.len().saturating_sub(MAX_BINARY_CARDS);
         let cards = self
             .binary_cards
             .iter()
+            .take(MAX_BINARY_CARDS)
             .map(|card| render_binary_card(card, cx).into_any_element())
             .collect::<Vec<_>>();
         v_flex()
@@ -747,6 +791,12 @@ impl Render for CommitDiffPreview {
             .bg(cx.theme().colors().editor_background)
             .overflow_y_scroll()
             .children(cards)
+            .when(hidden > 0, |this| {
+                this.child(
+                    Label::new(format!("\u{2026} and {hidden} more binary files"))
+                        .color(Color::Muted),
+                )
+            })
             .when(self.has_text_entries, |this| {
                 this.child(div().flex_1().min_h(px(240.)).child(self.editor.clone()))
             })

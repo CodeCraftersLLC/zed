@@ -928,6 +928,11 @@ impl Item for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        // A read-only project (a snapshot, a remote tree) has nothing to write:
+        // skip formatting and the save prompt entirely.
+        if project.read(cx).is_read_only(cx) {
+            return Task::ready(Ok(()));
+        }
         // Add meta data tracking # of auto saves
         if options.autosave {
             self.report_editor_event(ReportEditorEvent::Saved { auto_saved: true }, None, cx);
