@@ -185,6 +185,10 @@ impl Default for ProjectPanelContextMenuPolicy {
     }
 }
 
+/// Host-supplied check of a name typed into the panel's rename / new-entry
+/// editor: `Some(message)` refuses it, shown inline, and keeps the editor open.
+pub type NameValidator = std::sync::Arc<dyn Fn(&str) -> Option<String>>;
+
 pub struct ProjectPanel {
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
@@ -216,6 +220,7 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     context_menu_policy: ProjectPanelContextMenuPolicy,
+    name_validator: Option<NameValidator>,
     state: State,
 }
 
@@ -942,6 +947,7 @@ impl ProjectPanel {
                 update_visible_entries_task: Default::default(),
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
                 context_menu_policy: ProjectPanelContextMenuPolicy::default(),
+                name_validator: None,
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -1823,6 +1829,16 @@ impl ProjectPanel {
                 return;
             };
 
+            if let Some(message) = self
+                .name_validator
+                .as_ref()
+                .and_then(|validate| validate(filename.as_unix_str()))
+            {
+                edit_state.validation_state = ValidationState::Error(message);
+                cx.notify();
+                return;
+            }
+
             if let Some(worktree) = self
                 .project
                 .read(cx)
@@ -1881,6 +1897,15 @@ impl ProjectPanel {
             }
         }
         if filename.trim().is_empty() {
+            return None;
+        }
+        if let Some(message) = self
+            .name_validator
+            .as_ref()
+            .and_then(|validate| validate(filename.trim().trim_start_matches(['/', '\\'])))
+        {
+            edit_state.validation_state = ValidationState::Error(message);
+            cx.notify();
             return None;
         }
 
@@ -4008,6 +4033,14 @@ impl ProjectPanel {
             worktree_id: worktree.read(cx).id(),
             path: entry.path.clone(),
         })
+    }
+
+    /// Installs a check run on every name typed into the rename and new-entry
+    /// editor, so a name the host cannot accept is refused inline instead of
+    /// failing after the editor closed.
+    pub fn set_name_validator(&mut self, validator: Option<NameValidator>, cx: &mut Context<Self>) {
+        self.name_validator = validator;
+        cx.notify();
     }
 
     /// Updates context-menu action visibility for this project-panel surface.

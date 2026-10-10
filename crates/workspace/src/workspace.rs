@@ -1381,6 +1381,7 @@ pub struct Workspace {
     auto_watch: AutoWatch,
     window_edited: bool,
     last_window_title: Option<String>,
+    manages_window_title: bool,
     dirty_items: HashMap<EntityId, Subscription>,
     active_call: Option<(GlobalAnyActiveCall, Vec<Subscription>)>,
     leader_updates_tx: mpsc::UnboundedSender<(PeerId, proto::UpdateFollowers)>,
@@ -1833,6 +1834,7 @@ impl Workspace {
             dispatching_keystrokes: Default::default(),
             window_edited: false,
             last_window_title: None,
+            manages_window_title: true,
             dirty_items: Default::default(),
             active_call,
             database_id: workspace_id,
@@ -6157,7 +6159,16 @@ impl Workspace {
         self.apply_window_title(window, cx);
     }
 
+    /// Whether this workspace writes the OS window title. An embedder that owns
+    /// the window's chrome turns it off and sets the title itself.
+    pub fn set_manages_window_title(&mut self, manages: bool) {
+        self.manages_window_title = manages;
+    }
+
     fn apply_window_title(&mut self, window: &mut Window, cx: &mut App) {
+        if !self.manages_window_title {
+            return;
+        }
         let project = self.project().read(cx);
         let mut title = String::new();
 
@@ -6297,6 +6308,12 @@ impl Workspace {
     }
 
     fn render_notifications(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Div> {
+        self.notification_stack()
+    }
+
+    /// The toast stack, for an embedder that renders a bare workspace instead
+    /// of Zed's own window chrome. Without it every `show_error` is invisible.
+    pub fn notification_stack(&self) -> Option<Div> {
         if self.notifications.is_empty() {
             None
         } else {
@@ -11393,6 +11410,34 @@ mod tests {
         // Remove a project folder
         project.update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
         assert_eq!(cx.window_title().as_deref(), Some("root2 — one.txt"));
+    }
+
+    #[gpui::test]
+    async fn test_embedder_can_take_over_the_window_title(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root1", json!({ "one.txt": "" })).await;
+        let project = Project::test(fs, ["root1".as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        workspace.update(cx, |workspace, _| workspace.set_manages_window_title(false));
+        cx.update(|window, _| window.set_window_title("Embedder Title"));
+
+        let item = cx.new(|cx| {
+            TestItem::new(cx).with_project_items(&[TestProjectItem::new(1, "one.txt", cx)])
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            workspace.refresh_window_state(window, cx);
+        });
+        assert_eq!(cx.window_title().as_deref(), Some("Embedder Title"));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_manages_window_title(true);
+            workspace.refresh_window_state(window, cx);
+        });
+        assert_eq!(cx.window_title().as_deref(), Some("root1 — one.txt"));
     }
 
     #[gpui::test]
