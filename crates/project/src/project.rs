@@ -232,7 +232,6 @@ pub struct Project {
     client_subscriptions: Vec<client::Subscription>,
     worktree_store: Entity<WorktreeStore>,
     buffer_store: Entity<BufferStore>,
-    /// A local project an embedder has made read-only (see `set_local_read_only`).
     local_read_only: bool,
     context_server_store: Entity<ContextServerStore>,
     image_store: Entity<ImageStore>,
