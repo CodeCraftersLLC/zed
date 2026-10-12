@@ -893,25 +893,77 @@ impl WatcherState {
         }
     }
 
-    /// Drops a registration and, when it was the last one on a path that owns
-    /// an OS watch, returns the unwatch command that releases it.
-    fn remove_registration(&mut self, id: WatcherRegistrationId) -> Option<WatchCommand> {
-        let registration_state = self.watchers.remove(&id)?;
-        let path_registrations = self.path_registrations(registration_state.mode);
-        let path_state = path_registrations.get_mut(&registration_state.key)?;
+    /// Drops a registration. When it was the last one on a path that owns an OS
+    /// watch, returns the unwatch command that releases it, followed by a watch
+    /// command for each path that watch was covering and that nothing else
+    /// covers: those registrations stay, so they need a watch of their own.
+    fn remove_registration(&mut self, id: WatcherRegistrationId) -> Vec<WatchCommand> {
+        let Some(registration_state) = self.watchers.remove(&id) else {
+            return Vec::new();
+        };
+        let mode = registration_state.mode;
+        let paths = self.path_registrations(mode);
+        let Some(path_state) = paths.get_mut(&registration_state.key) else {
+            return Vec::new();
+        };
         path_state.watcher_ids.retain(|&existing| existing != id);
         if !path_state.watcher_ids.is_empty() {
-            return None;
+            return Vec::new();
         }
-
-        let path_state = path_registrations.remove(&registration_state.key)?;
-        Some(WatchCommand {
+        let Some(path_state) = paths.remove(&registration_state.key) else {
+            return Vec::new();
+        };
+        let Some(epoch) = path_state.os_watch else {
+            return Vec::new();
+        };
+        let mut commands = vec![WatchCommand {
             op: WatchOp::Unwatch,
-            mode: registration_state.mode,
-            path: registration_state.path,
-            key: registration_state.key,
-            epoch: path_state.os_watch?,
-        })
+            mode,
+            path: registration_state.path.clone(),
+            key: registration_state.key.clone(),
+            epoch,
+        }];
+        commands.extend(self.promote_covered(&registration_state.key, mode));
+        commands
+    }
+
+    /// Gives an OS watch to every registered path that the watch on `released`
+    /// was covering and that no other watch covers, shortest paths first so a
+    /// path under another promoted one stays covered by it.
+    fn promote_covered(&mut self, released: &WatchKey, mode: WatcherMode) -> Vec<WatchCommand> {
+        let mut covered: Vec<(WatchKey, Arc<SanitizedPath>)> = Vec::new();
+        for watcher in self.watchers.values() {
+            let under_released = watcher.mode == mode
+                && watcher.path.as_path().ancestors().skip(1).any(|ancestor| {
+                    let ancestor = SanitizedPath::unchecked_new(ancestor);
+                    WatchKey::exact(ancestor) == *released
+                        || WatchKey::folded(ancestor) == *released
+                });
+            if under_released && !covered.iter().any(|(key, _)| *key == watcher.key) {
+                covered.push((watcher.key.clone(), watcher.path.clone()));
+            }
+        }
+        covered.sort_by_key(|(_, path)| path.as_path().components().count());
+        let mut commands = Vec::new();
+        for (key, path) in covered {
+            let epoch = self.next_epoch();
+            let paths = self.path_registrations(mode);
+            let needs_watch = paths
+                .get_mut(&key)
+                .is_some_and(|state| state.os_watch.is_none())
+                && !paths.has_own_watch_ancestor(&path);
+            if needs_watch && let Some(state) = paths.get_mut(&key) {
+                state.os_watch = Some(epoch);
+                commands.push(WatchCommand {
+                    op: WatchOp::Watch,
+                    mode,
+                    path,
+                    key,
+                    epoch,
+                });
+            }
+        }
+        commands
     }
 
     /// Records the outcome of a watch command. A failed watch is rolled back,
@@ -1487,8 +1539,8 @@ impl GlobalWatcher {
     /// Drops a registration. Never blocks on FSEvents: releasing the OS watch
     /// it owned is queued for the watcher thread like any other change.
     pub fn remove(&self, id: WatcherRegistrationId) {
-        let command = self.state.lock().remove_registration(id);
-        if let Some(command) = command {
+        let commands = self.state.lock().remove_registration(id);
+        for command in commands {
             self.submit(command);
         }
     }
@@ -2031,6 +2083,34 @@ mod tests {
                 .contains(&PathBuf::from("/repo")),
             "the child resolved before the ancestor was watched"
         );
+    }
+
+    #[test]
+    fn a_path_covered_by_a_removed_ancestor_gets_a_watch_of_its_own() {
+        let backend = slow_backend(Duration::from_millis(200));
+        let watcher = test_watcher(backend.clone());
+
+        // Keep the worker busy so the ancestor is still queued when it is removed.
+        watcher
+            .add(poll_path("/busy"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        std::thread::sleep(Duration::from_millis(50));
+        let ancestor = watcher
+            .add(poll_path("/repo"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        let child = watcher
+            .add(poll_path("/repo/sub"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        watcher.remove(ancestor.id);
+        watcher.flush();
+
+        assert!(watcher.is_registered(child.id));
+        let backend = backend.lock();
+        assert!(
+            backend.watched_paths.contains(&PathBuf::from("/repo/sub")),
+            "the child lost its coverage and was given no watch"
+        );
+        assert!(!backend.watched_paths.contains(&PathBuf::from("/repo")));
     }
 
     #[test]
