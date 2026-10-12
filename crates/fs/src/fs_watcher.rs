@@ -104,6 +104,15 @@ impl FsWatcher {
         self.add_existing_path(path)
     }
 
+    /// A receiver for the watch this watcher's registration of `path` is still
+    /// waiting on, or `None` when it is not registered or its watch is in place.
+    fn pending_watch(&self, path: &Path) -> Option<WatchApplied> {
+        let case_insensitive = case_insensitive_path(path);
+        let key = WatchKey::for_registration(SanitizedPath::new(path), case_insensitive);
+        let existing = self.registrations.lock().get(&key).copied()?;
+        global_watcher().applied_waiter(existing.id).flatten()
+    }
+
     fn add_pending_path(&self, path: Arc<Path>) {
         let mut pending_registrations = self.pending_registrations.lock();
         if pending_registrations.contains_key(path.as_ref()) {
@@ -153,12 +162,22 @@ impl Watcher for FsWatcher {
     ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
         let applied = self.add_path(path);
         Box::pin(async move {
-            let Some(applied) = applied else {
+            let Some(mut applied) = applied else {
                 return Ok(());
             };
-            // Cancelled means the registration was removed before its watch was
-            // applied, so there is nothing left to wait for.
-            applied.await.unwrap_or(Ok(()))
+            loop {
+                match applied.await {
+                    Ok(result) => return result,
+                    // Cancelled: the watch this was waiting for was released
+                    // before it was applied. If this path is still registered
+                    // (a covering watch went away and it got its own), wait for
+                    // that one; if not, it was removed and there is nothing left.
+                    Err(_cancelled) => match self.pending_watch(path) {
+                        Some(next) => applied = next,
+                        None => return Ok(()),
+                    },
+                }
+            }
         })
     }
 
