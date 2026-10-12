@@ -29,6 +29,10 @@ pub struct FsWatcher {
     pending_registrations: Arc<Mutex<HashMap<Arc<std::path::Path>, Task<()>>>>,
 }
 
+/// How many 50 ms polls `add_and_wait` gives a poll task to claim a path that
+/// has appeared (about 30 seconds, longer than any poll interval).
+const PENDING_CLAIM_POLLS: usize = 600;
+
 /// Where a registration's OS watch stands.
 enum WatchState {
     /// Still being installed: wait on this receiver.
@@ -176,8 +180,24 @@ impl Watcher for FsWatcher {
         &'a self,
         path: &'a std::path::Path,
     ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
-        let applied = self.add_path(path);
+        let mut applied = self.add_path(path);
         Box::pin(async move {
+            // A missing path is watched by a poll task once it appears. If it
+            // already has, that task is claiming it right now: wait for the claim
+            // (bounded) and then for its watch, instead of reporting a watch that
+            // is not installed yet.
+            for _ in 0..PENDING_CLAIM_POLLS {
+                if applied.is_some()
+                    || !self.pending_registrations.lock().contains_key(path)
+                    || fs::symlink_metadata(path).is_err()
+                {
+                    break;
+                }
+                self.executor
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                applied = self.add_path(path);
+            }
             let Some(mut applied) = applied else {
                 return Ok(());
             };
@@ -1339,6 +1359,11 @@ pub struct GlobalWatcher {
     commands: std::sync::mpsc::Sender<WorkerMessage>,
     queued: fn(WatcherMode) -> bool,
     event_tx: async_channel::Sender<DispatchEvent>,
+    /// Held from a registration change to the submission of its commands, so two
+    /// changes cannot publish their commands in the opposite order to the state
+    /// transitions they came from (an unwatch overtaking its watch). The state
+    /// lock itself is still released before any OS work.
+    publish: Mutex<()>,
 }
 
 impl GlobalWatcher {
@@ -1373,6 +1398,7 @@ impl GlobalWatcher {
             commands,
             queued,
             event_tx,
+            publish: Mutex::new(()),
         }
     }
 
@@ -1387,6 +1413,7 @@ impl GlobalWatcher {
         case_insensitive: bool,
         cb: impl Fn(&notify::Event) + Send + Sync + 'static,
     ) -> Option<Registration> {
+        let _publishing = self.publish.lock();
         let path = SanitizedPath::from_arc(path);
         let key = WatchKey::for_registration(&path, case_insensitive);
         let (registration, command) = {
@@ -1620,6 +1647,7 @@ impl GlobalWatcher {
     /// Drops a registration. Never blocks on FSEvents: releasing the OS watch
     /// it owned is queued for the watcher thread like any other change.
     pub fn remove(&self, id: WatcherRegistrationId) {
+        let _publishing = self.publish.lock();
         let commands = self.state.lock().remove_registration(id);
         for command in commands {
             self.submit(command);
