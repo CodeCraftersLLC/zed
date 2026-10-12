@@ -569,9 +569,22 @@ async fn poll_path_until_created(
                 // Removing the pending path drops this task, possibly while it
                 // waits below; the guard releases the registration then.
                 let mut unclaimed = UnclaimedRegistration(Some(registration.id));
-                if let Some(applied) = applied
-                    && let Ok(Err(error)) = applied.await
-                {
+                let mut waiting = applied;
+                let mut failure = None;
+                while let Some(applied) = waiting.take() {
+                    match applied.await {
+                        Ok(Err(error)) => failure = Some(error),
+                        Ok(Ok(())) => {}
+                        // Cancelled: the watch waited on was released first. Ask
+                        // again where this registration stands, and report
+                        // success only once its own watch is in place.
+                        Err(_cancelled) => match global_watcher().applied_waiter(registration.id) {
+                            Some(next) => waiting = next,
+                            None => failure = Some(anyhow::anyhow!("its watch was released")),
+                        },
+                    }
+                }
+                if let Some(error) = failure {
                     log::warn!("failed to watch newly-created path {path:?}: {error}; retrying");
                     continue;
                 }
