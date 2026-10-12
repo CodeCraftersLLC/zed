@@ -929,9 +929,23 @@ impl Item for Editor {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         // A read-only project (a snapshot, a remote tree) has nothing to write:
-        // skip formatting and the save prompt entirely.
+        // skip formatting and the save prompt entirely. Edits made before the
+        // project became read-only cannot be written either, and saying so keeps
+        // the item from closing as if they had been saved.
         if project.read(cx).is_read_only(cx) {
-            return Task::ready(Ok(()));
+            let has_unsaved_edits = self
+                .buffer()
+                .read(cx)
+                .all_buffers()
+                .iter()
+                .any(|buffer| buffer.read(cx).is_dirty());
+            return Task::ready(if has_unsaved_edits {
+                Err(anyhow!(
+                    "This project is read-only, so these edits cannot be saved"
+                ))
+            } else {
+                Ok(())
+            });
         }
         // Add meta data tracking # of auto saves
         if options.autosave {

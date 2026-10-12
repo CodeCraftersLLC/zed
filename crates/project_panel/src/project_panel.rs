@@ -1798,6 +1798,7 @@ impl ProjectPanel {
     }
 
     fn populate_validation_error(&mut self, cx: &mut Context<Self>) {
+        let path_style = self.project.read(cx).path_style(cx);
         let edit_state = match self.state.edit_state.as_mut() {
             Some(state) => state,
             None => return,
@@ -1829,11 +1830,11 @@ impl ProjectPanel {
                 return;
             };
 
-            if let Some(message) = Self::name_rejection(
-                self.name_validator.as_ref(),
-                filename.as_unix_str(),
-                PathStyle::Posix,
-            ) {
+            // The same name and path style Enter validates with, so the inline
+            // error and the confirmation never disagree.
+            if let Some(message) =
+                Self::name_rejection(self.name_validator.as_ref(), trimmed_filename, path_style)
+            {
                 edit_state.validation_state = ValidationState::Error(message);
                 cx.notify();
                 return;
@@ -2347,6 +2348,10 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Discarding changes checks files out into the working tree.
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         maybe!({
             let selection = self.selection?;
             let project = self.project.read(cx);

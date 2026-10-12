@@ -2683,6 +2683,9 @@ impl Project {
         trash_entry: TrashedEntry,
         cx: &mut Context<'_, Self>,
     ) -> Task<Result<ProjectPath>> {
+        if !self.capability().editable() {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
             return Task::ready(Err(anyhow!("No worktree for id {worktree_id:?}")));
         };

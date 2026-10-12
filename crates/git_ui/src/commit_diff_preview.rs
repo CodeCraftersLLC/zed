@@ -108,6 +108,9 @@ pub struct CommitDiffPreview {
     /// Binary files, drawn as before/after cards above the text diff instead of
     /// as fake text.
     binary_cards: Vec<BinaryCard>,
+    /// Binary files past [`MAX_BINARY_CARDS`]: counted, never held, so their
+    /// image data is not kept for cards that are not drawn.
+    hidden_binary_files: usize,
     has_text_entries: bool,
     _populate_task: Task<Result<()>>,
 }
@@ -330,8 +333,10 @@ impl CommitDiffPreview {
             .into_iter()
             .enumerate()
             .partition(|(_, file)| file.is_binary && file.load_error.is_none());
+        let hidden_binary_files = binary_files.len().saturating_sub(MAX_BINARY_CARDS);
         let binary_cards = binary_files
             .into_iter()
+            .take(MAX_BINARY_CARDS)
             .map(|(_, file)| {
                 BinaryCard::new(
                     &file.display_path,
@@ -359,6 +364,7 @@ impl CommitDiffPreview {
             title: options.title,
             file_count,
             binary_cards,
+            hidden_binary_files,
             has_text_entries,
             _populate_task: populate_task,
         }
@@ -776,11 +782,10 @@ impl Render for CommitDiffPreview {
         if self.binary_cards.is_empty() {
             return self.editor.clone().into_any_element();
         }
-        let hidden = self.binary_cards.len().saturating_sub(MAX_BINARY_CARDS);
+        let hidden = self.hidden_binary_files;
         let cards = self
             .binary_cards
             .iter()
-            .take(MAX_BINARY_CARDS)
             .map(|card| render_binary_card(card, cx).into_any_element())
             .collect::<Vec<_>>();
         v_flex()

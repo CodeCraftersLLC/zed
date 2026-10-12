@@ -6159,10 +6159,14 @@ impl Workspace {
         self.apply_window_title(window, cx);
     }
 
-    /// Whether this workspace writes the OS window title. An embedder that owns
-    /// the window's chrome turns it off and sets the title itself.
+    /// Whether this workspace writes the OS window title and the window's
+    /// document path. An embedder that owns the window's chrome turns it off and
+    /// sets both itself. Turning it back on forgets the last title written, so
+    /// the next update rewrites the window even if the computed title is the
+    /// same as before the embedder changed it.
     pub fn set_manages_window_title(&mut self, manages: bool) {
         self.manages_window_title = manages;
+        self.last_window_title = None;
     }
 
     fn apply_window_title(&mut self, window: &mut Window, cx: &mut App) {

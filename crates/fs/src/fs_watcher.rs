@@ -59,7 +59,8 @@ impl FsWatcher {
             && global_watcher().is_registered(existing.id)
         {
             log::trace!("path to watch is already watched: {path:?}");
-            return None;
+            // Its OS watch may still be queued by an earlier `add`.
+            return global_watcher().applied_waiter(existing.id);
         }
         let (registration, applied) = register_existing_path(
             path,
@@ -75,12 +76,12 @@ impl FsWatcher {
         log::trace!("watcher add: {path:?}");
 
         let path: Arc<Path> = path.into();
-        if path_covered_by_recursive_registration(
-            &self.registrations.lock(),
-            SanitizedPath::new(&path),
-        ) {
+        let covering =
+            recursive_registration_covering(&self.registrations.lock(), SanitizedPath::new(&path));
+        if let Some(covering) = covering {
             log::trace!("path to watch is covered by an existing registration: {path:?}");
-            return None;
+            // The covering watch may still be queued by an earlier `add`.
+            return global_watcher().applied_waiter(covering.id);
         }
 
         if self
@@ -176,22 +177,25 @@ impl Watcher for FsWatcher {
     }
 }
 
-/// Whether a recursive registration on a strict ancestor of `path` already covers
-/// it. Both key spellings are probed so a folded registration still matches; only
-/// poll watches and native macOS/Windows watches are recursive.
-fn path_covered_by_recursive_registration(
+/// The recursive registration on a strict ancestor of `path` that already covers
+/// it, if any. Both key spellings are probed so a folded registration still
+/// matches; only poll watches and native macOS/Windows watches are recursive.
+fn recursive_registration_covering(
     registrations: &HashMap<WatchKey, FsWatcherRegistration>,
     path: &SanitizedPath,
-) -> bool {
-    path.as_path().ancestors().skip(1).any(|ancestor| {
+) -> Option<FsWatcherRegistration> {
+    path.as_path().ancestors().skip(1).find_map(|ancestor| {
         let ancestor = SanitizedPath::unchecked_new(ancestor);
         [WatchKey::exact(ancestor), WatchKey::folded(ancestor)]
             .iter()
-            .any(|key| {
-                registrations.get(key).is_some_and(|registration| {
-                    registration.mode == WatcherMode::Poll
-                        || cfg!(any(target_os = "windows", target_os = "macos"))
-                })
+            .find_map(|key| {
+                registrations
+                    .get(key)
+                    .filter(|registration| {
+                        registration.mode == WatcherMode::Poll
+                            || cfg!(any(target_os = "windows", target_os = "macos"))
+                    })
+                    .copied()
             })
     })
 }
@@ -532,6 +536,9 @@ async fn poll_path_until_created(
             pending_path_events.clone(),
         ) {
             Some((registration, applied)) => {
+                // Removing the pending path drops this task, possibly while it
+                // waits below; the guard releases the registration then.
+                let mut unclaimed = UnclaimedRegistration(Some(registration.id));
                 if let Some(applied) = applied
                     && let Ok(Err(error)) = applied.await
                 {
@@ -541,10 +548,10 @@ async fn poll_path_until_created(
                 {
                     let mut pending_registrations = pending_registrations.lock();
                     if pending_registrations.remove(path.as_ref()).is_none() {
-                        global_watcher().remove(registration.id);
                         return;
                     }
                     registrations.lock().insert(key, registration);
+                    unclaimed.0 = None;
                 }
                 enqueue_path_events(
                     &tx,
@@ -563,6 +570,18 @@ async fn poll_path_until_created(
                 return;
             }
             None => {}
+        }
+    }
+}
+
+/// A global registration no `FsWatcher` owns yet. Dropping it removes the
+/// registration, so a task cancelled mid-wait cannot leak a watch.
+struct UnclaimedRegistration(Option<WatcherRegistrationId>);
+
+impl Drop for UnclaimedRegistration {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            global_watcher().remove(id);
         }
     }
 }
@@ -1248,6 +1267,24 @@ impl GlobalWatcher {
         Some(registration)
     }
 
+    /// A receiver for the OS watch behind registration `id` if it is still
+    /// queued, so a second `add_and_wait` for a path an earlier `add` already
+    /// registered waits for the same watch instead of returning at once.
+    fn applied_waiter(&self, id: WatcherRegistrationId) -> Option<WatchApplied> {
+        let mut state = self.state.lock();
+        let (key, mode) = state
+            .watchers
+            .get(&id)
+            .map(|watcher| (watcher.key.clone(), watcher.mode))?;
+        let path_state = state.path_registrations(mode).get_mut(&key)?;
+        if path_state.waiters.is_empty() {
+            return None;
+        }
+        let (waiter, applied) = oneshot::channel();
+        path_state.waiters.push(waiter);
+        Some(applied)
+    }
+
     /// Whether `id` is still registered. A registration disappears when it is
     /// removed or when the OS watch it asked for failed.
     fn is_registered(&self, id: WatcherRegistrationId) -> bool {
@@ -1819,6 +1856,33 @@ mod tests {
                 .watched_paths
                 .contains(&PathBuf::from("/repo/root")),
             "applied resolved before the backend watched the path"
+        );
+    }
+
+    #[test]
+    fn a_second_waiter_for_a_queued_registration_waits_for_the_same_watch() {
+        let backend = slow_backend(Duration::from_millis(200));
+        let watcher = test_watcher(backend.clone());
+
+        let registration = watcher
+            .add(poll_path("/repo/root"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        // An earlier plain `add` dropped its receiver; a later `add_and_wait`
+        // for the same path must still wait for the watch.
+        drop(registration.applied);
+        let applied = watcher
+            .applied_waiter(registration.id)
+            .expect("the watch is still queued");
+
+        smol::block_on(applied)
+            .expect("not cancelled")
+            .expect("watch applied");
+        assert!(
+            backend
+                .lock()
+                .watched_paths
+                .contains(&PathBuf::from("/repo/root")),
+            "the second waiter resolved before the backend watched the path"
         );
     }
 

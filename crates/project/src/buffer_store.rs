@@ -967,6 +967,11 @@ impl BufferStore {
     }
 
     fn add_buffer(&mut self, buffer_entity: Entity<Buffer>, cx: &mut Context<Self>) -> Result<()> {
+        if self.force_read_only {
+            buffer_entity.update(cx, |buffer, cx| {
+                buffer.set_capability(Capability::ReadOnly, cx)
+            });
+        }
         let buffer = buffer_entity.read(cx);
         let remote_id = buffer.remote_id();
         let path = File::from_dyn(buffer.file()).map(|file| ProjectPath {
@@ -1020,12 +1025,17 @@ impl BufferStore {
         Ok(())
     }
 
-    /// Make every buffer, open now or loaded later, read-only.
+    /// Make every buffer, open now or created or loaded later, read-only. A
+    /// buffer that already has unsaved edits keeps its capability: `ReadOnly`
+    /// buffers report themselves clean, so flipping it would let the editor close
+    /// without asking and lose the edits. Saving it is refused instead.
     pub fn set_force_read_only(&mut self, cx: &mut Context<Self>) {
         self.force_read_only = true;
         for buffer in self.buffers().collect::<Vec<_>>() {
             buffer.update(cx, |buffer, cx| {
-                buffer.set_capability(Capability::ReadOnly, cx)
+                if !buffer.is_dirty() {
+                    buffer.set_capability(Capability::ReadOnly, cx)
+                }
             });
         }
     }
