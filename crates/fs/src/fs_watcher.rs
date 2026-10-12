@@ -55,12 +55,13 @@ impl FsWatcher {
         let key = WatchKey::for_registration(SanitizedPath::new(&path), case_insensitive);
         // A registration whose OS watch failed is gone from the global watcher;
         // adding the path again retries it.
-        if let Some(existing) = self.registrations.lock().get(&key)
-            && global_watcher().is_registered(existing.id)
+        let existing = self.registrations.lock().get(&key).copied();
+        if let Some(existing) = existing
+            && let Some(applied) = global_watcher().applied_waiter(existing.id)
         {
             log::trace!("path to watch is already watched: {path:?}");
             // Its OS watch may still be queued by an earlier `add`.
-            return global_watcher().applied_waiter(existing.id);
+            return applied;
         }
         let (registration, applied) = register_existing_path(
             path,
@@ -78,10 +79,12 @@ impl FsWatcher {
         let path: Arc<Path> = path.into();
         let covering =
             recursive_registration_covering(&self.registrations.lock(), SanitizedPath::new(&path));
-        if let Some(covering) = covering {
+        if let Some(covering) = covering
+            && let Some(applied) = global_watcher().applied_waiter(covering.id)
+        {
             log::trace!("path to watch is covered by an existing registration: {path:?}");
             // The covering watch may still be queued by an earlier `add`.
-            return global_watcher().applied_waiter(covering.id);
+            return applied;
         }
 
         if self
@@ -1347,21 +1350,26 @@ impl GlobalWatcher {
         Some(registration)
     }
 
-    /// A receiver for the OS watch behind registration `id` if it is still
-    /// queued, so a second `add_and_wait` for a path an earlier `add` already
-    /// registered waits for the same watch instead of returning at once.
-    fn applied_waiter(&self, id: WatcherRegistrationId) -> Option<WatchApplied> {
+    /// For registration `id`: `None` when it no longer exists (removed, or its
+    /// watch failed), `Some(None)` when its OS watch is already in place, and
+    /// `Some(Some(receiver))` while that watch is still queued. Both facts come
+    /// from one lock, so a caller can tell a vanished registration from an
+    /// applied one and register again.
+    fn applied_waiter(&self, id: WatcherRegistrationId) -> Option<Option<WatchApplied>> {
         let mut state = self.state.lock();
         let (key, mode) = state
             .watchers
             .get(&id)
             .map(|watcher| (watcher.key.clone(), watcher.mode))?;
-        let path_state = state.path_registrations(mode).get_mut(&key)?;
-        if path_state.waiters.is_empty() {
-            return None;
-        }
-        let (waiter, applied) = oneshot::channel();
-        path_state.waiters.push(waiter);
+        let applied = state
+            .path_registrations(mode)
+            .get_mut(&key)
+            .filter(|path_state| !path_state.waiters.is_empty())
+            .map(|path_state| {
+                let (waiter, applied) = oneshot::channel();
+                path_state.waiters.push(waiter);
+                applied
+            });
         Some(applied)
     }
 
@@ -1952,6 +1960,7 @@ mod tests {
         drop(registration.applied);
         let applied = watcher
             .applied_waiter(registration.id)
+            .expect("the registration exists")
             .expect("the watch is still queued");
 
         smol::block_on(applied)

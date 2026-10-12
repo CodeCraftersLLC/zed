@@ -939,7 +939,9 @@ impl Item for Editor {
                 .all_buffers()
                 .iter()
                 .any(|buffer| buffer.read(cx).is_dirty());
-            return Task::ready(if has_unsaved_edits {
+            // An autosave tick cannot do anything about it and must not fail
+            // on every tick; an explicit save says so.
+            return Task::ready(if has_unsaved_edits && !options.autosave {
                 Err(anyhow!(
                     "This project is read-only, so these edits cannot be saved"
                 ))

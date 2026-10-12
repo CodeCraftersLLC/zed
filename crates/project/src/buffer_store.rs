@@ -1032,16 +1032,22 @@ impl BufferStore {
     }
 
     /// Make every buffer, open now or created or loaded later, read-only. A
-    /// buffer that already has unsaved edits keeps its capability: `ReadOnly`
-    /// buffers report themselves clean, so flipping it would let the editor close
-    /// without asking and lose the edits. Saving it is refused instead.
+    /// buffer that already has unsaved edits becomes `Read` (not editable, but
+    /// still dirty): `ReadOnly` buffers report themselves clean, so flipping it
+    /// would let the editor close without asking and lose the edits. Saving it
+    /// is refused.
     pub fn set_force_read_only(&mut self, cx: &mut Context<Self>) {
         self.force_read_only = true;
         for buffer in self.buffers().collect::<Vec<_>>() {
             buffer.update(cx, |buffer, cx| {
-                if !buffer.is_dirty() {
-                    buffer.set_capability(Capability::ReadOnly, cx)
-                }
+                // `Read` stops editing but, unlike `ReadOnly`, keeps reporting
+                // unsaved edits, so closing still asks.
+                let capability = if buffer.is_dirty() {
+                    Capability::Read
+                } else {
+                    Capability::ReadOnly
+                };
+                buffer.set_capability(capability, cx)
             });
         }
     }
