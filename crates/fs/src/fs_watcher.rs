@@ -29,6 +29,17 @@ pub struct FsWatcher {
     pending_registrations: Arc<Mutex<HashMap<Arc<std::path::Path>, Task<()>>>>,
 }
 
+/// Where a registration's OS watch stands.
+enum WatchState {
+    /// Still being installed: wait on this receiver.
+    Pending(WatchApplied),
+    Applied,
+    /// This watcher no longer holds the registration (it removed it).
+    Removed,
+    /// The registration is gone from the global watcher: its watch failed.
+    Failed,
+}
+
 #[derive(Clone, Copy)]
 struct FsWatcherRegistration {
     id: WatcherRegistrationId,
@@ -104,13 +115,18 @@ impl FsWatcher {
         self.add_existing_path(path)
     }
 
-    /// A receiver for the watch this watcher's registration of `path` is still
-    /// waiting on, or `None` when it is not registered or its watch is in place.
-    fn pending_watch(&self, path: &Path) -> Option<WatchApplied> {
+    /// Where this watcher's registration of `path` stands now.
+    fn pending_watch(&self, path: &Path) -> WatchState {
         let case_insensitive = case_insensitive_path(path);
         let key = WatchKey::for_registration(SanitizedPath::new(path), case_insensitive);
-        let existing = self.registrations.lock().get(&key).copied()?;
-        global_watcher().applied_waiter(existing.id).flatten()
+        let Some(existing) = self.registrations.lock().get(&key).copied() else {
+            return WatchState::Removed;
+        };
+        match global_watcher().applied_waiter(existing.id) {
+            None => WatchState::Failed,
+            Some(None) => WatchState::Applied,
+            Some(Some(next)) => WatchState::Pending(next),
+        }
     }
 
     fn add_pending_path(&self, path: Arc<Path>) {
@@ -173,8 +189,13 @@ impl Watcher for FsWatcher {
                     // (a covering watch went away and it got its own), wait for
                     // that one; if not, it was removed and there is nothing left.
                     Err(_cancelled) => match self.pending_watch(path) {
-                        Some(next) => applied = next,
-                        None => return Ok(()),
+                        WatchState::Pending(next) => applied = next,
+                        WatchState::Applied | WatchState::Removed => return Ok(()),
+                        WatchState::Failed => {
+                            return Err(anyhow::anyhow!(
+                                "the watch for {path:?} was released before it was applied"
+                            ));
+                        }
                     },
                 }
             }
@@ -1317,7 +1338,6 @@ pub struct GlobalWatcher {
     applier: Arc<WatchApplier>,
     commands: std::sync::mpsc::Sender<WorkerMessage>,
     queued: fn(WatcherMode) -> bool,
-    native_available: Result<(), String>,
     event_tx: async_channel::Sender<DispatchEvent>,
 }
 
@@ -1331,7 +1351,6 @@ impl GlobalWatcher {
         queued: fn(WatcherMode) -> bool,
     ) -> Self {
         let state = Arc::new(Mutex::new(WatcherState::default()));
-        let native_available = native.as_ref().map(|_| ()).map_err(Clone::clone);
         let applier = Arc::new(WatchApplier {
             state: state.clone(),
             backends: WatchBackends {
@@ -1353,7 +1372,6 @@ impl GlobalWatcher {
             applier,
             commands,
             queued,
-            native_available,
             event_tx,
         }
     }
@@ -1470,6 +1488,20 @@ impl GlobalWatcher {
         };
         self.submit(command);
         Some(registration)
+    }
+
+    /// Whether the native backend can be used. A backend that failed to start is
+    /// created again here, so a temporary shortage (inotify instances, file
+    /// descriptors) does not disable native watching for the life of the process.
+    fn native_available(&self) -> Result<(), String> {
+        let backends = &self.applier.backends;
+        let mut native = backends.native.lock();
+        if native.is_err()
+            && let Some(make_native) = backends.make_native
+        {
+            *native = make_native().map_err(|error| error.to_string());
+        }
+        native.as_ref().map(|_| ()).map_err(Clone::clone)
     }
 
     /// For registration `id`: `None` when it no longer exists (removed, or its
@@ -2554,7 +2586,7 @@ mod tests {
 
 pub fn global<T>(f: impl FnOnce(&GlobalWatcher) -> T) -> anyhow::Result<T> {
     let global_watcher = global_watcher();
-    if let Err(error) = &global_watcher.native_available {
+    if let Err(error) = global_watcher.native_available() {
         anyhow::bail!("native file watcher unavailable: {error}");
     }
     Ok(f(global_watcher))

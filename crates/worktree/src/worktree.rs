@@ -5174,8 +5174,13 @@ impl BackgroundScanner {
                     // An external directory is outside the watched root, so its
                     // watch is new; wait for it before its entries are trusted.
                     let canonical: Arc<Path> = canonical.into();
-                    self.watcher.add_and_wait(&canonical).await.log_err();
-                    Some(canonical)
+                    // Recorded as watched only once it is: a failed watch has
+                    // been rolled back and must not be reported as active.
+                    self.watcher
+                        .add_and_wait(&canonical)
+                        .await
+                        .log_err()
+                        .map(|()| canonical)
                 }
                 Err(_) => None,
             }

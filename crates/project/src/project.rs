@@ -4548,6 +4548,9 @@ impl Project {
         new_name: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<ProjectTransaction>> {
+        if !self.capability().editable() {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         let push_to_history = true;
         let position = position.to_point_utf16(buffer.read(cx));
         self.request_lsp(
