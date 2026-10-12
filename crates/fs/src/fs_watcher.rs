@@ -198,6 +198,15 @@ impl Watcher for FsWatcher {
                     .await;
                 applied = self.add_path(path);
             }
+            if applied.is_none()
+                && self.pending_registrations.lock().contains_key(path)
+                && fs::symlink_metadata(path).is_ok()
+            {
+                // Still unclaimed after the deadline: its watch is not in place.
+                return Err(anyhow::anyhow!(
+                    "the watch for {path:?} was not installed in time"
+                ));
+            }
             let Some(mut applied) = applied else {
                 return Ok(());
             };
@@ -898,6 +907,9 @@ impl WatchPaths {
         if mode != WatcherMode::Poll && !cfg!(any(target_os = "windows", target_os = "macos")) {
             return None;
         }
+        // The nearest ancestor with an OS watch of its own is what covers this
+        // path: it is waited on if still queued, and nothing is waited on if it
+        // is applied (a farther, unrelated ancestor must not decide the outcome).
         let key = path.as_path().ancestors().skip(1).find_map(|ancestor| {
             let ancestor = SanitizedPath::unchecked_new(ancestor);
             [WatchKey::exact(ancestor), WatchKey::folded(ancestor)]
@@ -905,10 +917,12 @@ impl WatchPaths {
                 .find(|key| {
                     self.0
                         .get(key)
-                        .is_some_and(|state| !state.waiters.is_empty())
+                        .is_some_and(|state| state.os_watch.is_some())
                 })
         })?;
-        self.0.get_mut(&key)
+        self.0
+            .get_mut(&key)
+            .filter(|state| !state.waiters.is_empty())
     }
 
     /// Collects the watcher ids of every registration whose directory is an
