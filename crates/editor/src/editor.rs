@@ -5738,11 +5738,17 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A project an embedder made read-only cannot be unlocked per file.
+        let project_read_only = self
+            .project
+            .as_ref()
+            .is_some_and(|project| project.read(cx).is_read_only(cx));
         if let Some(buffer) = self.buffer.read(cx).as_singleton() {
             buffer.update(cx, |buffer, cx| {
                 buffer.set_capability(
                     match buffer.capability() {
                         Capability::ReadWrite => Capability::Read,
+                        Capability::Read if project_read_only => Capability::Read,
                         Capability::Read => Capability::ReadWrite,
                         Capability::ReadOnly => Capability::ReadOnly,
                     },

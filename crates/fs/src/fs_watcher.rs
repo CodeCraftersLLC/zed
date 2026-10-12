@@ -801,6 +801,20 @@ impl WatchPaths {
         })
     }
 
+    /// Whether a strict ancestor of `path` has an OS watch of its own.
+    fn has_own_watch_ancestor(&self, path: &SanitizedPath) -> bool {
+        path.as_path().ancestors().skip(1).any(|ancestor| {
+            let ancestor = SanitizedPath::unchecked_new(ancestor);
+            [WatchKey::exact(ancestor), WatchKey::folded(ancestor)]
+                .iter()
+                .any(|key| {
+                    self.0
+                        .get(key)
+                        .is_some_and(|state| state.os_watch.is_some())
+                })
+        })
+    }
+
     /// The state of the nearest recursive ancestor registration of `path` whose
     /// OS watch is still queued, so a covered path can wait for that watch.
     fn pending_covering_state_mut(
@@ -919,27 +933,34 @@ impl WatcherState {
             for id in path_state.watcher_ids {
                 self.watchers.remove(&id);
             }
-            // Paths this watch covered have no OS watch of their own. Drop them
-            // too, so their owners see them unregistered and retry, which now
+            // Paths this watch covered have no OS watch of their own, unless
+            // another watch still covers them. Drop the rest, every registration
+            // of each, so their owners see them unregistered and retry, which
             // installs a watch for each.
-            let covered: Vec<_> = self
-                .watchers
-                .iter()
-                .filter(|(_, watcher)| {
-                    watcher.mode == command.mode
-                        && watcher.path.as_path() != command.path.as_path()
-                        && watcher.path.as_path().starts_with(command.path.as_path())
-                })
-                .map(|(id, watcher)| (*id, watcher.key.clone()))
-                .collect();
-            for (id, key) in covered {
+            let mut affected: Vec<(WatchKey, Arc<SanitizedPath>)> = Vec::new();
+            for watcher in self.watchers.values() {
+                let under_failed_path = watcher.mode == command.mode
+                    && watcher.path.as_path().ancestors().skip(1).any(|ancestor| {
+                        let ancestor = SanitizedPath::unchecked_new(ancestor);
+                        WatchKey::exact(ancestor) == command.key
+                            || WatchKey::folded(ancestor) == command.key
+                    });
+                if under_failed_path && !affected.iter().any(|(key, _)| *key == watcher.key) {
+                    affected.push((watcher.key.clone(), watcher.path.clone()));
+                }
+            }
+            for (key, path) in affected {
                 let paths = self.path_registrations(command.mode);
-                if paths
+                let covered_only = paths
                     .get_mut(&key)
-                    .is_some_and(|state| state.os_watch.is_none())
+                    .is_some_and(|state| state.os_watch.is_none());
+                if covered_only
+                    && !paths.has_own_watch_ancestor(&path)
+                    && let Some(state) = paths.remove(&key)
                 {
-                    paths.remove(&key);
-                    self.watchers.remove(&id);
+                    for id in state.watcher_ids {
+                        self.watchers.remove(&id);
+                    }
                 }
             }
         }
@@ -1357,19 +1378,28 @@ impl GlobalWatcher {
     /// applied one and register again.
     fn applied_waiter(&self, id: WatcherRegistrationId) -> Option<Option<WatchApplied>> {
         let mut state = self.state.lock();
-        let (key, mode) = state
+        let (key, mode, path) = state
             .watchers
             .get(&id)
-            .map(|watcher| (watcher.key.clone(), watcher.mode))?;
-        let applied = state
-            .path_registrations(mode)
+            .map(|watcher| (watcher.key.clone(), watcher.mode, watcher.path.clone()))?;
+        let paths = state.path_registrations(mode);
+        // A covered path has no OS watch of its own: its readiness is that of
+        // the ancestor watch covering it.
+        let covered = paths
             .get_mut(&key)
-            .filter(|path_state| !path_state.waiters.is_empty())
-            .map(|path_state| {
-                let (waiter, applied) = oneshot::channel();
-                path_state.waiters.push(waiter);
-                applied
-            });
+            .is_some_and(|path_state| path_state.os_watch.is_none());
+        let pending = if covered {
+            paths.pending_covering_state_mut(&path, mode)
+        } else {
+            paths
+                .get_mut(&key)
+                .filter(|path_state| !path_state.waiters.is_empty())
+        };
+        let applied = pending.map(|path_state| {
+            let (waiter, applied) = oneshot::channel();
+            path_state.waiters.push(waiter);
+            applied
+        });
         Some(applied)
     }
 
