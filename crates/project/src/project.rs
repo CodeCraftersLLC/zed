@@ -4502,6 +4502,10 @@ impl Project {
         push_to_history: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<ProjectTransaction>> {
+        // A code action edits buffers and files.
+        if !self.capability().editable() {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.apply_code_action(buffer_handle, action, push_to_history, cx)
         })
@@ -4514,6 +4518,9 @@ impl Project {
         push_to_history: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<ProjectTransaction>> {
+        if !self.capability().editable() {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.apply_code_action_kind(buffers, kind, push_to_history, cx)
         })

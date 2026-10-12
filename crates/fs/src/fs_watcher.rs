@@ -894,9 +894,9 @@ impl WatcherState {
     }
 
     /// Drops a registration. When it was the last one on a path that owns an OS
-    /// watch, returns the unwatch command that releases it, followed by a watch
-    /// command for each path that watch was covering and that nothing else
-    /// covers: those registrations stay, so they need a watch of their own.
+    /// watch, returns a watch command for each path that watch was covering and
+    /// that nothing else covers (those registrations stay, so they need a watch
+    /// of their own), followed by the unwatch command that releases the watch.
     fn remove_registration(&mut self, id: WatcherRegistrationId) -> Vec<WatchCommand> {
         let Some(registration_state) = self.watchers.remove(&id) else {
             return Vec::new();
@@ -916,14 +916,16 @@ impl WatcherState {
         let Some(epoch) = path_state.os_watch else {
             return Vec::new();
         };
-        let mut commands = vec![WatchCommand {
+        // The covered paths get their own watch first and the ancestor's watch is
+        // released last, so there is no moment when they are watched by neither.
+        let mut commands = self.promote_covered(&registration_state.key, mode);
+        commands.push(WatchCommand {
             op: WatchOp::Unwatch,
             mode,
             path: registration_state.path.clone(),
             key: registration_state.key.clone(),
             epoch,
-        }];
-        commands.extend(self.promote_covered(&registration_state.key, mode));
+        });
         commands
     }
 
@@ -954,6 +956,10 @@ impl WatcherState {
                 && !paths.has_own_watch_ancestor(&path);
             if needs_watch && let Some(state) = paths.get_mut(&key) {
                 state.os_watch = Some(epoch);
+                // Pending until the backend acknowledges the watch: a later
+                // `applied_waiter` must wait for it. Nobody holds the receiver.
+                let (waiter, _) = oneshot::channel();
+                state.waiters.push(waiter);
                 commands.push(WatchCommand {
                     op: WatchOp::Watch,
                     mode,
