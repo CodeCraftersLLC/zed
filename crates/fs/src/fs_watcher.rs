@@ -1290,7 +1290,7 @@ impl WatchApplier {
                     );
                     break;
                 };
-                let failed_index = pending.len() - remaining.len() - 1;
+                let failed_index = pending.len().saturating_sub(remaining.len() + 1);
                 let unapplied = pending.split_off(failed_index + 1);
                 let failed = pending.pop().expect("the failed op is in the batch");
                 finished.extend(pending.drain(..).map(|command| (command, Ok(()))));
