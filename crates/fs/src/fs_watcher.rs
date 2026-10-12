@@ -195,6 +195,9 @@ fn recursive_registration_covering(
                         registration.mode == WatcherMode::Poll
                             || cfg!(any(target_os = "windows", target_os = "macos"))
                     })
+                    // A watch that failed is gone from the global watcher; the
+                    // local record of it must not keep covering its descendants.
+                    .filter(|registration| global_watcher().is_registered(registration.id))
                     .copied()
             })
     })
@@ -790,6 +793,29 @@ impl WatchPaths {
         })
     }
 
+    /// The state of the nearest recursive ancestor registration of `path` whose
+    /// OS watch is still queued, so a covered path can wait for that watch.
+    fn pending_covering_state_mut(
+        &mut self,
+        path: &SanitizedPath,
+        mode: WatcherMode,
+    ) -> Option<&mut PathRegistrationState> {
+        if mode != WatcherMode::Poll && !cfg!(any(target_os = "windows", target_os = "macos")) {
+            return None;
+        }
+        let key = path.as_path().ancestors().skip(1).find_map(|ancestor| {
+            let ancestor = SanitizedPath::unchecked_new(ancestor);
+            [WatchKey::exact(ancestor), WatchKey::folded(ancestor)]
+                .into_iter()
+                .find(|key| {
+                    self.0
+                        .get(key)
+                        .is_some_and(|state| !state.waiters.is_empty())
+                })
+        })?;
+        self.0.get_mut(&key)
+    }
+
     /// Collects the watcher ids of every registration whose directory is an
     /// ancestor of (or equal to) `path`. Both exact and folded keys are probed,
     /// so a real-cased event path matches a folded registration and vice versa.
@@ -1246,7 +1272,18 @@ impl GlobalWatcher {
                     },
                 });
             let Some(epoch) = os_watch else {
-                return Some(Registration { id, applied: None });
+                // A recursive ancestor's watch covers this path. If that watch is
+                // still queued, wait for it too: until it is in place nothing is
+                // watching the path, whichever `FsWatcher` asked for the ancestor.
+                let (ancestor_waiter, ancestor_applied) = oneshot::channel();
+                let applied = state
+                    .path_registrations(mode)
+                    .pending_covering_state_mut(&path, mode)
+                    .map(|ancestor| {
+                        ancestor.waiters.push(ancestor_waiter);
+                        ancestor_applied
+                    });
+                return Some(Registration { id, applied });
             };
             let command = WatchCommand {
                 op: WatchOp::Watch,
@@ -1883,6 +1920,34 @@ mod tests {
                 .watched_paths
                 .contains(&PathBuf::from("/repo/root")),
             "the second waiter resolved before the backend watched the path"
+        );
+    }
+
+    #[test]
+    fn a_path_covered_by_a_queued_ancestor_waits_for_the_ancestors_watch() {
+        let backend = slow_backend(Duration::from_millis(200));
+        let watcher = test_watcher(backend.clone());
+
+        let _ancestor = watcher
+            .add(poll_path("/repo"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        // Another `FsWatcher` asks for a child while the ancestor's watch is
+        // still queued: there is no OS watch of its own, but it must not report
+        // ready before the ancestor's is in place.
+        let child = watcher
+            .add(poll_path("/repo/sub"), WatcherMode::Poll, false, |_| {})
+            .expect("registered");
+        let applied = child.applied.expect("waits for the covering watch");
+
+        smol::block_on(applied)
+            .expect("not cancelled")
+            .expect("watch applied");
+        assert!(
+            backend
+                .lock()
+                .watched_paths
+                .contains(&PathBuf::from("/repo")),
+            "the child resolved before the ancestor was watched"
         );
     }
 

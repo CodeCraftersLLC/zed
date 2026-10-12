@@ -932,6 +932,9 @@ impl BufferStore {
         buffer: Entity<Buffer>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.force_read_only {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         match &mut self.state {
             BufferStoreState::Local(this) => this.save_buffer(buffer, cx),
             BufferStoreState::Remote(this) => this.save_remote_buffer(buffer, None, cx),
@@ -944,6 +947,9 @@ impl BufferStore {
         path: ProjectPath,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.force_read_only {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         let old_file = buffer.read(cx).file().cloned();
         let task = match &self.state {
             BufferStoreState::Local(this) => this.save_buffer_as(buffer.clone(), path, cx),
