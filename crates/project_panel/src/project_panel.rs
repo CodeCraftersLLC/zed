@@ -4596,6 +4596,10 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Dropping files in copies them into the project's tree.
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         let mut paths: Vec<Arc<Path>> = paths.iter().map(|path| Arc::from(path.clone())).collect();
 
         let open_file_after_drop = paths.len() == 1 && paths[0].is_file();

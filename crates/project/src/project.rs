@@ -2989,8 +2989,16 @@ impl Project {
     }
 
     /// Make this local project read-only: its buffers cannot be edited and
-    /// creating, renaming, copying or deleting entries is refused. For
-    /// embedders that show a snapshot or a tree they cannot write back to.
+    /// creating, renaming, copying, deleting or restoring entries, saving, and
+    /// dropping files in are refused. For embedders that show a snapshot or a
+    /// tree they cannot write back to.
+    ///
+    /// This is a policy for the UI, not a security boundary: it is meant for a
+    /// project whose filesystem is itself read-only (a virtual one), which
+    /// rejects whatever a language server, a task or another embedder-owned
+    /// path writes. A workspace restoring unsaved editor contents from a
+    /// database is not supported on a read-only project (read-only buffers
+    /// report themselves clean).
     pub fn set_local_read_only(&mut self, cx: &mut Context<Self>) {
         self.local_read_only = true;
         self.buffer_store

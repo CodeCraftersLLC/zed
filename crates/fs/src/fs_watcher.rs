@@ -527,7 +527,12 @@ async fn poll_path_until_created(
         let case_insensitive = case_insensitive_path(path.as_ref());
         let key = WatchKey::for_registration(SanitizedPath::new(&path), case_insensitive);
 
-        if registrations.lock().contains_key(&key) {
+        // A record whose watch has since failed does not count: register again.
+        if registrations
+            .lock()
+            .get(&key)
+            .is_some_and(|existing| global_watcher().is_registered(existing.id))
+        {
             pending_registrations.lock().remove(path.as_ref());
             return;
         }
@@ -911,6 +916,29 @@ impl WatcherState {
             for id in path_state.watcher_ids {
                 self.watchers.remove(&id);
             }
+            // Paths this watch covered have no OS watch of their own. Drop them
+            // too, so their owners see them unregistered and retry, which now
+            // installs a watch for each.
+            let covered: Vec<_> = self
+                .watchers
+                .iter()
+                .filter(|(_, watcher)| {
+                    watcher.mode == command.mode
+                        && watcher.path.as_path() != command.path.as_path()
+                        && watcher.path.as_path().starts_with(command.path.as_path())
+                })
+                .map(|(id, watcher)| (*id, watcher.key.clone()))
+                .collect();
+            for (id, key) in covered {
+                let paths = self.path_registrations(command.mode);
+                if paths
+                    .get_mut(&key)
+                    .is_some_and(|state| state.os_watch.is_none())
+                {
+                    paths.remove(&key);
+                    self.watchers.remove(&id);
+                }
+            }
         }
         for waiter in waiters {
             let outcome = match result {
@@ -1250,11 +1278,26 @@ impl GlobalWatcher {
                     .get_mut(&key)
                     .expect("registered path has state");
                 path_state.watcher_ids.push(id);
+                // A covered path has no OS watch of its own: its readiness is its
+                // ancestor's.
+                let covered_by_ancestor = path_state.os_watch.is_none();
                 // The path's OS watch is still queued: wait for the same one.
                 let applied = (!path_state.waiters.is_empty()).then(|| {
                     path_state.waiters.push(waiter);
                     applied
                 });
+                let applied = if applied.is_none() && covered_by_ancestor {
+                    let (ancestor_waiter, ancestor_applied) = oneshot::channel();
+                    state
+                        .path_registrations(mode)
+                        .pending_covering_state_mut(&path, mode)
+                        .map(|ancestor| {
+                            ancestor.waiters.push(ancestor_waiter);
+                            ancestor_applied
+                        })
+                } else {
+                    applied
+                };
                 return Some(Registration { id, applied });
             }
 
