@@ -1107,6 +1107,10 @@ enum WorkerMessage {
 /// a poll change.
 struct WatchBackends {
     native: Mutex<Result<Box<dyn WatchBackend>, String>>,
+    /// Creates the native backend again after a failed attempt, so a temporary
+    /// shortage (inotify instances, file descriptors) does not disable native
+    /// watching for the life of the process. `None` keeps the result as given.
+    make_native: Option<fn() -> notify::Result<Box<dyn WatchBackend>>>,
     poll: Mutex<Option<Box<dyn WatchBackend>>>,
     make_poll: fn() -> notify::Result<Box<dyn WatchBackend>>,
 }
@@ -1162,6 +1166,11 @@ impl WatchApplier {
             let backend: &mut Box<dyn WatchBackend> = match mode {
                 WatcherMode::Native => {
                     native = self.backends.native.lock();
+                    if native.is_err()
+                        && let Some(make_native) = self.backends.make_native
+                    {
+                        *native = make_native().map_err(|error| error.to_string());
+                    }
                     match native.as_mut() {
                         Ok(backend) => backend,
                         Err(error) => {
@@ -1303,6 +1312,7 @@ impl GlobalWatcher {
     fn new(
         event_tx: async_channel::Sender<DispatchEvent>,
         native: Result<Box<dyn WatchBackend>, String>,
+        make_native: Option<fn() -> notify::Result<Box<dyn WatchBackend>>>,
         poll: Option<Box<dyn WatchBackend>>,
         make_poll: fn() -> notify::Result<Box<dyn WatchBackend>>,
         queued: fn(WatcherMode) -> bool,
@@ -1313,6 +1323,7 @@ impl GlobalWatcher {
             state: state.clone(),
             backends: WatchBackends {
                 native: Mutex::new(native),
+                make_native,
                 poll: Mutex::new(poll),
                 make_poll,
             },
@@ -1634,6 +1645,7 @@ fn global_watcher() -> &'static GlobalWatcher {
         GlobalWatcher::new(
             event_tx,
             new_native_backend().map_err(|error| error.to_string()),
+            Some(new_native_backend),
             None,
             new_poll_backend,
             queued_in_production,
@@ -1779,6 +1791,7 @@ mod tests {
             native_watcher
                 .map(|watcher| Box::new(SharedFakeWatchBackend(watcher)) as Box<dyn WatchBackend>)
                 .ok_or_else(|| "no native backend in this test".to_owned()),
+            None,
             poll_watcher
                 .map(|watcher| Box::new(SharedFakeWatchBackend(watcher)) as Box<dyn WatchBackend>),
             no_poll_backend,
