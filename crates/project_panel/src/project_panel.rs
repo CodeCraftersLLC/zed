@@ -185,6 +185,10 @@ impl Default for ProjectPanelContextMenuPolicy {
     }
 }
 
+/// Host-supplied check of a name typed into the panel's rename / new-entry
+/// editor: `Some(message)` refuses it, shown inline, and keeps the editor open.
+pub type NameValidator = std::sync::Arc<dyn Fn(&str) -> Option<String>>;
+
 pub struct ProjectPanel {
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
@@ -216,6 +220,7 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     context_menu_policy: ProjectPanelContextMenuPolicy,
+    name_validator: Option<NameValidator>,
     state: State,
 }
 
@@ -942,6 +947,7 @@ impl ProjectPanel {
                 update_visible_entries_task: Default::default(),
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
                 context_menu_policy: ProjectPanelContextMenuPolicy::default(),
+                name_validator: None,
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -1792,6 +1798,7 @@ impl ProjectPanel {
     }
 
     fn populate_validation_error(&mut self, cx: &mut Context<Self>) {
+        let path_style = self.project.read(cx).path_style(cx);
         let edit_state = match self.state.edit_state.as_mut() {
             Some(state) => state,
             None => return,
@@ -1822,6 +1829,16 @@ impl ProjectPanel {
                 cx.notify();
                 return;
             };
+
+            // The same name and path style Enter validates with, so the inline
+            // error and the confirmation never disagree.
+            if let Some(message) =
+                Self::name_rejection(self.name_validator.as_ref(), trimmed_filename, path_style)
+            {
+                edit_state.validation_state = ValidationState::Error(message);
+                cx.notify();
+                return;
+            }
 
             if let Some(worktree) = self
                 .project
@@ -1872,6 +1889,10 @@ impl ProjectPanel {
         let is_new_entry = edit_state.is_new_entry();
         let mut filename = self.filename_editor.read(cx).text(cx);
         let path_style = self.project.read(cx).path_style(cx);
+        // The host judges what was typed, before trailing dots and spaces are
+        // quietly dropped below.
+        let host_rejection =
+            Self::name_rejection(self.name_validator.as_ref(), &filename, path_style);
         if path_style.is_windows() {
             // on windows, trailing dots are ignored in paths
             // this can cause project panel to create a new entry with a trailing dot
@@ -1881,6 +1902,11 @@ impl ProjectPanel {
             }
         }
         if filename.trim().is_empty() {
+            return None;
+        }
+        if let Some(message) = host_rejection {
+            edit_state.validation_state = ValidationState::Error(message);
+            cx.notify();
             return None;
         }
 
@@ -2126,6 +2152,9 @@ impl ProjectPanel {
     }
 
     fn add_entry(&mut self, is_dir: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         let Some((worktree_id, entry_id)) = self
             .selection
             .map(|entry| (entry.worktree_id, entry.entry_id))
@@ -2219,11 +2248,17 @@ impl ProjectPanel {
         }
     }
 
-    pub fn undo(&mut self, _: &Undo, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         self.undo_manager.undo().log_err();
     }
 
-    pub fn redo(&mut self, _: &Redo, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         self.undo_manager.redo().log_err();
     }
 
@@ -2233,6 +2268,9 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         if let Some(SelectedEntry {
             worktree_id,
             entry_id,
@@ -2310,6 +2348,10 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Discarding changes checks files out into the working tree.
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         maybe!({
             let selection = self.selection?;
             let project = self.project.read(cx);
@@ -2502,6 +2544,9 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<ProjectPanel>,
     ) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         maybe!({
             let items_to_delete = self.disjoint_effective_entries(cx);
             if items_to_delete.is_empty() {
@@ -3175,6 +3220,9 @@ impl ProjectPanel {
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         let entries = self.disjoint_effective_entries(cx);
         if !entries.is_empty() {
             self.write_entries_to_system_clipboard(&entries, cx);
@@ -3257,6 +3305,9 @@ impl ProjectPanel {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         if let Some(external_paths) = self.external_paths_from_system_clipboard(cx) {
             let target_entry_id = self
                 .selection
@@ -4010,6 +4061,29 @@ impl ProjectPanel {
         })
     }
 
+    /// The host validator's verdict on a typed name. Windows separators are
+    /// normalised first, so `src\\new.rs` is the nested path it means.
+    fn name_rejection(
+        validator: Option<&NameValidator>,
+        typed: &str,
+        path_style: PathStyle,
+    ) -> Option<String> {
+        let validate = validator?;
+        if path_style.is_windows() {
+            validate(typed.replace('\\', "/").trim_start_matches('/'))
+        } else {
+            validate(typed.trim_start_matches('/'))
+        }
+    }
+
+    /// Installs a check run on every name typed into the rename and new-entry
+    /// editor, so a name the host cannot accept is refused inline instead of
+    /// failing after the editor closed.
+    pub fn set_name_validator(&mut self, validator: Option<NameValidator>, cx: &mut Context<Self>) {
+        self.name_validator = validator;
+        cx.notify();
+    }
+
     /// Updates context-menu action visibility for this project-panel surface.
     ///
     /// Standalone Zed leaves the default policy in place; embedded hosts call
@@ -4522,6 +4596,10 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Dropping files in copies them into the project's tree.
+        if self.project.read(cx).is_read_only(cx) {
+            return;
+        }
         let mut paths: Vec<Arc<Path>> = paths.iter().map(|path| Arc::from(path.clone())).collect();
 
         let open_file_after_drop = paths.len() == 1 && paths[0].is_file();

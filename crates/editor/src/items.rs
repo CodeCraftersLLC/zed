@@ -888,11 +888,17 @@ impl Item for Editor {
     // Note: this mirrors the logic in `Editor::toggle_read_only`, but is reachable
     // without relying on focus-based action dispatch.
     fn toggle_read_only(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A project an embedder made read-only cannot be unlocked per file.
+        let project_read_only = self
+            .project
+            .as_ref()
+            .is_some_and(|project| project.read(cx).is_read_only(cx));
         if let Some(buffer) = self.buffer.read(cx).as_singleton() {
             buffer.update(cx, |buffer, cx| {
                 buffer.set_capability(
                     match buffer.capability() {
                         Capability::ReadWrite => Capability::Read,
+                        Capability::Read if project_read_only => Capability::Read,
                         Capability::Read => Capability::ReadWrite,
                         Capability::ReadOnly => Capability::ReadOnly,
                     },
@@ -928,6 +934,27 @@ impl Item for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        // A read-only project (a snapshot, a remote tree) has nothing to write:
+        // skip formatting and the save prompt entirely. Edits made before the
+        // project became read-only cannot be written either, and saying so keeps
+        // the item from closing as if they had been saved.
+        if project.read(cx).is_read_only(cx) {
+            let has_unsaved_edits = self
+                .buffer()
+                .read(cx)
+                .all_buffers()
+                .iter()
+                .any(|buffer| buffer.read(cx).is_dirty());
+            // An autosave tick cannot do anything about it and must not fail
+            // on every tick; an explicit save says so.
+            return Task::ready(if has_unsaved_edits && !options.autosave {
+                Err(anyhow!(
+                    "This project is read-only, so these edits cannot be saved"
+                ))
+            } else {
+                Ok(())
+            });
+        }
         // Add meta data tracking # of auto saves
         if options.autosave {
             self.report_editor_event(ReportEditorEvent::Saved { auto_saved: true }, None, cx);

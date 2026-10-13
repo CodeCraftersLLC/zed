@@ -3347,12 +3347,16 @@ impl BackgroundScannerState {
 
         let (repository_dir_abs_path, common_dir_abs_path) =
             discover_git_paths(&dot_git_abs_path, fs).await;
+        // Awaited: the common and repository directories of a linked worktree
+        // usually sit outside the watched root, so their watches are new.
         watcher
-            .add(&common_dir_abs_path)
+            .add_and_wait(&common_dir_abs_path)
+            .await
             .context("failed to add common directory to watcher")
             .log_err();
         watcher
-            .add(&repository_dir_abs_path)
+            .add_and_wait(&repository_dir_abs_path)
+            .await
             .context("failed to add repository directory to watcher")
             .log_err();
 
@@ -3361,7 +3365,8 @@ impl BackgroundScannerState {
         let reftable_path = common_dir_abs_path.join("reftable");
         if fs.is_dir(&reftable_path).await {
             watcher
-                .add(&reftable_path)
+                .add_and_wait(&reftable_path)
+                .await
                 .context("failed to add reftable directory to watcher")
                 .log_err();
         }
@@ -4179,9 +4184,12 @@ impl BackgroundScanner {
             fs_events_rx = Box::pin(events.map(|events| events.into_iter().collect()));
 
             let state = self.state.lock().await;
+            // Queue every watch before waiting on any: each submission restarts
+            // the FSEvents stream, and the watcher batches what is already queued.
+            let mut watches = Vec::new();
             for target in state.symlink_paths_by_target.keys() {
                 if !target.starts_with(root_abs_path.as_path()) {
-                    self.watcher.add(target).log_err();
+                    watches.push(self.watcher.add_and_wait(target));
                 }
             }
             for repo in state.snapshot.git_repositories.values() {
@@ -4189,14 +4197,17 @@ impl BackgroundScanner {
                     .common_dir_abs_path
                     .starts_with(root_abs_path.as_path())
                 {
-                    self.watcher.add(&repo.common_dir_abs_path).log_err();
+                    watches.push(self.watcher.add_and_wait(&repo.common_dir_abs_path));
                 }
                 if !repo
                     .repository_dir_abs_path
                     .starts_with(root_abs_path.as_path())
                 {
-                    self.watcher.add(&repo.repository_dir_abs_path).log_err();
+                    watches.push(self.watcher.add_and_wait(&repo.repository_dir_abs_path));
                 }
+            }
+            for result in futures::future::join_all(watches).await {
+                result.log_err();
             }
             drop(state);
         }
@@ -5158,15 +5169,21 @@ impl BackgroundScanner {
         // the lock must not be held across the await point below.
         drop(state);
         let watched_abs_path: Option<Arc<Path>> = if job.is_external {
-            self.fs
-                .canonicalize(job.abs_path.as_ref())
-                .await
-                .ok()
-                .map(|canonical| {
+            match self.fs.canonicalize(job.abs_path.as_ref()).await {
+                Ok(canonical) => {
+                    // An external directory is outside the watched root, so its
+                    // watch is new; wait for it before its entries are trusted.
                     let canonical: Arc<Path> = canonical.into();
-                    self.watcher.add(&canonical).log_err();
-                    canonical
-                })
+                    // Recorded as watched only once it is: a failed watch has
+                    // been rolled back and must not be reported as active.
+                    self.watcher
+                        .add_and_wait(&canonical)
+                        .await
+                        .log_err()
+                        .map(|()| canonical)
+                }
+                Err(_) => None,
+            }
         } else {
             self.watcher.add(job.abs_path.as_ref()).log_err();
             Some(job.abs_path.clone())

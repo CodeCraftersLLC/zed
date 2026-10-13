@@ -71,6 +71,14 @@ use std::ffi::OsStr;
 pub trait Watcher: Send + Sync {
     fn add(&self, path: &Path) -> Result<()>;
     fn remove(&self, path: &Path) -> Result<()>;
+
+    /// Add `path` and resolve once its OS watch is in place, so no change made
+    /// after it resolves can be missed. `add` may return before then (a new
+    /// FSEvents watch is applied on a watcher thread). Waiting never blocks a
+    /// thread.
+    fn add_and_wait<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.add(path) })
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -1075,13 +1083,15 @@ impl Fs for RealFs {
         let (tx, rx) = async_channel::unbounded();
         let pending_paths: Arc<Mutex<Vec<PathEvent>>> = Default::default();
 
-        let watcher: Arc<dyn Watcher> = Arc::new(fs_watcher::FsWatcher::new(
+        let watcher = Arc::new(fs_watcher::FsWatcher::new(
             executor.clone(),
             tx.clone(),
             pending_paths.clone(),
         ));
 
-        if let Err(e) = watcher.add(path) {
+        // Awaited rather than queued, so a change made after `watch` returns is
+        // never missed; the OS work runs on the watcher thread either way.
+        if let Err(e) = watcher.add_and_wait(path).await {
             log::warn!("Failed to watch {}:\n{e}", path.display());
         }
 
@@ -1097,11 +1107,12 @@ impl Fs for RealFs {
                     target = SanitizedPath::new(&canonical).as_path().to_path_buf();
                 }
             }
-            watcher.add(&target).ok();
+            watcher.add_and_wait(&target).await.ok();
             if let Some(parent) = target.parent() {
-                watcher.add(parent).log_err();
+                watcher.add_and_wait(parent).await.log_err();
             }
         }
+        let watcher: Arc<dyn Watcher> = watcher;
 
         (
             Box::pin(rx.filter_map({

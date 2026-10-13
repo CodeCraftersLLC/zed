@@ -42,6 +42,9 @@ pub struct BufferStore {
     shared_buffers: HashMap<proto::PeerId, HashMap<BufferId, SharedBuffer>>,
     non_searchable_buffers: HashSet<BufferId>,
     project_search: RemoteProjectSearchState,
+    /// Every buffer loaded from disk is read-only (an embedder showing a
+    /// snapshot or a remote tree it cannot write back to).
+    force_read_only: bool,
 }
 
 #[derive(Default)]
@@ -684,6 +687,11 @@ impl LocalBufferStore {
             };
             this.update(cx, |this, cx| {
                 this.add_buffer(buffer.clone(), cx)?;
+                if this.force_read_only {
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.set_capability(Capability::ReadOnly, cx)
+                    });
+                }
                 let buffer_id = buffer.read(cx).remote_id();
                 if let Some(file) = File::from_dyn(buffer.read(cx).file()) {
                     let project_path = ProjectPath {
@@ -699,7 +707,7 @@ impl LocalBufferStore {
                     } else {
                         settings.is_path_read_only(&project_path.path)
                     };
-                    if is_read_only {
+                    if is_read_only && !this.force_read_only {
                         buffer.update(cx, |buffer, cx| {
                             buffer.set_capability(Capability::Read, cx);
                         });
@@ -798,6 +806,7 @@ impl BufferStore {
             shared_buffers: Default::default(),
             loading_buffers: Default::default(),
             non_searchable_buffers: Default::default(),
+            force_read_only: false,
             worktree_store,
             project_search: Default::default(),
         }
@@ -824,6 +833,7 @@ impl BufferStore {
             loading_buffers: Default::default(),
             shared_buffers: Default::default(),
             non_searchable_buffers: Default::default(),
+            force_read_only: false,
             worktree_store,
             project_search: Default::default(),
         }
@@ -922,6 +932,9 @@ impl BufferStore {
         buffer: Entity<Buffer>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.force_read_only {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         match &mut self.state {
             BufferStoreState::Local(this) => this.save_buffer(buffer, cx),
             BufferStoreState::Remote(this) => this.save_remote_buffer(buffer, None, cx),
@@ -934,6 +947,9 @@ impl BufferStore {
         path: ProjectPath,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.force_read_only {
+            return Task::ready(Err(anyhow!("This project is read-only")));
+        }
         let old_file = buffer.read(cx).file().cloned();
         let task = match &self.state {
             BufferStoreState::Local(this) => this.save_buffer_as(buffer.clone(), path, cx),
@@ -957,6 +973,11 @@ impl BufferStore {
     }
 
     fn add_buffer(&mut self, buffer_entity: Entity<Buffer>, cx: &mut Context<Self>) -> Result<()> {
+        if self.force_read_only {
+            buffer_entity.update(cx, |buffer, cx| {
+                buffer.set_capability(Capability::ReadOnly, cx)
+            });
+        }
         let buffer = buffer_entity.read(cx);
         let remote_id = buffer.remote_id();
         let path = File::from_dyn(buffer.file()).map(|file| ProjectPath {
@@ -1008,6 +1029,27 @@ impl BufferStore {
         cx.subscribe(&buffer_entity, Self::on_buffer_event).detach();
         cx.emit(BufferStoreEvent::BufferAdded(buffer_entity));
         Ok(())
+    }
+
+    /// Make every buffer, open now or created or loaded later, read-only. A
+    /// buffer that already has unsaved edits becomes `Read` (not editable, but
+    /// still dirty): `ReadOnly` buffers report themselves clean, so flipping it
+    /// would let the editor close without asking and lose the edits. Saving it
+    /// is refused.
+    pub fn set_force_read_only(&mut self, cx: &mut Context<Self>) {
+        self.force_read_only = true;
+        for buffer in self.buffers().collect::<Vec<_>>() {
+            buffer.update(cx, |buffer, cx| {
+                // `Read` stops editing but, unlike `ReadOnly`, keeps reporting
+                // unsaved edits, so closing still asks.
+                let capability = if buffer.is_dirty() {
+                    Capability::Read
+                } else {
+                    Capability::ReadOnly
+                };
+                buffer.set_capability(capability, cx)
+            });
+        }
     }
 
     pub fn buffers(&self) -> impl '_ + Iterator<Item = Entity<Buffer>> {
