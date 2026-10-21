@@ -398,7 +398,7 @@ impl Render for LanguageServerPrompt {
                                         workspace.open_url_or_file(&link, None, window, cx);
                                     });
                                 } else {
-                                    cx.open_url(&link);
+                                    markdown::open_allowlisted_link(&link, cx);
                                 }
                             }),
                     )

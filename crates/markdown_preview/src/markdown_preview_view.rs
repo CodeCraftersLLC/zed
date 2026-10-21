@@ -12,7 +12,7 @@ use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
     InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
-    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point,
+    ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, point,
 };
 use language::LanguageRegistry;
 use markdown::{
@@ -30,7 +30,9 @@ use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, Serializabl
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
-use workspace::{ItemId, Pane, Workspace, WorkspaceId, delete_unloaded_items};
+use workspace::{
+    ItemId, MarkdownImageResolver, Pane, Workspace, WorkspaceId, delete_unloaded_items,
+};
 
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
 use crate::{
@@ -727,9 +729,11 @@ impl MarkdownPreviewView {
             .map(|state| state.editor.clone());
 
         let mut workspace_directory = None;
+        let mut host_image_resolver = None;
         if let Some(workspace_entity) = self.workspace.upgrade() {
-            let project = workspace_entity.read(cx).project();
-            if let Some(tree) = project.read(cx).worktrees(cx).next() {
+            let workspace = workspace_entity.read(cx);
+            host_image_resolver = workspace.markdown_image_resolver();
+            if let Some(tree) = workspace.project().read(cx).worktrees(cx).next() {
                 workspace_directory = Some(tree.read(cx).abs_path().to_path_buf());
             }
         }
@@ -757,7 +761,8 @@ impl MarkdownPreviewView {
             .image_resolver({
                 let base_directory = self.base_directory.clone();
                 move |dest_url| {
-                    resolve_preview_image(
+                    resolve_image_source(
+                        host_image_resolver.as_ref(),
                         dest_url,
                         base_directory.as_deref(),
                         workspace_directory.as_deref(),
@@ -918,7 +923,7 @@ fn open_preview_url(
             workspace.open_url_or_file(&decoded_path, base_directory.as_deref(), window, cx);
         });
     } else {
-        cx.open_url(url.as_ref());
+        markdown::open_allowlisted_link(url.as_ref(), cx);
     }
 }
 
@@ -929,49 +934,49 @@ fn split_preview_url(url: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The host's resolver, when one is installed, decides alone; the built-in resolver is only
+/// the default for an embedder that installed none.
+fn resolve_image_source(
+    host_resolver: Option<&MarkdownImageResolver>,
+    dest_url: &str,
+    base_directory: Option<&Path>,
+    workspace_directory: Option<&Path>,
+) -> Option<ImageSource> {
+    match host_resolver {
+        Some(resolve) => resolve(dest_url, base_directory),
+        None => resolve_preview_image(dest_url, base_directory, workspace_directory),
+    }
+}
+
+/// Resolves a preview image to a file inside the first worktree. Remote URLs, `data:` and
+/// every other scheme are refused, and so is any path that leaves the worktree, whether
+/// through `..`, an absolute path or a symlink. A leading `/` or `\` means the worktree root.
 fn resolve_preview_image(
     dest_url: &str,
     base_directory: Option<&Path>,
     workspace_directory: Option<&Path>,
 ) -> Option<ImageSource> {
-    if dest_url.starts_with("data:") {
-        return None;
-    }
-
-    if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
-        return Some(ImageSource::Resource(Resource::Uri(SharedUri::from(
-            dest_url.to_string(),
-        ))));
-    }
-
     let decoded = urlencoding::decode(dest_url)
         .map(|decoded| decoded.into_owned())
         .unwrap_or_else(|_| dest_url.to_string());
 
-    if let Some(stripped) = ['/', '\\']
-        .iter()
-        .find_map(|prefix| decoded.strip_prefix(*prefix))
+    if util::markdown::has_uri_scheme(&decoded)
+        || decoded.starts_with("//")
+        || decoded.starts_with("\\\\")
     {
-        if let Some(root) = workspace_directory {
-            let absolute_path = root.join(stripped);
-            if absolute_path.exists() {
-                return Some(ImageSource::Resource(Resource::Path(Arc::from(
-                    absolute_path.as_path(),
-                ))));
-            } else {
-                return None;
-            }
-        }
+        return None;
     }
 
-    let path = if Path::new(&decoded).is_absolute() {
-        PathBuf::from(decoded)
-    } else {
-        base_directory?.join(decoded)
+    let workspace_directory = workspace_directory?;
+    let candidate = match decoded.strip_prefix(['/', '\\']) {
+        Some(root_relative) => workspace_directory.join(root_relative),
+        None => base_directory?.join(&decoded),
     };
 
-    path.exists()
-        .then(|| ImageSource::Resource(Resource::Path(Arc::from(path.as_path()))))
+    let resolved = candidate.canonicalize().ok()?;
+    resolved
+        .starts_with(workspace_directory.canonicalize().ok()?)
+        .then(|| ImageSource::Resource(Resource::Path(Arc::from(candidate.as_path()))))
 }
 
 impl Focusable for MarkdownPreviewView {
@@ -1475,12 +1480,13 @@ mod persistence {
 mod tests {
     use crate::markdown_preview_view::ImageSource;
     use crate::markdown_preview_view::Resource;
-    use crate::markdown_preview_view::resolve_preview_image;
+    use crate::markdown_preview_view::{resolve_image_source, resolve_preview_image};
     use buffer_diff::BufferDiff;
     use editor::Editor;
     use gpui::{AppContext as _, Entity, TestAppContext};
     use serde_json::json;
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::time::Duration;
     use util::path;
@@ -1488,7 +1494,8 @@ mod tests {
     use util::test::TempTree;
     use workspace::item::SerializableItem;
     use workspace::{
-        AppState, ItemId, MultiWorkspace, SaveIntent, Workspace, WorkspaceId, open_paths,
+        AppState, ItemId, MarkdownImageResolver, MultiWorkspace, SaveIntent, Workspace,
+        WorkspaceId, open_paths,
     };
 
     use super::MarkdownPreviewView;
@@ -1518,6 +1525,90 @@ mod tests {
             Some(workspace_directory),
         );
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn remote_and_out_of_worktree_images_are_not_resolved() {
+        let tree = TempTree::new(json!({
+            "worktree": {
+                "docs": { "pic.png": "mock data" },
+                "root.png": "mock data",
+            },
+            "outside.png": "mock data",
+        }));
+        let worktree = tree.path().join("worktree");
+        let docs = worktree.join("docs");
+        let outside = tree.path().join("outside.png");
+        let resolve =
+            |dest_url: &str| resolve_preview_image(dest_url, Some(&docs), Some(&worktree));
+
+        for refused in [
+            "https://a/b.png",
+            "HTTP://a/b.png",
+            "%68ttp://a/b.png",
+            "//host/share/x.png",
+            "\\\\host\\share\\x.png",
+            "data:image/png;base64,AAAA",
+            "file:///etc/hosts",
+            "../../outside.png",
+            "..%2F..%2Foutside.png",
+            "/../outside.png",
+            outside.to_str().expect("temp path is utf-8"),
+        ] {
+            assert!(resolve(refused).is_none(), "{refused:?} resolved");
+        }
+
+        assert_resolved_preview_image_path(resolve("pic.png"), &docs.join("pic.png"));
+        assert_resolved_preview_image_path(resolve("/docs/pic.png"), &docs.join("pic.png"));
+        assert_resolved_preview_image_path(resolve("../root.png"), &docs.join("../root.png"));
+    }
+
+    #[test]
+    fn an_installed_image_resolver_replaces_the_built_in_one() {
+        let tree = TempTree::new(json!({ "docs": { "pic.png": "mock data" } }));
+        let docs = tree.path().join("docs");
+        let host_image = PathBuf::from("/host/image.png");
+        let host_resolver: MarkdownImageResolver = Rc::new({
+            let host_image = host_image.clone();
+            move |dest_url, base_directory| {
+                (dest_url != "refused.png" && base_directory.is_some())
+                    .then(|| ImageSource::Resource(Resource::Path(Arc::from(host_image.as_path()))))
+            }
+        });
+        let resolve = |host: Option<&MarkdownImageResolver>, dest_url: &str| {
+            resolve_image_source(host, dest_url, Some(&docs), Some(tree.path()))
+        };
+
+        assert_resolved_preview_image_path(
+            resolve(Some(&host_resolver), "https://a/b.png"),
+            &host_image,
+        );
+        assert!(
+            resolve(Some(&host_resolver), "refused.png").is_none(),
+            "the built-in resolver must not run behind the host's"
+        );
+        assert!(
+            resolve(Some(&host_resolver), "pic.png").is_some(),
+            "the host's answer wins even for a file the built-in resolver would find"
+        );
+        assert_resolved_preview_image_path(resolve(None, "pic.png"), &docs.join("pic.png"));
+        assert!(resolve(None, "https://a/b.png").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_worktree_is_not_resolved() {
+        let tree = TempTree::new(json!({
+            "worktree": { "docs": {} },
+            "outside.png": "mock data",
+        }));
+        let worktree = tree.path().join("worktree");
+        let docs = worktree.join("docs");
+        std::os::unix::fs::symlink(tree.path().join("outside.png"), docs.join("link.png"))
+            .expect("create symlink");
+
+        assert!(resolve_preview_image("link.png", Some(&docs), Some(&worktree)).is_none());
+        assert!(resolve_preview_image("/docs/link.png", Some(&docs), Some(&worktree)).is_none());
     }
 
     #[gpui::test]

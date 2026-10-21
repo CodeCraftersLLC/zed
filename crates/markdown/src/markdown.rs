@@ -1181,6 +1181,17 @@ pub enum AutoscrollBehavior {
     Controlled(ScrollHandle),
 }
 
+/// Hands `url` to the operating system only when its scheme is on the link allowlist
+/// (`http`, `https`, `mailto`). Everything else, including bare names such as `calc.exe`,
+/// is logged and dropped, because the OS opener would otherwise execute or resolve it.
+pub fn open_allowlisted_link(url: &str, cx: &mut App) {
+    if util::markdown::is_os_openable_link(url) {
+        cx.open_url(url);
+    } else {
+        log::warn!("not opening link {url:?}: only http, https and mailto links reach the OS");
+    }
+}
+
 pub struct MarkdownElement {
     markdown: Entity<Markdown>,
     style: MarkdownStyle,
@@ -1875,7 +1886,7 @@ impl MarkdownElement {
                         if let Some(open_url) = on_open_url.as_ref() {
                             open_url(pressed_link.destination_url, window, cx);
                         } else {
-                            cx.open_url(&pressed_link.destination_url);
+                            open_allowlisted_link(&pressed_link.destination_url, cx);
                         }
                     }
                 } else if markdown.selection.pending {
@@ -2773,7 +2784,7 @@ fn image_fallback_element(dest_url: SharedString, alt_text: Option<SharedString>
         .tooltip(Tooltip::text(
             "Image failed to load. Open `zed: log` for more details.",
         ))
-        .on_click(move |_, _, cx| cx.open_url(&dest_url))
+        .on_click(move |_, _, cx| open_allowlisted_link(&dest_url, cx))
         .into_any_element()
 }
 
@@ -4856,6 +4867,26 @@ mod tests {
         cx.update(|_window, cx| {
             assert!(markdown.read(cx).context_menu_link().is_none());
         });
+    }
+
+    #[gpui::test]
+    fn links_without_a_handler_only_reach_the_os_when_allowlisted(cx: &mut TestAppContext) {
+        for refused in [
+            "calc.exe",
+            "ms-msdt:/id x",
+            "search-ms:query=a",
+            "vscode://x",
+            "file:///etc/hosts",
+            "javascript:alert(1)",
+        ] {
+            cx.update(|cx| open_allowlisted_link(refused, cx));
+            assert_eq!(cx.opened_url(), None, "{refused:?} reached the OS opener");
+        }
+
+        for allowed in ["https://example.com", "mailto:user@example.com"] {
+            cx.update(|cx| open_allowlisted_link(allowed, cx));
+            assert_eq!(cx.opened_url().as_deref(), Some(allowed));
+        }
     }
 
     #[track_caller]
