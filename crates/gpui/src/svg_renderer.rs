@@ -77,6 +77,16 @@ fn select_emoji_font(
     None
 }
 
+/// An SVG is untrusted input: it may name `/etc/passwd`, a UNC share, a `file:` or
+/// `http:` URL in an `<image href>`. Only inline `data:` images decode; every other
+/// href resolves to nothing instead of being read from disk or the network.
+fn inline_only_image_href_resolver() -> usvg::ImageHrefResolver<'static> {
+    usvg::ImageHrefResolver {
+        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_string: Box::new(|_, _| None),
+    }
+}
+
 /// When rendering SVGs, we render them at twice the size to get a higher-quality result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
 
@@ -161,6 +171,7 @@ impl SvgRenderer {
                 select_font: font_resolver,
                 select_fallback: fallback_selection,
             },
+            image_href_resolver: inline_only_image_href_resolver(),
             ..Default::default()
         };
         Self {
@@ -305,6 +316,68 @@ mod tests {
     const IBM_PLEX_REGULAR: &[u8] =
         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
     const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+
+    /// Removes the files it created, even when an assertion unwinds.
+    struct TempFiles(Vec<std::path::PathBuf>);
+
+    impl Drop for TempFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                std::fs::remove_file(path).ok();
+            }
+        }
+    }
+
+    fn solid_red_png() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("PNG encodes");
+        bytes.into_inner()
+    }
+
+    fn opaque_pixel_count(href: &str) -> usize {
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><image href="{href}" width="8" height="8"/></svg>"#
+        );
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let pixmap = renderer
+            .render_pixmap(svg.as_bytes(), SvgSize::ScaleFactor(1.))
+            .expect("the SVG itself is valid");
+        pixmap.pixels().iter().filter(|p| p.alpha() > 0).count()
+    }
+
+    #[test]
+    fn svg_image_href_never_reads_the_filesystem() {
+        let unique = format!("{}-{:?}", std::process::id(), std::thread::current().id())
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+        let png = solid_red_png();
+        let absolute = std::env::temp_dir().join(format!("gpui-svg-href-{unique}.png"));
+        let relative = std::path::PathBuf::from(format!("gpui-svg-href-{unique}.png"));
+        std::fs::write(&absolute, &png).expect("write absolute fixture");
+        std::fs::write(&relative, &png).expect("write relative fixture");
+        let _cleanup = TempFiles(vec![absolute.clone(), relative.clone()]);
+
+        for href in [
+            absolute.to_string_lossy().into_owned(),
+            relative.to_string_lossy().into_owned(),
+            format!("file://{}", absolute.to_string_lossy()),
+            format!("http://127.0.0.1/{unique}.png"),
+        ] {
+            assert_eq!(opaque_pixel_count(&href), 0, "{href} must not be loaded");
+        }
+    }
+
+    #[test]
+    fn svg_image_href_still_decodes_inline_data_uris() {
+        let encoded: String = solid_red_png()
+            .iter()
+            .map(|b| format!("%{b:02x}"))
+            .collect();
+        let href = format!("data:image/png,{encoded}");
+        assert_eq!(opaque_pixel_count(&href), 64);
+    }
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();
