@@ -704,6 +704,11 @@ impl Markdown {
         self.pending_parse.is_some()
     }
 
+    /// What to tell the user when a `#slug` link names no heading on the page.
+    pub fn missing_heading_message(slug: &str) -> String {
+        format!("There is no heading “{slug}” on this page")
+    }
+
     pub fn scroll_to_heading(&mut self, slug: &str, cx: &mut Context<Self>) -> Option<usize> {
         if let Some(source_index) = self.parsed_markdown.heading_slugs.get(slug).copied() {
             self.autoscroll_request = Some(source_index);

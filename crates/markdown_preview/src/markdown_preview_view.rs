@@ -27,11 +27,12 @@ use theme_settings::ThemeSettings;
 use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu};
 use util::markdown::split_local_url_fragment;
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem};
+use workspace::notifications::NotificationId;
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
 use workspace::{
-    ItemId, MarkdownImageResolver, Pane, Workspace, WorkspaceId, delete_unloaded_items,
+    ItemId, MarkdownImageResolver, Pane, Toast, Workspace, WorkspaceId, delete_unloaded_items,
 };
 
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
@@ -869,6 +870,7 @@ fn handle_url_click(
     if path_part.is_empty() {
         if let Some(fragment) = fragment {
             let view = view.clone();
+            let workspace = workspace.clone();
             let slug = SharedString::from(fragment.to_string());
             window.defer(cx, move |window, cx| {
                 if let Some(view) = view.upgrade() {
@@ -891,6 +893,21 @@ fn handle_url_click(
                                 cx,
                             );
                         }
+                    } else {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.show_toast(
+                                    Toast::new(
+                                        NotificationId::composite::<MarkdownPreviewView>(
+                                            slug.clone(),
+                                        ),
+                                        Markdown::missing_heading_message(&slug),
+                                    )
+                                    .autohide(),
+                                    cx,
+                                );
+                            })
+                            .ok();
                     }
                 }
             });
@@ -1499,6 +1516,8 @@ mod tests {
     };
 
     use super::MarkdownPreviewView;
+    use markdown::Markdown;
+    use workspace::notifications::NotificationId;
 
     #[test]
     fn resolves_workspace_absolute_preview_image_path_and_rejects_missing() {
@@ -1689,6 +1708,90 @@ mod tests {
                 .await
                 .unwrap(),
             "- [x] Finish work\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_a_missing_heading_link_shows_a_toast(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/dir"),
+                json!({ "doc.md": "# Intro\n\n[there](#intro) [missing](#nope)\n" }),
+            )
+            .await;
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/dir/doc.md"))],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let (workspace, preview) = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let editor: Entity<Editor> = workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<Editor>(cx))
+                    .unwrap();
+                let preview = workspace.update(cx, |workspace, cx| {
+                    let preview = MarkdownPreviewView::create_markdown_view(
+                        workspace,
+                        editor.clone(),
+                        window,
+                        cx,
+                    );
+                    workspace.active_pane().update(cx, |pane, cx| {
+                        pane.add_item(Box::new(preview.clone()), true, true, None, window, cx)
+                    });
+                    preview
+                });
+                (workspace, preview)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let click = |url: &'static str, cx: &mut TestAppContext| {
+            multi_workspace
+                .update(cx, |_, window, cx| {
+                    super::handle_url_click(
+                        url.into(),
+                        &preview.downgrade(),
+                        None,
+                        &workspace.downgrade(),
+                        window,
+                        cx,
+                    );
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let toasts = |cx: &mut TestAppContext| {
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids())
+        };
+
+        click("#intro", cx);
+        assert!(
+            toasts(cx).is_empty(),
+            "a link to a heading that exists says nothing"
+        );
+
+        click("#nope", cx);
+        assert_eq!(
+            toasts(cx),
+            [NotificationId::composite::<MarkdownPreviewView>("nope")]
+        );
+        assert_eq!(
+            Markdown::missing_heading_message("nope"),
+            "There is no heading “nope” on this page"
         );
     }
 
