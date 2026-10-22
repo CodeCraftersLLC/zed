@@ -1644,6 +1644,16 @@ pub trait DetachAndPromptErr<R> {
     );
 }
 
+/// The text of an error prompt: the error, closed with a full stop unless it already ends in
+/// sentence punctuation or a line break.
+pub fn error_prompt_detail(err: &anyhow::Error) -> String {
+    let mut detail = format!("{err:#}");
+    if !detail.ends_with(['.', '!', '?', '\n']) {
+        detail.push('.');
+    }
+    detail
+}
+
 impl<R> DetachAndPromptErr<R> for Task<anyhow::Result<R>>
 where
     R: 'static,
@@ -1661,11 +1671,7 @@ where
             if let Err(err) = result.as_ref() {
                 log::error!("{err:#}");
                 if let Ok(prompt) = cx.update(|window, cx| {
-                    let mut display = format!("{err:#}");
-                    if !display.ends_with('\n') {
-                        display.push('.');
-                    }
-                    let detail = f(err, window, cx).unwrap_or(display);
+                    let detail = f(err, window, cx).unwrap_or_else(|| error_prompt_detail(err));
                     window.prompt(PromptLevel::Critical, &msg, Some(&detail), &["OK"], cx)
                 }) {
                     prompt.await.ok();
@@ -1696,6 +1702,24 @@ mod tests {
     use crate::tests::init_test;
 
     use super::*;
+
+    #[test]
+    fn error_prompt_detail_does_not_double_a_final_full_stop() {
+        let detail = |message: &str| error_prompt_detail(&anyhow::anyhow!("{message}"));
+        assert_eq!(
+            detail("“con” is a reserved name. Choose another name."),
+            "“con” is a reserved name. Choose another name."
+        );
+        assert_eq!(detail("Failed to save"), "Failed to save.");
+        assert_eq!(detail("Is it saved?"), "Is it saved?");
+        assert_eq!(detail("Stop!"), "Stop!");
+        assert_eq!(detail("two lines\n"), "two lines\n");
+        let chained = anyhow::anyhow!("Access is denied.").context("Failed to create file");
+        assert_eq!(
+            error_prompt_detail(&chained),
+            "Failed to create file: Access is denied."
+        );
+    }
 
     #[gpui::test]
     async fn test_notification_auto_dismiss_with_notifications_from_multiple_language_servers(
