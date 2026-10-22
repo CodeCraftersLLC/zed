@@ -326,6 +326,62 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_code_tag_styles_the_text_until_its_closing_tag(cx: &mut TestAppContext) {
+        use crate::MarkdownElementBuilder;
+        use gpui::{FontWeight, TextStyle, TextStyleRefinement, hsla};
+        use std::sync::Arc;
+
+        let (markdown, cx) = markdown_view("x", cx);
+        let code_background = hsla(0.5, 0.5, 0.5, 1.);
+        let element = MarkdownElement::new(
+            markdown,
+            MarkdownStyle {
+                inline_code: TextStyleRefinement {
+                    background_color: Some(code_background),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        cx.update(|_, cx| {
+            for (open, render_inline_html) in [
+                ("<code>", true),
+                ("<code class=\"language-rs\">", true),
+                ("<code>", false),
+            ] {
+                let mut builder = MarkdownElementBuilder::new(
+                    &Default::default(),
+                    TextStyle::default(),
+                    Arc::new(theme::SyntaxTheme::default()),
+                );
+                // Bold text around the tag, as `**a <code>x</code> b**` has.
+                builder.push_text_style(TextStyleRefinement {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                });
+
+                element.push_inline_html(
+                    &mut builder,
+                    open,
+                    &(0..open.len()),
+                    render_inline_html,
+                    cx,
+                );
+                assert_eq!(
+                    builder.text_style().background_color,
+                    Some(code_background),
+                    "{open} opened"
+                );
+
+                element.push_inline_html(&mut builder, "</code>", &(0..7), render_inline_html, cx);
+                let style = builder.text_style();
+                assert_eq!(style.background_color, None, "{open} closed");
+                assert_eq!(style.font_weight, FontWeight::BOLD, "{open} closed");
+            }
+        });
+    }
+
+    #[gpui::test]
     fn an_html_link_is_a_link(cx: &mut TestAppContext) {
         let source = "go <a href=\"https://example.com/x\">here</a> now";
         let (markdown, cx) = markdown_view(source, cx);

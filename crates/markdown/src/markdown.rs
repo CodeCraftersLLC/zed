@@ -1405,6 +1405,31 @@ impl MarkdownElement {
         builder.push_image_child(image_element);
     }
 
+    fn push_inline_html(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        html: &str,
+        range: &Range<usize>,
+        render_inline_html: bool,
+        cx: &mut App,
+    ) {
+        if let Some(code) = html
+            .strip_prefix("<code>")
+            .and_then(|html| html.strip_suffix("</code>"))
+        {
+            let code_start = range.start + "<code>".len();
+            self.push_markdown_code_span(builder, code, code_start..code_start + code.len(), cx);
+        } else if render_inline_html {
+            self.render_inline_html_tag(builder, html, range, cx);
+        } else if html.starts_with("<code>") {
+            builder.push_text_style(self.style.inline_code.clone());
+        } else if html.trim_end().starts_with("</code>") {
+            builder.pop_text_style();
+        } else {
+            builder.push_text(html, range.clone());
+        }
+    }
+
     fn render_inline_html_tag(
         &self,
         builder: &mut MarkdownElementBuilder,
@@ -2776,32 +2801,7 @@ impl Element for MarkdownElement {
                 }
                 MarkdownEvent::InlineHtml => {
                     let html = &parsed_markdown.source[range.clone()];
-                    if let Some(code) = html
-                        .strip_prefix("<code>")
-                        .and_then(|html| html.strip_suffix("</code>"))
-                    {
-                        let code_start = range.start + "<code>".len();
-                        self.push_markdown_code_span(
-                            &mut builder,
-                            code,
-                            code_start..code_start + code.len(),
-                            cx,
-                        );
-                        continue;
-                    }
-                    if html.starts_with("<code>") {
-                        builder.push_text_style(self.style.inline_code.clone());
-                        continue;
-                    }
-                    if html.trim_end().starts_with("</code>") {
-                        builder.pop_text_style();
-                        continue;
-                    }
-                    if render_inline_html {
-                        self.render_inline_html_tag(&mut builder, html, range, cx);
-                    } else {
-                        builder.push_text(html, range.clone());
-                    }
+                    self.push_inline_html(&mut builder, html, range, render_inline_html, cx);
                 }
                 MarkdownEvent::Rule => {
                     builder.push_div(
