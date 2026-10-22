@@ -94,9 +94,9 @@ pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
 /// this, so anything bigger would be painted as nothing.
 pub const MAX_RASTER_SIDE: u32 = 16_384;
 
-/// The most memory an SVG raster may take; an image within `MAX_RASTER_SIDE` on both sides can
-/// still be gigabytes.
-const MAX_RASTER_BYTES: u64 = 256 * 1024 * 1024;
+/// The most memory a raster may take; an image within `MAX_RASTER_SIDE` on both sides can still be
+/// gigabytes.
+pub(crate) const MAX_RASTER_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Why an SVG could not be rasterised.
 #[derive(Debug, thiserror::Error)]

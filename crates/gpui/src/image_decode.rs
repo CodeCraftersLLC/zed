@@ -1,10 +1,15 @@
 //! The one place gpui decodes raster images, so that every caller gets the same bounds, the
 //! same EXIF orientation and the same tolerance for icon files.
 
+use crate::{MAX_RASTER_BYTES, MAX_RASTER_SIDE};
 use image::{
-    DynamicImage, ExtendedColorType, ImageDecoder as _, ImageFormat, ImageReader, ImageResult,
-    Limits, metadata::Orientation,
+    AnimationDecoder as _, ColorType, DynamicImage, ExtendedColorType, Frame, Frames,
+    ImageDecoder as _, ImageError, ImageFormat, ImageReader, ImageResult, Limits, Rgba,
+    codecs::{gif::GifDecoder, webp::WebPDecoder},
+    error::{DecodingError, LimitError, LimitErrorKind},
+    metadata::Orientation,
 };
+use smallvec::SmallVec;
 use std::{borrow::Cow, io::Cursor};
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -18,6 +23,19 @@ pub struct ImageHeader {
     pub height: u32,
     /// The pixel layout the decoder produces.
     pub color_type: ExtendedColorType,
+}
+
+/// The most frames of an animation that are decoded; a longer one is refused.
+pub const MAX_ANIMATION_FRAMES: usize = 1024;
+
+/// The bounds every raster decode keeps to: no side longer than [`MAX_RASTER_SIDE`], which the
+/// GPU atlas could not hold, and no more memory than the SVG rasteriser may take.
+pub fn raster_limits() -> Limits {
+    let mut limits = Limits::no_limits();
+    limits.max_image_width = Some(MAX_RASTER_SIDE);
+    limits.max_image_height = Some(MAX_RASTER_SIDE);
+    limits.max_alloc = Some(MAX_RASTER_BYTES);
+    limits
 }
 
 /// Reads the header of `bytes` as `format`. An unreadable orientation tag is treated as "upright".
@@ -57,6 +75,96 @@ pub fn decode_image(
             _ => Err(error),
         },
         result => result,
+    }
+}
+
+/// Decodes `bytes` as `format` into the BGRA frames the renderer draws: one for a still image, one
+/// per frame for an animated GIF or WebP.
+///
+/// The decode keeps to [`raster_limits`]. An animation is refused, with no frames at all, when its
+/// canvas is too large or when its frames together would take more memory than a still image may,
+/// or when it has more than [`MAX_ANIMATION_FRAMES`] frames.
+pub fn decode_bgra_frames(bytes: &[u8], format: ImageFormat) -> ImageResult<SmallVec<[Frame; 1]>> {
+    let limits = raster_limits();
+    match format {
+        ImageFormat::Gif => {
+            let mut decoder = GifDecoder::new(Cursor::new(bytes))?;
+            // `GifDecoder` starts with no limits at all.
+            decoder.set_limits(limits.clone())?;
+            let canvas = decoder.dimensions();
+            collect_animation(decoder.into_frames(), format, canvas, limits)
+        }
+        ImageFormat::WebP => {
+            let mut decoder = WebPDecoder::new(Cursor::new(bytes))?;
+            // The canvas is checked before a frame is allocated for it: `WebPDecoder` keeps no
+            // limits of its own.
+            decoder.set_limits(limits.clone())?;
+            if decoder.has_animation() {
+                decoder.set_background_color(Rgba([0, 0, 0, 0]))?;
+                let canvas = decoder.dimensions();
+                collect_animation(decoder.into_frames(), format, canvas, limits)
+            } else {
+                decode_still(bytes, format, limits)
+            }
+        }
+        _ => decode_still(bytes, format, limits),
+    }
+}
+
+fn decode_still(
+    bytes: &[u8],
+    format: ImageFormat,
+    limits: Limits,
+) -> ImageResult<SmallVec<[Frame; 1]>> {
+    let mut image = decode_image(bytes, format, limits)?.into_rgba8();
+    swap_red_and_blue(&mut image);
+    Ok(SmallVec::from_elem(Frame::new(image), 1))
+}
+
+/// Every frame the decoder yields is a whole canvas, so the memory they take is known before one is
+/// decoded and no partly decoded animation is ever returned.
+fn collect_animation(
+    frames: Frames<'_>,
+    format: ImageFormat,
+    (canvas_width, canvas_height): (u32, u32),
+    mut budget: Limits,
+) -> ImageResult<SmallVec<[Frame; 1]>> {
+    // The decoder composites onto a canvas of its own.
+    budget.reserve_buffer(canvas_width, canvas_height, ColorType::Rgba8)?;
+
+    let mut decoded = SmallVec::new();
+    for (index, frame) in frames.enumerate() {
+        if index == MAX_ANIMATION_FRAMES {
+            return Err(limit_error(LimitErrorKind::InsufficientMemory));
+        }
+        match frame {
+            Ok(mut frame) => {
+                budget.reserve_usize(frame.buffer().as_raw().len())?;
+                swap_red_and_blue(frame.buffer_mut());
+                decoded.push(frame);
+            }
+            // A frame over the limits means the file is too large, not that the frame is broken.
+            Err(error @ ImageError::Limits(_)) => return Err(error),
+            Err(error) => log::debug!("Skipping {format:?} frame due to decode error: {error}"),
+        }
+    }
+
+    if decoded.is_empty() {
+        return Err(ImageError::Decoding(DecodingError::new(
+            format.into(),
+            "all frames failed to decode",
+        )));
+    }
+    Ok(decoded)
+}
+
+fn limit_error(kind: LimitErrorKind) -> ImageError {
+    ImageError::Limits(LimitError::from_kind(kind))
+}
+
+fn swap_red_and_blue(image: &mut image::RgbaImage) {
+    for pixel in image.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
     }
 }
 
@@ -210,7 +318,7 @@ mod tests {
     use super::*;
     use image::{
         ImageEncoder as _, Rgb, RgbImage,
-        codecs::{jpeg::JpegEncoder, png::PngEncoder},
+        codecs::{jpeg::JpegEncoder, png::PngEncoder, webp::WebPEncoder},
     };
 
     #[test]
@@ -391,6 +499,190 @@ mod tests {
         let header = image_header(&header_only, ImageFormat::Png).unwrap();
         assert_eq!((header.width, header.height), (16000, 16000));
         assert_eq!(header.color_type, ExtendedColorType::L8);
+    }
+
+    /// A GIF whose canvas is `width` x `height` and whose frames are each one red pixel, so that it
+    /// takes few bytes however large a canvas it claims. `frame_sizes` is the size each frame claims.
+    fn gif_with_frame_sizes(width: u16, height: u16, frame_sizes: &[(u16, u16)]) -> Vec<u8> {
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend(width.to_le_bytes());
+        gif.extend(height.to_le_bytes());
+        // A two-colour global palette: red and black.
+        gif.extend([0x80, 0, 0, 0xFF, 0, 0, 0, 0, 0]);
+        for (frame_width, frame_height) in frame_sizes {
+            gif.extend([0x21, 0xF9, 0x04, 0x00, 0x0A, 0x00, 0x00, 0x00]);
+            gif.extend([0x2C, 0, 0, 0, 0]);
+            gif.extend(frame_width.to_le_bytes());
+            gif.extend(frame_height.to_le_bytes());
+            gif.push(0);
+            gif.extend([0x02, 0x02, 0x44, 0x01, 0x00]);
+        }
+        gif.push(0x3B);
+        gif
+    }
+
+    fn gif(width: u16, height: u16, frames: usize) -> Vec<u8> {
+        gif_with_frame_sizes(width, height, &vec![(1, 1); frames])
+    }
+
+    fn riff_chunk(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut chunk = fourcc.to_vec();
+        chunk.extend((payload.len() as u32).to_le_bytes());
+        chunk.extend(payload);
+        if payload.len() % 2 == 1 {
+            chunk.push(0);
+        }
+        chunk
+    }
+
+    /// An animated WebP whose canvas is `width` x `height` and whose `frames` frames are each one
+    /// red pixel.
+    fn animated_webp(width: u32, height: u32, frames: usize) -> Vec<u8> {
+        let mut lossless = Vec::new();
+        WebPEncoder::new_lossless(&mut lossless)
+            .write_image(&[255, 0, 0, 255], 1, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+        // The still image's `VP8L` chunk, after the 12 byte RIFF header.
+        let pixel = &lossless[12..];
+
+        let three_bytes = |value: u32| value.to_le_bytes()[..3].to_vec();
+        let mut extended_header = vec![0x12, 0, 0, 0];
+        extended_header.extend(three_bytes(width - 1));
+        extended_header.extend(three_bytes(height - 1));
+
+        let mut body = b"WEBP".to_vec();
+        body.extend(riff_chunk(b"VP8X", &extended_header));
+        body.extend(riff_chunk(b"ANIM", &[0; 6]));
+        for _ in 0..frames {
+            let mut frame = vec![0; 6];
+            frame.extend(three_bytes(0));
+            frame.extend(three_bytes(0));
+            frame.extend(three_bytes(10));
+            frame.push(0);
+            frame.extend(pixel);
+            body.extend(riff_chunk(b"ANMF", &frame));
+        }
+        let mut webp = b"RIFF".to_vec();
+        webp.extend((body.len() as u32).to_le_bytes());
+        webp.extend(body);
+        webp
+    }
+
+    fn limit_kind(result: ImageResult<SmallVec<[Frame; 1]>>) -> LimitErrorKind {
+        match result {
+            Err(ImageError::Limits(error)) => error.kind(),
+            Err(other) => panic!("expected a limit error, got {other}"),
+            Ok(frames) => panic!("expected a limit error, decoded {} frames", frames.len()),
+        }
+    }
+
+    #[test]
+    fn an_animated_gif_decodes_to_bgra_frames() {
+        let frames = decode_bgra_frames(&gif(2, 2, 3), ImageFormat::Gif).unwrap();
+        assert_eq!(frames.len(), 3);
+        // Red, as blue-green-red-alpha.
+        assert_eq!(frames[0].buffer().get_pixel(0, 0).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn a_gif_wider_than_the_raster_limit_is_refused_before_it_is_decoded() {
+        let wide = gif(MAX_RASTER_SIDE as u16 + 1, 1, 1);
+        assert!(matches!(
+            limit_kind(decode_bgra_frames(&wide, ImageFormat::Gif)),
+            LimitErrorKind::DimensionError
+        ));
+    }
+
+    #[test]
+    fn a_gif_whose_canvas_alone_is_too_large_to_hold_is_refused() {
+        // 16000 x 16000 x 4 bytes is a gigabyte, from a header and one pixel.
+        let bomb = gif(16_000, 16_000, 1);
+        assert!(bomb.len() < 100);
+        assert!(matches!(
+            limit_kind(decode_bgra_frames(&bomb, ImageFormat::Gif)),
+            LimitErrorKind::InsufficientMemory
+        ));
+    }
+
+    #[test]
+    fn a_gif_whose_frames_together_exceed_the_budget_yields_no_frames() {
+        // Each frame is 4 MiB on a 1024 x 1024 canvas; 100 of them are 400 MiB, from 2 KB of file.
+        let many = gif(1024, 1024, 100);
+        assert!(many.len() < 4096);
+        assert!(matches!(
+            limit_kind(decode_bgra_frames(&many, ImageFormat::Gif)),
+            LimitErrorKind::InsufficientMemory
+        ));
+    }
+
+    #[test]
+    fn a_gif_frame_larger_than_the_raster_limit_refuses_the_whole_animation() {
+        // The canvas is one pixel; the second frame claims 20000 x 20000 and is not skipped as if it
+        // were a damaged frame.
+        let bomb = gif_with_frame_sizes(1, 1, &[(1, 1), (20_000, 20_000), (1, 1)]);
+        assert!(matches!(
+            limit_kind(decode_bgra_frames(&bomb, ImageFormat::Gif)),
+            LimitErrorKind::DimensionError
+        ));
+    }
+
+    #[test]
+    fn a_gif_is_refused_past_the_frame_cap_and_decoded_at_it() {
+        let at_the_cap = decode_bgra_frames(&gif(1, 1, MAX_ANIMATION_FRAMES), ImageFormat::Gif);
+        assert_eq!(at_the_cap.unwrap().len(), MAX_ANIMATION_FRAMES);
+
+        let past_the_cap = gif(1, 1, MAX_ANIMATION_FRAMES + 1);
+        assert!(matches!(
+            limit_kind(decode_bgra_frames(&past_the_cap, ImageFormat::Gif)),
+            LimitErrorKind::InsufficientMemory
+        ));
+    }
+
+    #[test]
+    fn an_animated_webp_decodes_to_bgra_frames() {
+        let frames = decode_bgra_frames(&animated_webp(2, 2, 3), ImageFormat::WebP).unwrap();
+        assert_eq!(frames.len(), 3);
+        // Red, as blue-green-red-alpha; compositing may leave the channel a step short of full.
+        let [blue, green, red, alpha] = frames[0].buffer().get_pixel(0, 0).0;
+        assert_eq!((blue, green, alpha), (0, 0, 255));
+        assert!(red >= 254, "red channel was {red}");
+    }
+
+    #[test]
+    fn an_animated_webp_wider_than_the_raster_limit_is_refused() {
+        let wide = animated_webp(MAX_RASTER_SIDE + 1, 1, 1);
+        assert!(matches!(
+            limit_kind(decode_bgra_frames(&wide, ImageFormat::WebP)),
+            LimitErrorKind::DimensionError
+        ));
+    }
+
+    #[test]
+    fn an_animated_webp_canvas_too_large_to_hold_is_refused() {
+        let bomb = animated_webp(16_000, 16_000, 1);
+        assert!(bomb.len() < 200);
+        assert!(matches!(
+            limit_kind(decode_bgra_frames(&bomb, ImageFormat::WebP)),
+            LimitErrorKind::InsufficientMemory
+        ));
+    }
+
+    #[test]
+    fn an_animated_webp_whose_frames_together_exceed_the_budget_yields_no_frames() {
+        let many = animated_webp(1024, 1024, 100);
+        assert!(matches!(
+            limit_kind(decode_bgra_frames(&many, ImageFormat::WebP)),
+            LimitErrorKind::InsufficientMemory
+        ));
+    }
+
+    #[test]
+    fn an_animated_webp_is_refused_past_the_frame_cap() {
+        let past_the_cap = animated_webp(1, 1, MAX_ANIMATION_FRAMES + 1);
+        assert!(matches!(
+            limit_kind(decode_bgra_frames(&past_the_cap, ImageFormat::WebP)),
+            LimitErrorKind::InsufficientMemory
+        ));
     }
 
     /// CRC-32 of a PNG chunk (type and data), for building a header-only fixture.

@@ -37,7 +37,7 @@ use crate::{
     ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
     PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
-    SystemWindowTab, Task, Window, WindowControlArea, decode_image, hash, point, px, size,
+    SystemWindowTab, Task, Window, WindowControlArea, decode_bgra_frames, hash, point, px, size,
 };
 use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -46,8 +46,6 @@ use async_task::Runnable;
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
-use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder as _, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -57,7 +55,6 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
-use std::io::Cursor;
 use std::ops;
 use std::time::Duration;
 use std::{
@@ -2200,58 +2197,20 @@ impl Image {
 
     /// Convert the clipboard image to an `ImageData` object.
     pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
-        fn frames_for_image(
-            bytes: &[u8],
-            format: image::ImageFormat,
-        ) -> Result<SmallVec<[Frame; 1]>> {
-            let mut data = decode_image(bytes, format, image::Limits::default())?.into_rgba8();
-
-            // Convert from RGBA to BGRA.
-            for pixel in data.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-
-            Ok(SmallVec::from_elem(Frame::new(data), 1))
-        }
-
         let frames = match self.format {
-            ImageFormat::Gif => {
-                let decoder = GifDecoder::new(Cursor::new(&self.bytes))?;
-                let mut frames = SmallVec::new();
-
-                for frame in decoder.into_frames() {
-                    match frame {
-                        Ok(mut frame) => {
-                            // Convert from RGBA to BGRA.
-                            for pixel in frame.buffer_mut().chunks_exact_mut(4) {
-                                pixel.swap(0, 2);
-                            }
-                            frames.push(frame);
-                        }
-                        Err(err) => {
-                            log::debug!("Skipping GIF frame due to decode error: {err}");
-                        }
-                    }
-                }
-
-                if frames.is_empty() {
-                    anyhow::bail!("GIF could not be decoded: all frames failed");
-                }
-
-                frames
-            }
-            ImageFormat::Png => frames_for_image(&self.bytes, image::ImageFormat::Png)?,
-            ImageFormat::Jpeg => frames_for_image(&self.bytes, image::ImageFormat::Jpeg)?,
-            ImageFormat::Webp => frames_for_image(&self.bytes, image::ImageFormat::WebP)?,
-            ImageFormat::Bmp => frames_for_image(&self.bytes, image::ImageFormat::Bmp)?,
-            ImageFormat::Tiff => frames_for_image(&self.bytes, image::ImageFormat::Tiff)?,
-            ImageFormat::Ico => frames_for_image(&self.bytes, image::ImageFormat::Ico)?,
+            ImageFormat::Gif => decode_bgra_frames(&self.bytes, image::ImageFormat::Gif)?,
+            ImageFormat::Png => decode_bgra_frames(&self.bytes, image::ImageFormat::Png)?,
+            ImageFormat::Jpeg => decode_bgra_frames(&self.bytes, image::ImageFormat::Jpeg)?,
+            ImageFormat::Webp => decode_bgra_frames(&self.bytes, image::ImageFormat::WebP)?,
+            ImageFormat::Bmp => decode_bgra_frames(&self.bytes, image::ImageFormat::Bmp)?,
+            ImageFormat::Tiff => decode_bgra_frames(&self.bytes, image::ImageFormat::Tiff)?,
+            ImageFormat::Ico => decode_bgra_frames(&self.bytes, image::ImageFormat::Ico)?,
             ImageFormat::Svg => {
                 return svg_renderer
                     .render_single_frame(&self.bytes, 1.0)
                     .map_err(Into::into);
             }
-            ImageFormat::Pnm => frames_for_image(&self.bytes, image::ImageFormat::Pnm)?,
+            ImageFormat::Pnm => decode_bgra_frames(&self.bytes, image::ImageFormat::Pnm)?,
         };
 
         Ok(Arc::new(RenderImage::new(frames)))
