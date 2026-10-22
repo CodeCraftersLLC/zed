@@ -4442,6 +4442,92 @@ async fn open_queried_buffer(
     history_items
 }
 
+#[gpui::test]
+async fn test_empty_query_without_history_shows_a_typing_hint(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/root"), json!({ "a.txt": "" }))
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, _workspace, cx) = build_find_picker(project, cx);
+
+    let no_matches_text = |picker: &Entity<Picker<FileFinderDelegate>>,
+                           cx: &mut VisualTestContext| {
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.no_matches_text(window, cx)
+        })
+    };
+    picker.update(cx, |picker, _| assert_eq!(picker.delegate.matches.len(), 0));
+    assert_eq!(
+        no_matches_text(&picker, cx).as_deref(),
+        Some("Type to search the project's files")
+    );
+
+    simulate_input(cx, "zzzzzz");
+    assert_eq!(no_matches_text(&picker, cx).as_deref(), Some("No matches"));
+}
+
+#[gpui::test]
+async fn test_create_new_is_refused_for_a_rejected_name(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    cx.update(|cx| {
+        super::set_new_name_validator(
+            Arc::new(|typed: &str| {
+                typed
+                    .split('/')
+                    .any(|part| part.eq_ignore_ascii_case("con.txt"))
+                    .then(|| "“con.txt” is a reserved name. Choose another name.".to_string())
+            }),
+            cx,
+        );
+    });
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/root"), json!({ "a.txt": "" }))
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, workspace, cx) = build_find_picker(project, cx);
+
+    simulate_input(cx, "con.txt");
+    picker.update(cx, |picker, _| {
+        assert_matches!(
+            picker.delegate.matches.matches.as_slice(),
+            [Match::CreateNew(_)]
+        );
+    });
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace.active_item_as::<Editor>(cx).is_none(),
+            "no buffer was opened for the reserved name"
+        );
+        assert!(
+            workspace.active_modal::<FileFinder>(cx).is_some(),
+            "the finder stays open so the name can be corrected"
+        );
+        assert_eq!(
+            workspace.notification_ids().len(),
+            1,
+            "the reason was shown"
+        );
+    });
+
+    // A name the validator accepts is still created.
+    cx.dispatch_action(Cancel);
+    open_file_picker(&workspace, cx);
+    simulate_input(cx, "fine.txt");
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+    workspace.update(cx, |workspace, cx| {
+        assert!(workspace.active_item_as::<Editor>(cx).is_some());
+    });
+}
+
 fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
     cx.update(|cx| {
         let state = AppState::test(cx);
