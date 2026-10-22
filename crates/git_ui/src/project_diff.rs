@@ -104,6 +104,9 @@ pub struct ProjectDiffOptions {
     pub register_git_panel_addon: bool,
     pub allow_index_mutations: bool,
     pub enable_conflict_view: bool,
+    /// Whether the empty state says anything about the remote. Without a Git panel to ask, all
+    /// it can say is "Remote up to date", which is false for a repository with no remote.
+    pub show_remote_status: bool,
 }
 
 impl ProjectDiffOptions {
@@ -114,6 +117,7 @@ impl ProjectDiffOptions {
             register_git_panel_addon: false,
             allow_index_mutations: false,
             enable_conflict_view: false,
+            show_remote_status: false,
         }
     }
 }
@@ -126,7 +130,28 @@ impl Default for ProjectDiffOptions {
             register_git_panel_addon: true,
             allow_index_mutations: true,
             enable_conflict_view: true,
+            show_remote_status: true,
         }
+    }
+}
+
+/// What the empty state says about the remote.
+#[derive(Debug, Eq, PartialEq)]
+enum RemoteLine {
+    /// The Git panel's own remote button.
+    PanelButton,
+    /// The fallback sentence used when there is no Git panel to ask.
+    UpToDate,
+    Nothing,
+}
+
+fn empty_state_remote_line(show_remote_status: bool, has_panel_button: bool) -> RemoteLine {
+    if has_panel_button {
+        RemoteLine::PanelButton
+    } else if show_remote_status {
+        RemoteLine::UpToDate
+    } else {
+        RemoteLine::Nothing
     }
 }
 
@@ -1490,6 +1515,7 @@ impl Render for ProjectDiff {
                 )
             })
             .when(is_empty && !is_loading, |el| {
+                let show_remote_status = self.options.show_remote_status;
                 let remote_button = if let Some(panel) = self
                     .workspace
                     .upgrade()
@@ -1508,13 +1534,21 @@ impl Render for ProjectDiff {
                                 .justify_around()
                                 .child(Label::new("No uncommitted changes")),
                         )
-                        .map(|el| match remote_button {
-                            Some(button) => el.child(h_flex().justify_around().child(button)),
-                            None => el.child(
-                                h_flex()
-                                    .justify_around()
-                                    .child(Label::new("Remote up to date")),
-                            ),
+                        .map(|el| {
+                            match empty_state_remote_line(
+                                show_remote_status,
+                                remote_button.is_some(),
+                            ) {
+                                RemoteLine::PanelButton => {
+                                    el.child(h_flex().justify_around().children(remote_button))
+                                }
+                                RemoteLine::UpToDate => el.child(
+                                    h_flex()
+                                        .justify_around()
+                                        .child(Label::new("Remote up to date")),
+                                ),
+                                RemoteLine::Nothing => el,
+                            }
                         })
                         .child(
                             h_flex().justify_around().mt_1().child(
@@ -2145,6 +2179,29 @@ impl Addon for BranchDiffAddon {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedded_view_only_never_says_remote_up_to_date() {
+        use super::{ProjectDiffOptions, RemoteLine, empty_state_remote_line};
+
+        let embedded = ProjectDiffOptions::embedded_view_only();
+        assert!(!embedded.show_remote_status);
+        assert_eq!(
+            empty_state_remote_line(embedded.show_remote_status, false),
+            RemoteLine::Nothing
+        );
+        // A Git panel's own button is still shown.
+        assert_eq!(
+            empty_state_remote_line(embedded.show_remote_status, true),
+            RemoteLine::PanelButton
+        );
+
+        let full = ProjectDiffOptions::default();
+        assert_eq!(
+            empty_state_remote_line(full.show_remote_status, false),
+            RemoteLine::UpToDate
+        );
+    }
+
     use collections::HashMap;
     use db::indoc;
     use editor::test::editor_test_context::{EditorTestContext, assert_state_with_diff};
