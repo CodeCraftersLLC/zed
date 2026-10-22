@@ -90,6 +90,30 @@ fn inline_only_image_href_resolver() -> usvg::ImageHrefResolver<'static> {
 /// When rendering SVGs, we render them at twice the size to get a higher-quality result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
 
+/// The longest side, in pixels, of an SVG raster. The GPU atlas cannot hold an image larger than
+/// this, so anything bigger would be painted as nothing.
+pub const MAX_RASTER_SIDE: u32 = 16_384;
+
+/// The most memory an SVG raster may take; an image within `MAX_RASTER_SIDE` on both sides can
+/// still be gigabytes.
+const MAX_RASTER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Why an SVG could not be rasterised.
+#[derive(Debug, thiserror::Error)]
+pub enum SvgRenderError {
+    /// The SVG could not be parsed or has no drawable size.
+    #[error(transparent)]
+    Svg(#[from] usvg::Error),
+    /// The raster would exceed the size limit.
+    #[error("{width} × {height} px is too large to draw")]
+    TooLarge {
+        /// The width the raster would have had.
+        width: u32,
+        /// The height the raster would have had.
+        height: u32,
+    },
+}
+
 #[derive(Clone, PartialEq, Hash, Eq)]
 #[expect(missing_docs)]
 pub struct RenderSvgParams {
@@ -180,15 +204,33 @@ impl SvgRenderer {
         }
     }
 
-    /// Renders the given bytes into an image buffer.
+    /// Renders the given bytes into an image buffer. A raster larger than [`MAX_RASTER_SIDE`]
+    /// is refused as [`usvg::Error::InvalidSize`]; use [`Self::render_single_frame_bounded`] to
+    /// tell that apart from an unparsable SVG.
     pub fn render_single_frame(
         &self,
         bytes: &[u8],
         scale_factor: f32,
     ) -> Result<Arc<RenderImage>, usvg::Error> {
+        self.render_single_frame_bounded(bytes, scale_factor, MAX_RASTER_SIDE)
+            .map_err(|error| match error {
+                SvgRenderError::Svg(error) => error,
+                SvgRenderError::TooLarge { .. } => usvg::Error::InvalidSize,
+            })
+    }
+
+    /// Renders the given bytes into an image buffer, refusing, before allocating anything, a raster
+    /// with a side longer than `max_side` or more than 256 MiB of pixels.
+    pub fn render_single_frame_bounded(
+        &self,
+        bytes: &[u8],
+        scale_factor: f32,
+        max_side: u32,
+    ) -> Result<Arc<RenderImage>, SvgRenderError> {
         self.render_pixmap(
             bytes,
             SvgSize::ScaleFactor(scale_factor * SMOOTH_SVG_SCALE_FACTOR),
+            Some(max_side),
         )
         .map(|pixmap| {
             let mut buffer =
@@ -213,7 +255,7 @@ impl SvgRenderer {
         anyhow::ensure!(!params.size.is_zero(), "can't render at a zero size");
 
         let render_pixmap = |bytes| {
-            let pixmap = self.render_pixmap(bytes, SvgSize::Size(params.size))?;
+            let pixmap = self.render_pixmap(bytes, SvgSize::Size(params.size), None)?;
 
             // Convert the pixmap's pixels into an alpha mask.
             let size = Size::new(
@@ -238,20 +280,31 @@ impl SvgRenderer {
         }
     }
 
-    fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
+    fn render_pixmap(
+        &self,
+        bytes: &[u8],
+        size: SvgSize,
+        max_side: Option<u32>,
+    ) -> Result<Pixmap, SvgRenderError> {
         let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
         let svg_size = tree.size();
         let scale = match size {
             SvgSize::Size(size) => size.width.0 as f32 / svg_size.width(),
             SvgSize::ScaleFactor(scale) => scale,
         };
+        let width = (svg_size.width() * scale) as u32;
+        let height = (svg_size.height() * scale) as u32;
+        if let Some(max_side) = max_side
+            && (width > max_side
+                || height > max_side
+                || u64::from(width) * u64::from(height) * 4 > MAX_RASTER_BYTES)
+        {
+            return Err(SvgRenderError::TooLarge { width, height });
+        }
 
         // Render the SVG to a pixmap with the specified width and height.
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(
-            (svg_size.width() * scale) as u32,
-            (svg_size.height() * scale) as u32,
-        )
-        .ok_or(usvg::Error::InvalidSize)?;
+        let mut pixmap =
+            resvg::tiny_skia::Pixmap::new(width, height).ok_or(usvg::Error::InvalidSize)?;
 
         let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
 
@@ -343,7 +396,7 @@ mod tests {
         );
         let renderer = SvgRenderer::new(Arc::new(()));
         let pixmap = renderer
-            .render_pixmap(svg.as_bytes(), SvgSize::ScaleFactor(1.))
+            .render_pixmap(svg.as_bytes(), SvgSize::ScaleFactor(1.), None)
             .expect("the SVG itself is valid");
         pixmap.pixels().iter().filter(|p| p.alpha() > 0).count()
     }
@@ -367,6 +420,57 @@ mod tests {
         ] {
             assert_eq!(opaque_pixel_count(&href), 0, "{href} must not be loaded");
         }
+    }
+
+    fn plain_svg(width: u32, height: u32) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="{width}" height="{height}" fill="red"/></svg>"#
+        )
+    }
+
+    #[test]
+    fn bounded_render_refuses_before_allocating() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+
+        // 150,000 px tall: tiny-skia would allocate it happily and the GPU atlas could never hold it.
+        let tall = plain_svg(100, 150_000);
+        let Err(SvgRenderError::TooLarge { width, height }) =
+            renderer.render_single_frame_bounded(tall.as_bytes(), 1.0, MAX_RASTER_SIDE)
+        else {
+            panic!("a 150,000 px tall SVG must be refused as too large");
+        };
+        assert_eq!((width, height), (200, 300_000));
+        assert!(matches!(
+            renderer.render_single_frame(tall.as_bytes(), 1.0),
+            Err(usvg::Error::InvalidSize)
+        ));
+
+        // Within the side limit but over the memory limit: 12,000 x 12,000 x 4 bytes.
+        let wide_and_tall = plain_svg(6_000, 6_000);
+        assert!(matches!(
+            renderer.render_single_frame_bounded(wide_and_tall.as_bytes(), 1.0, MAX_RASTER_SIDE),
+            Err(SvgRenderError::TooLarge { .. })
+        ));
+
+        let small = plain_svg(10, 10);
+        let image = renderer
+            .render_single_frame_bounded(small.as_bytes(), 1.0, MAX_RASTER_SIDE)
+            .expect("a small SVG renders");
+        assert_eq!(
+            image.size(0),
+            crate::size(DevicePixels(20), DevicePixels(20))
+        );
+        assert!(matches!(
+            renderer.render_single_frame_bounded(small.as_bytes(), 1.0, 10),
+            Err(SvgRenderError::TooLarge {
+                width: 20,
+                height: 20
+            })
+        ));
+        assert!(matches!(
+            renderer.render_single_frame_bounded(b"not svg", 1.0, MAX_RASTER_SIDE),
+            Err(SvgRenderError::Svg(_))
+        ));
     }
 
     #[test]

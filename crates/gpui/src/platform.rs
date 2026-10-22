@@ -37,7 +37,7 @@ use crate::{
     ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
     PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
-    SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+    SystemWindowTab, Task, Window, WindowControlArea, decode_image, hash, point, px, size,
 };
 use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -2204,7 +2204,7 @@ impl Image {
             bytes: &[u8],
             format: image::ImageFormat,
         ) -> Result<SmallVec<[Frame; 1]>> {
-            let mut data = image::load_from_memory_with_format(bytes, format)?.into_rgba8();
+            let mut data = decode_image(bytes, format, image::Limits::default())?.into_rgba8();
 
             // Convert from RGBA to BGRA.
             for pixel in data.chunks_exact_mut(4) {
@@ -2352,6 +2352,38 @@ mod image_tests {
         for pixel in bytes.chunks_exact(4) {
             assert_eq!(pixel, &[0xF8, 0xBD, 0x38, 0xFF]);
         }
+    }
+
+    #[test]
+    fn an_ico_whose_png_entry_is_rgb_decodes() {
+        use crate::image_decode::fixtures::{ico_with, png};
+        let entry = png(
+            &image::RgbImage::from_pixel(32, 32, image::Rgb([1, 2, 3])),
+            None,
+        );
+        let image = Image::from_bytes(ImageFormat::Ico, ico_with(&[(32, 32, 24, &entry)]));
+
+        let render_image = image.to_image_data(SvgRenderer::new(Arc::new(()))).unwrap();
+        assert_eq!(
+            render_image.size(0),
+            size(DevicePixels(32), DevicePixels(32))
+        );
+        // BGRA
+        assert_eq!(&render_image.as_bytes(0).unwrap()[..4], &[3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn a_picture_with_exif_orientation_6_is_drawn_upright() {
+        use crate::image_decode::fixtures::{exif_orientation, landscape, png};
+        let image = Image::from_bytes(
+            ImageFormat::Png,
+            png(&landscape(), Some(exif_orientation(6))),
+        );
+
+        let render_image = image.to_image_data(SvgRenderer::new(Arc::new(()))).unwrap();
+        assert_eq!(render_image.size(0), size(DevicePixels(2), DevicePixels(4)));
+        // The stored top-left corner (red) is the top-right corner once upright; BGRA.
+        assert_eq!(&render_image.as_bytes(0).unwrap()[4..8], &[0, 0, 255, 255]);
     }
 }
 

@@ -26,6 +26,7 @@ mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
 mod global;
+mod image_decode;
 mod input;
 mod inspector;
 mod interactive;
@@ -131,6 +132,7 @@ macro_rules! bench_main {
 pub use gpui_shared_string::*;
 pub use gpui_util::arc_cow::ArcCow;
 pub use http_client;
+pub use image_decode::*;
 pub use input::*;
 pub use inspector::*;
 pub use interactive::*;

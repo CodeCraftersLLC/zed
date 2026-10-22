@@ -2,14 +2,14 @@ use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
+    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_image, px,
 };
 use anyhow::Result;
 
 use futures::Future;
 use gpui_util::ResultExt;
 use image::{
-    AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba,
+    AnimationDecoder, Frame, ImageError, ImageFormat, Rgba,
     codecs::{gif::GifDecoder, webp::WebPDecoder},
 };
 use scheduler::Instant;
@@ -715,7 +715,8 @@ impl Asset for ImageAssetLoader {
 
                             frames
                         } else {
-                            let mut data = DynamicImage::from_decoder(decoder)?.into_rgba8();
+                            let mut data = decode_image(&bytes, format, image::Limits::default())?
+                                .into_rgba8();
 
                             // Convert from RGBA to BGRA.
                             for pixel in data.chunks_exact_mut(4) {
@@ -727,7 +728,7 @@ impl Asset for ImageAssetLoader {
                     }
                     _ => {
                         let mut data =
-                            image::load_from_memory_with_format(&bytes, format)?.into_rgba8();
+                            decode_image(&bytes, format, image::Limits::default())?.into_rgba8();
 
                         // Convert from RGBA to BGRA.
                         for pixel in data.chunks_exact_mut(4) {
