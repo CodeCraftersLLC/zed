@@ -1,7 +1,8 @@
 use collections::HashMap;
 use gpui::{
     Animation, AnimationExt, AnyElement, ClipboardItem, Context, Entity, ImageSource,
-    MAX_RASTER_SIDE, RenderImage, StyledText, SvgRenderError, Task, img, pulsating_between,
+    MAX_RASTER_SIDE, RenderImage, StyledText, SvgRenderError, SvgRenderer, Task, img,
+    pulsating_between,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -165,15 +166,7 @@ impl CachedMermaidDiagram {
                     let svg_string =
                         mermaid_render::render_to_svg(&contents.contents, &mermaid_theme)
                             .map_err(|error| MermaidError::Failed(error.to_string()))?;
-                    let scale = contents.scale as f32 / 100.0;
-                    svg_renderer
-                        .render_single_frame_bounded(svg_string.as_bytes(), scale, MAX_RASTER_SIDE)
-                        .map_err(|error| match error {
-                            SvgRenderError::TooLarge { width, height } => {
-                                MermaidError::TooLarge { width, height }
-                            }
-                            SvgRenderError::Svg(error) => MermaidError::Failed(error.to_string()),
-                        })
+                    rasterize_svg(&svg_renderer, &svg_string, contents.scale as f32 / 100.0)
                 })
                 .await;
             let _ = render_image_clone.set(value);
@@ -205,6 +198,19 @@ impl CachedMermaidDiagram {
             _task: Task::ready(()),
         }
     }
+}
+
+fn rasterize_svg(
+    svg_renderer: &SvgRenderer,
+    svg: &str,
+    scale: f32,
+) -> Result<Arc<RenderImage>, MermaidError> {
+    svg_renderer
+        .render_single_frame_bounded(svg.as_bytes(), scale, MAX_RASTER_SIDE)
+        .map_err(|error| match error {
+            SvgRenderError::TooLarge { width, height } => MermaidError::TooLarge { width, height },
+            SvgRenderError::Svg(error) => MermaidError::Failed(error.to_string()),
+        })
 }
 
 /// Merman has somewhat limited text measurement capabilities.
@@ -289,9 +295,6 @@ fn parse_mermaid_info(info: &str) -> Option<u32> {
     )
 }
 
-/// We deliberately block rendering of some diagram types, even though `merman`
-/// supports them, because we have not yet written custom CSS to ensure text is
-/// readable.
 /// The first word of the source, which names the diagram type.
 fn diagram_type(source: &str) -> &str {
     source
@@ -301,6 +304,9 @@ fn diagram_type(source: &str) -> &str {
         .unwrap_or("")
 }
 
+/// We deliberately block rendering of some diagram types, even though `merman`
+/// supports them, because we have not yet written custom CSS to ensure text is
+/// readable.
 fn is_supported_diagram_type(source: &str) -> bool {
     /// If updating this list, also update the system prompt!
     const SUPPORTED_PREFIXES: &[&str] = &[
@@ -616,13 +622,16 @@ mod tests {
     use super::{
         CachedMermaidDiagram, MermaidDiagramCache, MermaidError, MermaidState,
         ParsedMarkdownMermaidDiagramContents, extract_mermaid_diagrams, parse_mermaid_info,
+        rasterize_svg,
     };
     use crate::{
         CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownOptions,
         MarkdownStyle, WrapButtonVisibility,
     };
     use collections::HashMap;
-    use gpui::{Context, IntoElement, Render, RenderImage, TestAppContext, Window, size};
+    use gpui::{
+        Context, IntoElement, Render, RenderImage, SvgRenderer, TestAppContext, Window, size,
+    };
     use std::sync::Arc;
     use ui::prelude::*;
 
@@ -831,20 +840,23 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn an_oversize_diagram_is_an_error_not_a_blank_image(cx: &mut TestAppContext) {
-        let chain: String = (0..400)
-            .map(|ix| format!("  N{ix} --> N{}\n", ix + 1))
-            .collect();
-        let failures = mermaid_failures(&format!("flowchart TD\n{chain}"), cx);
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(
-            failures[0].starts_with("This diagram is too large to draw ("),
-            "{failures:?}"
+    #[test]
+    fn a_raster_beyond_the_limit_is_a_too_large_error_not_a_blank_image() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="150000"><rect width="100" height="150000" fill="red"/></svg>"#;
+
+        let error = rasterize_svg(&renderer, svg, 1.0).unwrap_err();
+
+        assert_eq!(
+            error,
+            MermaidError::TooLarge {
+                width: 200,
+                height: 300_000
+            }
         );
-        assert!(
-            failures[0].ends_with(" px). The Code tab shows its source."),
-            "{failures:?}"
+        assert_eq!(
+            error.reason(),
+            "This diagram is too large to draw (200 × 300000 px). The Code tab shows its source."
         );
     }
 

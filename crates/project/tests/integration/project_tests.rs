@@ -13314,8 +13314,6 @@ async fn test_undo_encoding_change(cx: &mut gpui::TestAppContext) {
     });
 }
 
-/// Opening a file, typing one character at its start or end and saving must change that
-/// character and nothing else: not the line endings, the encoding or the byte-order mark.
 #[gpui::test]
 async fn test_renaming_an_entry_reports_where_it_came_from(cx: &mut gpui::TestAppContext) {
     init_test(cx);
@@ -13368,6 +13366,8 @@ async fn test_renaming_an_entry_reports_where_it_came_from(cx: &mut gpui::TestAp
     );
 }
 
+/// Opening a file, typing one character at its start or end and saving must change that
+/// character and nothing else: not the line endings, the encoding or the byte-order mark.
 #[gpui::test]
 async fn test_saving_changes_only_the_typed_character(cx: &mut gpui::TestAppContext) {
     init_test(cx);
