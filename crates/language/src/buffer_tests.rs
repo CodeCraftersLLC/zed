@@ -146,6 +146,17 @@ fn test_set_line_ending(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_text_with_line_endings_returns_the_loaded_endings(cx: &mut gpui::App) {
+    let buffer = cx.new(|cx| Buffer::local("one\r\ntwo\r\nthree", cx));
+    buffer.update(cx, |buffer, cx| {
+        assert_eq!(buffer.text(), "one\ntwo\nthree");
+        buffer.edit([(4..4, "X")], None, cx);
+        assert_eq!(buffer.text(), "one\nXtwo\nthree");
+        assert_eq!(buffer.text_with_line_endings(), "one\r\nXtwo\r\nthree");
+    });
+}
+
+#[gpui::test]
 async fn test_a_diff_to_mixed_text_installs_its_line_endings(cx: &mut TestAppContext) {
     let buffer = cx.new(|cx| Buffer::local("a\nb\n", cx));
     let diff = buffer

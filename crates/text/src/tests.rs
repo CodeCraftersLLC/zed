@@ -241,7 +241,7 @@ fn test_cr_only_text_keeps_its_line_ending() {
     assert_eq!(buffer.text(), "one\ntwo\nthree");
     assert_eq!(buffer.line_ending(), LineEnding::Mac);
     assert_eq!(LineEnding::Mac.label(), "CR");
-    assert_eq!(text_with_line_endings(&buffer), "one\rtwo\rthree");
+    assert_eq!(buffer.text_with_line_endings(), "one\rtwo\rthree");
 }
 
 #[test]
@@ -1246,15 +1246,11 @@ fn test_line_endings_survive_undo() {
     assert_eq!(buffer.line_endings(), before);
 }
 
-fn text_with_line_endings(buffer: &Buffer) -> String {
-    chunks_with_line_endings(buffer.as_rope(), &buffer.line_endings()).collect()
-}
-
 #[test]
 fn test_chunks_with_line_endings_restore_each_line_ending() {
     let buffer = mixed_buffer();
     assert_eq!(
-        text_with_line_endings(&buffer),
+        buffer.text_with_line_endings(),
         "one\r\ntwo\nthree\r\nfour\n"
     );
 
@@ -1263,10 +1259,10 @@ fn test_chunks_with_line_endings_restore_each_line_ending() {
         BufferId::new(1).unwrap(),
         "\r\n\r\rx\n\ny",
     );
-    assert_eq!(text_with_line_endings(&buffer), "\r\n\r\rx\n\ny");
+    assert_eq!(buffer.text_with_line_endings(), "\r\n\r\rx\n\ny");
 
     let empty = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
-    assert_eq!(text_with_line_endings(&empty), "");
+    assert_eq!(empty.text_with_line_endings(), "");
 }
 
 #[gpui::test(iterations = 100)]
@@ -1314,7 +1310,7 @@ fn test_mixed_line_endings_round_trip_and_survive_a_typed_character(mut rng: Std
         original.clone(),
     );
     buffer.check_invariants();
-    assert_eq!(text_with_line_endings(&buffer), original);
+    assert_eq!(buffer.text_with_line_endings(), original);
 
     let line_ix = rng.random_range(0..lines.len());
     let boundaries: Vec<usize> = lines[line_ix]
@@ -1332,5 +1328,5 @@ fn test_mixed_line_endings_round_trip_and_survive_a_typed_character(mut rng: Std
     buffer.edit([(offset..offset, "Q")]);
     lines[line_ix].0.insert(column, 'Q');
     buffer.check_invariants();
-    assert_eq!(text_with_line_endings(&buffer), render(&lines));
+    assert_eq!(buffer.text_with_line_endings(), render(&lines));
 }

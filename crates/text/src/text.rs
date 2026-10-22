@@ -2223,6 +2223,12 @@ impl BufferSnapshot {
         self.line_ending
     }
 
+    /// The text as it is saved to disk: each line with the ending it was loaded with. [`Self::text`]
+    /// has every ending normalized to `\n`.
+    pub fn text_with_line_endings(&self) -> String {
+        chunks_with_line_endings(&self.visible_text, &self.line_endings()).collect()
+    }
+
     /// The ending of every line, following the text through edits.
     pub fn line_endings(&self) -> LineEndings {
         let mut line_endings = LineEndings::uniform(self.line_ending);
