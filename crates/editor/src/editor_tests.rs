@@ -28524,8 +28524,14 @@ async fn test_git_blame_is_not_offered_without_a_renderer(cx: &mut TestAppContex
         )
     });
 
+    // A host that never called `editor::init` has no renderer global at all.
+    cx.update(|_, cx| cx.remove_global::<crate::git::blame::GlobalBlameRenderer>());
     editor.update_in(cx, |editor, window, cx| {
+        assert!(!editor.git_blame_available(cx));
+        editor.toggle_git_blame(&::git::Blame, window, cx);
+        assert!(editor.blame().is_none());
         // `editor::init` installs the placeholder renderer, which draws nothing.
+        cx.set_global(crate::git::blame::GlobalBlameRenderer(Arc::new(())));
         assert!(!editor.git_blame_available(cx));
 
         editor.toggle_git_blame(&::git::Blame, window, cx);

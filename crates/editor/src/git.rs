@@ -213,7 +213,8 @@ impl Editor {
     /// Whether a blame renderer is installed. Without one, blame data would be computed and a
     /// gutter column reserved for it, and nothing would be drawn in it.
     pub fn git_blame_available(&self, cx: &App) -> bool {
-        cx.global::<GlobalBlameRenderer>().0.is_available()
+        cx.try_global::<GlobalBlameRenderer>()
+            .is_some_and(|renderer| renderer.0.is_available())
     }
 
     pub fn toggle_git_blame(
