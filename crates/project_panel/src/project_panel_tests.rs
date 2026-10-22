@@ -1860,6 +1860,147 @@ async fn test_cut_paste(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_cut_paste_into_the_same_folder_is_a_no_op(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "one.txt": "",
+            "a": { "inner.txt": "" },
+            "b": {}
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let entries = |cx: &mut VisualTestContext| visible_entries_as_strings(&panel, 0..50, cx);
+    let cut_then_paste = |path: &str, cx: &mut VisualTestContext| {
+        select_path(&panel, path, cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.cut(&Default::default(), window, cx);
+            panel.paste(&Default::default(), window, cx);
+        });
+        cx.executor().run_until_parked();
+    };
+
+    // A file cut and pasted while it is selected goes to the folder it is already in.
+    cut_then_paste("root/one.txt", cx);
+    assert_eq!(
+        entries(cx),
+        &[
+            "v root",
+            "    > a",
+            "    > b",
+            "      one.txt  <== selected",
+        ],
+        "the file was not renamed to a copy"
+    );
+    assert!(fs.is_file(Path::new("/root/one.txt")).await);
+    assert!(!fs.is_file(Path::new("/root/one copy.txt")).await);
+    panel.read_with(cx, |panel, _| {
+        assert!(
+            matches!(panel.clipboard, Some(ClipboardEntry::Cut(_))),
+            "a paste that moved nothing leaves the entry cut"
+        );
+    });
+
+    // So does a folder.
+    cut_then_paste("root/a", cx);
+    assert_eq!(
+        entries(cx),
+        &[
+            "v root",
+            "    > a  <== selected",
+            "    > b",
+            "      one.txt",
+        ]
+    );
+    assert!(!fs.is_dir(Path::new("/root/a copy")).await);
+
+    // A real move still moves, and the entry is then pasted as a copy.
+    select_path(&panel, "root/b", cx);
+    panel.update_in(cx, |panel, window, cx| {
+        panel.paste(&Default::default(), window, cx);
+    });
+    cx.executor().run_until_parked();
+    assert!(fs.is_dir(Path::new("/root/b/a")).await);
+    assert!(!fs.is_dir(Path::new("/root/a")).await);
+}
+
+#[gpui::test]
+async fn test_dot_dot_name_shows_the_host_reason_while_typing(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "one.txt": "" })).await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    select_path(&panel, "root", cx);
+    panel.update_in(cx, |panel, window, cx| panel.new_file(&NewFile, window, cx));
+    cx.run_until_parked();
+
+    let typed = |text: &str, cx: &mut VisualTestContext| {
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .filename_editor
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            panel
+                .state
+                .edit_state
+                .as_ref()
+                .unwrap()
+                .validation_state
+                .clone()
+        })
+    };
+
+    // Without a host check, a name that is not a path says so, not "whitespace".
+    assert!(
+        matches!(typed("a/../b", cx), ValidationState::Error(message) if message == "File or directory name is not a valid path."),
+    );
+
+    let host_rule: NameValidator = std::sync::Arc::new(|typed: &str| {
+        typed
+            .split('/')
+            .any(|part| part == "..")
+            .then(|| "`..` is not a valid name.".to_string())
+    });
+    panel.update(cx, |panel, cx| {
+        panel.set_name_validator(Some(host_rule), cx)
+    });
+
+    assert!(
+        matches!(typed("..", cx), ValidationState::Error(message) if message == "`..` is not a valid name."),
+    );
+    assert!(
+        matches!(typed("a/../b", cx), ValidationState::Error(message) if message == "`..` is not a valid name."),
+    );
+    assert!(matches!(typed(" spaced", cx), ValidationState::Warning(_)));
+    assert!(matches!(typed("fine.txt", cx), ValidationState::None));
+}
+
+#[gpui::test]
 async fn test_cut_paste_between_different_worktrees(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
