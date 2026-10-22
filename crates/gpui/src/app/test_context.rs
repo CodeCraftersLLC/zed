@@ -762,6 +762,41 @@ impl VisualTestContext {
             .clone()
     }
 
+    /// Connects a pretend screen reader to this window, so the accessibility tree
+    /// is built from now on. Test windows have no platform adapter, so without this
+    /// the tree is never built and [`Self::a11y_tree_updates`] stays empty.
+    /// Redraws the window and runs until parked, so the first tree is available on return.
+    ///
+    /// Builds no tree in [`TestAppContext::skip_drawing`] mode.
+    pub fn enable_accessibility(&mut self) {
+        self.cx.test_window(self.window).enable_accessibility();
+        self.run_until_parked();
+    }
+
+    /// Every accessibility tree this window has sent to its adapter since
+    /// [`Self::enable_accessibility`], oldest first. Each one describes the whole tree.
+    pub fn a11y_tree_updates(&mut self) -> Vec<accesskit::TreeUpdate> {
+        self.cx.test_window(self.window).a11y_tree_updates()
+    }
+
+    /// The most recent accessibility tree sent to the adapter.
+    pub fn a11y_tree(&mut self) -> Option<accesskit::TreeUpdate> {
+        self.a11y_tree_updates().pop()
+    }
+
+    /// Delivers `action` to `target` as a screen reader would, then runs until parked.
+    pub fn simulate_a11y_action(&mut self, target: accesskit::NodeId, action: accesskit::Action) {
+        self.cx
+            .test_window(self.window)
+            .simulate_a11y_action(accesskit::ActionRequest {
+                action,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: target,
+                data: None,
+            });
+        self.run_until_parked();
+    }
+
     /// Simulate a sequence of keystrokes `cx.simulate_keystrokes("cmd-p escape")`
     /// Automatically runs until parked.
     pub fn simulate_keystrokes(&mut self, keystrokes: &str) {
@@ -1115,8 +1150,12 @@ impl AnyWindowHandle {
 
 #[cfg(test)]
 mod tests {
-    use crate::{PathPromptOptions, TestAppContext};
-    use std::path::PathBuf;
+    use crate::{
+        Context, InteractiveElement as _, IntoElement, PathPromptOptions, Render, SharedString,
+        StatefulInteractiveElement as _, Styled as _, TestAppContext, Window, div, px,
+    };
+    use accesskit::{Action, Role};
+    use std::{cell::Cell, path::PathBuf, rc::Rc};
 
     #[gpui::test]
     async fn test_simulate_path_prompt_response(cx: &mut TestAppContext) {
@@ -1161,5 +1200,105 @@ mod tests {
 
         let response = receiver.await.unwrap().unwrap();
         assert_eq!(response, None);
+    }
+
+    struct SaveButton {
+        label: SharedString,
+        activations: Rc<Cell<usize>>,
+    }
+
+    impl Render for SaveButton {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let activations = self.activations.clone();
+            div()
+                .id("save")
+                .role(Role::Button)
+                .aria_label(self.label.clone())
+                .size(px(100.))
+                .on_a11y_action(Action::Click, move |_, _, _| {
+                    activations.set(activations.get() + 1)
+                })
+        }
+    }
+
+    fn save_button_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        crate::Entity<SaveButton>,
+        &mut crate::VisualTestContext,
+        Rc<Cell<usize>>,
+    ) {
+        let activations = Rc::new(Cell::new(0));
+        let (view, cx) = cx.add_window_view({
+            let activations = activations.clone();
+            |_, _| SaveButton {
+                label: "Save".into(),
+                activations,
+            }
+        });
+        (view, cx, activations)
+    }
+
+    fn node_labelled<'a>(
+        tree: &'a accesskit::TreeUpdate,
+        label: &str,
+    ) -> (accesskit::NodeId, &'a accesskit::Node) {
+        tree.nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(label))
+            .map(|(id, node)| (*id, node))
+            .unwrap_or_else(|| panic!("no node labelled {label:?} in the tree"))
+    }
+
+    #[gpui::test]
+    async fn test_window_builds_no_accessibility_tree_until_enabled(cx: &mut TestAppContext) {
+        let (_view, cx, _) = save_button_window(cx);
+        cx.run_until_parked();
+        assert!(cx.a11y_tree_updates().is_empty());
+        assert!(cx.a11y_tree().is_none());
+    }
+
+    #[gpui::test]
+    async fn test_enable_accessibility_records_the_tree_a_screen_reader_reads(
+        cx: &mut TestAppContext,
+    ) {
+        let (_view, cx, _) = save_button_window(cx);
+
+        cx.enable_accessibility();
+
+        let tree = cx.a11y_tree().expect("enabling accessibility sends a tree");
+        let (_, button) = node_labelled(&tree, "Save");
+        assert_eq!(button.role(), Role::Button);
+        assert!(button.supports_action(Action::Click));
+    }
+
+    #[gpui::test]
+    async fn test_each_redraw_sends_another_tree(cx: &mut TestAppContext) {
+        let (view, cx, _) = save_button_window(cx);
+        cx.enable_accessibility();
+        let trees_before = cx.a11y_tree_updates().len();
+
+        view.update(cx, |view, cx| {
+            view.label = "Saved".into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.a11y_tree_updates().len() > trees_before);
+        node_labelled(&cx.a11y_tree().unwrap(), "Saved");
+    }
+
+    #[gpui::test]
+    async fn test_simulated_accessibility_action_reaches_the_elements_listener(
+        cx: &mut TestAppContext,
+    ) {
+        let (_view, cx, activations) = save_button_window(cx);
+        cx.enable_accessibility();
+        let tree = cx.a11y_tree().unwrap();
+        let (button_id, _) = node_labelled(&tree, "Save");
+
+        cx.simulate_a11y_action(button_id, Action::Click);
+
+        assert_eq!(activations.get(), 1);
     }
 }

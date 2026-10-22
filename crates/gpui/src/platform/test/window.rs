@@ -1,5 +1,5 @@
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
+    A11yCallbacks, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId, WindowAppearance,
@@ -37,6 +37,8 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    a11y_callbacks: Option<A11yCallbacks>,
+    a11y_tree_updates: Vec<accesskit::TreeUpdate>,
 }
 
 #[derive(Clone)]
@@ -90,6 +92,8 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            a11y_callbacks: None,
+            a11y_tree_updates: Vec::new(),
         })))
     }
 
@@ -114,6 +118,33 @@ impl TestWindow {
         drop(lock);
         callback(active);
         self.0.lock().active_status_change_callback = Some(callback);
+    }
+
+    /// Connects a pretend screen reader: the window starts building its
+    /// accessibility tree and hands every frame's tree to this window, which
+    /// records it for [`Self::a11y_tree_updates`].
+    pub(crate) fn enable_accessibility(&self) {
+        let lock = self.0.lock();
+        let callbacks = lock
+            .a11y_callbacks
+            .as_ref()
+            .expect("the window never installed an accessibility adapter to activate");
+        (callbacks.activation)();
+    }
+
+    /// Every accessibility tree the window sent to its adapter, oldest first.
+    pub(crate) fn a11y_tree_updates(&self) -> Vec<accesskit::TreeUpdate> {
+        self.0.lock().a11y_tree_updates.clone()
+    }
+
+    /// Delivers an accessibility action the way the platform adapter would.
+    pub(crate) fn simulate_a11y_action(&self, request: accesskit::ActionRequest) {
+        let lock = self.0.lock();
+        let callbacks = lock
+            .a11y_callbacks
+            .as_ref()
+            .expect("the window never installed an accessibility adapter to act through");
+        (callbacks.action)(request);
     }
 
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
@@ -337,6 +368,14 @@ impl PlatformWindow for TestWindow {
         } else {
             anyhow::bail!("render_to_image not available: no HeadlessRenderer configured")
         }
+    }
+
+    fn a11y_init(&self, callbacks: A11yCallbacks) {
+        self.0.lock().a11y_callbacks = Some(callbacks);
+    }
+
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        self.0.lock().a11y_tree_updates.push(tree_update);
     }
 
     fn as_test(&mut self) -> Option<&mut TestWindow> {
