@@ -331,13 +331,27 @@ impl WindowsPlatform {
                         break;
                     };
                     for hwnd in all_windows.read().iter() {
-                        unsafe {
-                            let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                        if window_presence(hwnd.as_raw()).should_present() {
+                            unsafe {
+                                let _ =
+                                    RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                            }
                         }
                     }
                 }
             })
             .unwrap();
+    }
+}
+
+fn window_presence(hwnd: HWND) -> WindowPresence {
+    // SAFETY: both calls only read window state, from any thread, and answer false
+    // for a handle that no longer names a window.
+    unsafe {
+        WindowPresence {
+            minimized: IsIconic(hwnd).as_bool(),
+            visible: IsWindowVisible(hwnd).as_bool(),
+        }
     }
 }
 
