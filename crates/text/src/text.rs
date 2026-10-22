@@ -30,6 +30,7 @@ use std::{
     fmt::Display,
     future::Future,
     iter::Iterator,
+    mem,
     num::NonZeroU64,
     ops::{self, Deref, Range, Sub},
     str,
@@ -3642,6 +3643,12 @@ pub struct LineEndings {
     pub changes: Vec<(usize, LineEnding)>,
 }
 
+impl From<LineEnding> for LineEndings {
+    fn from(ending: LineEnding) -> Self {
+        Self::uniform(ending)
+    }
+}
+
 impl LineEndings {
     /// Every line uses `ending`.
     pub fn uniform(ending: LineEnding) -> Self {
@@ -3767,23 +3774,71 @@ impl LineEnding {
     }
 }
 
-pub fn chunks_with_line_ending(rope: &Rope, line_ending: LineEnding) -> impl Iterator<Item = &str> {
-    rope.chunks().flat_map(move |chunk| {
-        let mut newline = false;
-        let end_with_newline = chunk.ends_with('\n').then_some(line_ending.as_str());
-        chunk
-            .lines()
-            .flat_map(move |line| {
-                let ending = if newline {
-                    Some(line_ending.as_str())
-                } else {
-                    None
-                };
-                newline = true;
-                ending.into_iter().chain([line])
-            })
-            .chain(end_with_newline)
-    })
+/// The text of `rope` with each `\n` replaced by the ending `line_endings` assigns that line.
+pub fn chunks_with_line_endings<'a>(
+    rope: &'a Rope,
+    line_endings: &'a LineEndings,
+) -> impl Iterator<Item = &'a str> {
+    ChunksWithLineEndings {
+        chunks: rope.chunks(),
+        chunk: "",
+        chunk_offset: 0,
+        line_endings,
+        next_change: 0,
+        current: line_endings.first,
+        pending_ending: None,
+    }
+}
+
+struct ChunksWithLineEndings<'a> {
+    chunks: Chunks<'a>,
+    /// The part of the current rope chunk that has not been yielded yet.
+    chunk: &'a str,
+    /// The offset of `chunk` in the rope.
+    chunk_offset: usize,
+    line_endings: &'a LineEndings,
+    /// Index into `line_endings.changes` of the first change not yet in force.
+    next_change: usize,
+    current: LineEnding,
+    pending_ending: Option<&'static str>,
+}
+
+impl<'a> Iterator for ChunksWithLineEndings<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if let Some(ending) = self.pending_ending.take() {
+            return Some(ending);
+        }
+        while self.chunk.is_empty() {
+            self.chunk = self.chunks.next()?;
+        }
+        let Some(newline_ix) = self.chunk.find('\n') else {
+            let rest = mem::take(&mut self.chunk);
+            self.chunk_offset += rest.len();
+            return Some(rest);
+        };
+
+        let newline_offset = self.chunk_offset + newline_ix;
+        while let Some(&(line_start, ending)) = self.line_endings.changes.get(self.next_change) {
+            if line_start > newline_offset {
+                break;
+            }
+            self.current = ending;
+            self.next_change += 1;
+        }
+
+        let line = &self.chunk[..newline_ix];
+        self.chunk = &self.chunk[newline_ix + 1..];
+        self.chunk_offset = newline_offset + 1;
+        let ending = self.current.as_str();
+        if line.is_empty() {
+            Some(ending)
+        } else {
+            self.pending_ending = Some(ending);
+            Some(line)
+        }
+    }
 }
 
 #[cfg(debug_assertions)]

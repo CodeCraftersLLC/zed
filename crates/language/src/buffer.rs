@@ -564,7 +564,8 @@ pub struct Chunk<'a> {
 #[derive(Debug, Clone)]
 pub struct Diff {
     pub base_version: clock::Global,
-    pub line_ending: LineEnding,
+    /// The line endings of the text the edits lead to, or `None` when the edits keep the buffer's.
+    pub line_endings: Option<LineEndings>,
     pub edits: Vec<(Range<usize>, Arc<str>)>,
 }
 
@@ -1695,7 +1696,9 @@ impl Buffer {
         self.saved_version = version;
         self.has_unsaved_edits
             .set((self.saved_version.clone(), false));
-        self.text.set_line_ending(line_ending);
+        if self.text.line_ending() != line_ending {
+            self.text.set_line_ending(line_ending);
+        }
         self.saved_mtime = mtime;
         cx.emit(BufferEvent::Reloaded);
         cx.notify();
@@ -2268,12 +2271,11 @@ impl Buffer {
         cx.background_spawn(async move {
             let old_text = old_text.to_string();
             let mut new_text = new_text.as_ref().to_owned();
-            let line_ending = LineEnding::detect(&new_text);
-            LineEnding::normalize(&mut new_text);
+            let line_endings = LineEnding::normalize_with_endings(&mut new_text);
             let edits = text_diff(&old_text, &new_text);
             Diff {
                 base_version,
-                line_ending,
+                line_endings: Some(line_endings),
                 edits,
             }
         })
@@ -2283,14 +2285,13 @@ impl Buffer {
     /// at the ends of a lines, and returns a `Diff` that removes that whitespace.
     pub fn remove_trailing_whitespace(&self, cx: &App) -> Task<Diff> {
         let old_text = self.as_rope().clone();
-        let line_ending = self.line_ending();
         let base_version = self.version();
         cx.background_spawn(async move {
             let ranges = trailing_whitespace_ranges(&old_text);
             let empty = Arc::<str>::from("");
             Diff {
                 base_version,
-                line_ending,
+                line_endings: None,
                 edits: ranges
                     .into_iter()
                     .map(|range| (range, empty.clone()))
@@ -2329,6 +2330,9 @@ impl Buffer {
     pub fn apply_diff(&mut self, diff: Diff, cx: &mut Context<Self>) -> Option<TransactionId> {
         let snapshot = self.snapshot();
         let mut edits_since = snapshot.edits_since::<usize>(&diff.base_version).peekable();
+        // Only when nothing changed since the diff was made does the buffer end up as the text its
+        // line endings were measured on.
+        let applies_exactly = edits_since.peek().is_none();
         let mut delta = 0;
         let adjusted_edits = diff.edits.into_iter().filter_map(|(range, new_text)| {
             while let Some(edit_since) = edits_since.peek() {
@@ -2355,8 +2359,14 @@ impl Buffer {
         });
 
         self.start_transaction();
-        self.text.set_line_ending(diff.line_ending);
         self.edit(adjusted_edits, None, cx);
+        if let Some(line_endings) = diff.line_endings {
+            if applies_exactly {
+                self.text.set_line_endings(line_endings);
+            } else {
+                self.text.set_line_ending(line_endings.first);
+            }
+        }
         self.end_transaction(cx)
     }
 

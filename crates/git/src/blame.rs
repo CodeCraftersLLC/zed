@@ -81,7 +81,9 @@ async fn run_git_blame(
         .context("failed to get stderr from git blame command")?;
 
     let write_stdin = async move {
-        for chunk in text::chunks_with_line_ending(contents, line_ending) {
+        for chunk in
+            text::chunks_with_line_endings(contents, &text::LineEndings::uniform(line_ending))
+        {
             stdin.write_all(chunk.as_bytes()).await?;
         }
         stdin.flush().await.map_err(Into::into)

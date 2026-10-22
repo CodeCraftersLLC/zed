@@ -1776,7 +1776,7 @@ async fn test_write_file(cx: &mut TestAppContext) {
             tree.write_file(
                 rel_path("tracked-dir/file.txt").into(),
                 "hello".into(),
-                Default::default(),
+                text::LineEnding::default(),
                 encoding_rs::UTF_8,
                 false,
                 cx,
@@ -1789,7 +1789,7 @@ async fn test_write_file(cx: &mut TestAppContext) {
             tree.write_file(
                 rel_path("ignored-dir/file.txt").into(),
                 "world".into(),
-                Default::default(),
+                text::LineEnding::default(),
                 encoding_rs::UTF_8,
                 false,
                 cx,
@@ -3220,7 +3220,7 @@ fn randomly_mutate_worktree(
                 let task = worktree.write_file(
                     entry.path.clone(),
                     "".into(),
-                    Default::default(),
+                    text::LineEnding::default(),
                     encoding_rs::UTF_8,
                     false,
                     cx,
@@ -4835,6 +4835,112 @@ async fn test_write_file_encoding(cx: &mut gpui::TestAppContext) {
             bytes, case.expected_bytes,
             "case '{}' mismatch. Expected {:?}, but got {:?}",
             case.name, case.expected_bytes, bytes
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_write_file_keeps_each_lines_ending(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    let root_path = if cfg!(windows) {
+        Path::new("C:\\root")
+    } else {
+        Path::new("/root")
+    };
+    fs.create_dir(root_path).await.unwrap();
+
+    let worktree = Worktree::local(
+        root_path,
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    let mixed = text::LineEndings {
+        first: text::LineEnding::Windows,
+        changes: vec![(2, text::LineEnding::Unix), (4, text::LineEnding::Mac)],
+    };
+    // Normalized text "a\nb\nc\nd": a is CRLF, b is LF, c and d's line are CR.
+    let cases: Vec<(
+        &str,
+        text::LineEndings,
+        &'static encoding_rs::Encoding,
+        bool,
+        Vec<u8>,
+    )> = vec![
+        (
+            "mixed UTF-8",
+            mixed.clone(),
+            encoding_rs::UTF_8,
+            false,
+            b"a\r\nb\nc\rd".to_vec(),
+        ),
+        (
+            "mixed UTF-8 with BOM",
+            mixed.clone(),
+            encoding_rs::UTF_8,
+            true,
+            b"\xEF\xBB\xBFa\r\nb\nc\rd".to_vec(),
+        ),
+        (
+            "mixed UTF-16LE",
+            mixed.clone(),
+            encoding_rs::UTF_16LE,
+            true,
+            vec![
+                0xFF, 0xFE, b'a', 0, b'\r', 0, b'\n', 0, b'b', 0, b'\n', 0, b'c', 0, b'\r', 0,
+                b'd', 0,
+            ],
+        ),
+        (
+            "mixed Windows-1252",
+            mixed.clone(),
+            encoding_rs::WINDOWS_1252,
+            false,
+            b"a\r\nb\nc\rd".to_vec(),
+        ),
+        (
+            "CR only",
+            text::LineEndings::uniform(text::LineEnding::Mac),
+            encoding_rs::UTF_8,
+            false,
+            b"a\rb\rc\rd".to_vec(),
+        ),
+    ];
+
+    for (i, (name, line_endings, encoding, has_bom, expected)) in cases.into_iter().enumerate() {
+        let file_name = format!("endings_{i}.txt");
+        let file_path = root_path.join(&file_name);
+        fs.insert_file(&file_path, "".into()).await;
+        let rel_path = RelPath::new(Path::new(&file_name), PathStyle::local())
+            .unwrap()
+            .into_arc();
+
+        worktree
+            .update(cx, |wt, cx| {
+                wt.write_file(
+                    rel_path,
+                    text::Rope::from("a\nb\nc\nd"),
+                    line_endings,
+                    encoding,
+                    has_bom,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs.load_bytes(&file_path).await.unwrap(),
+            expected,
+            "case '{name}'"
         );
     }
 }

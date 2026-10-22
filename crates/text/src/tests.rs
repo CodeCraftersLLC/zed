@@ -241,10 +241,7 @@ fn test_cr_only_text_keeps_its_line_ending() {
     assert_eq!(buffer.text(), "one\ntwo\nthree");
     assert_eq!(buffer.line_ending(), LineEnding::Mac);
     assert_eq!(LineEnding::Mac.label(), "CR");
-    assert_eq!(
-        chunks_with_line_ending(buffer.as_rope(), buffer.line_ending()).collect::<String>(),
-        "one\rtwo\rthree"
-    );
+    assert_eq!(text_with_line_endings(&buffer), "one\rtwo\rthree");
 }
 
 #[test]
@@ -1247,4 +1244,93 @@ fn test_line_endings_survive_undo() {
     buffer.undo();
     assert_eq!(buffer.text(), "one\ntwo\nthree\nfour\n");
     assert_eq!(buffer.line_endings(), before);
+}
+
+fn text_with_line_endings(buffer: &Buffer) -> String {
+    chunks_with_line_endings(buffer.as_rope(), &buffer.line_endings()).collect()
+}
+
+#[test]
+fn test_chunks_with_line_endings_restore_each_line_ending() {
+    let buffer = mixed_buffer();
+    assert_eq!(
+        text_with_line_endings(&buffer),
+        "one\r\ntwo\nthree\r\nfour\n"
+    );
+
+    let buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        "\r\n\r\rx\n\ny",
+    );
+    assert_eq!(text_with_line_endings(&buffer), "\r\n\r\rx\n\ny");
+
+    let empty = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
+    assert_eq!(text_with_line_endings(&empty), "");
+}
+
+#[gpui::test(iterations = 100)]
+fn test_mixed_line_endings_round_trip_and_survive_a_typed_character(mut rng: StdRng) {
+    let endings = [LineEnding::Unix, LineEnding::Windows, LineEnding::Mac];
+    let contents = ["", "abc", "é日本", "x y", "  ", "🍐✅"];
+    // Long inputs span several rope chunks, so a terminator can fall on a chunk boundary.
+    let line_count = if rng.random_bool(0.2) {
+        rng.random_range(100..800)
+    } else {
+        rng.random_range(1..12)
+    };
+    let mut lines: Vec<(String, Option<LineEnding>)> = Vec::new();
+    for ix in 0..line_count {
+        let mut content = contents[rng.random_range(0..contents.len())].to_string();
+        // A CR directly followed by an empty LF line would read back as a single CRLF.
+        if content.is_empty()
+            && lines
+                .last()
+                .is_some_and(|(_, e)| *e == Some(LineEnding::Mac))
+        {
+            content = "abc".to_string();
+        }
+        let is_last = ix == line_count - 1;
+        let ending = if is_last && rng.random_bool(0.5) {
+            None
+        } else if rng.random_bool(0.3) {
+            Some(endings[rng.random_range(0..endings.len())])
+        } else {
+            Some(endings[0])
+        };
+        lines.push((content, ending));
+    }
+    let render = |lines: &[(String, Option<LineEnding>)]| -> String {
+        lines
+            .iter()
+            .map(|(content, ending)| format!("{content}{}", ending.map_or("", |e| e.as_str())))
+            .collect()
+    };
+
+    let original = render(&lines);
+    let mut buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        original.clone(),
+    );
+    buffer.check_invariants();
+    assert_eq!(text_with_line_endings(&buffer), original);
+
+    let line_ix = rng.random_range(0..lines.len());
+    let boundaries: Vec<usize> = lines[line_ix]
+        .0
+        .char_indices()
+        .map(|(ix, _)| ix)
+        .chain([lines[line_ix].0.len()])
+        .collect();
+    let column = boundaries[rng.random_range(0..boundaries.len())];
+    let offset: usize = lines[..line_ix]
+        .iter()
+        .map(|(content, _)| content.len() + 1)
+        .sum::<usize>()
+        + column;
+    buffer.edit([(offset..offset, "Q")]);
+    lines[line_ix].0.insert(column, 'Q');
+    buffer.check_invariants();
+    assert_eq!(text_with_line_endings(&buffer), render(&lines));
 }

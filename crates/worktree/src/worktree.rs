@@ -68,7 +68,7 @@ use std::{
     time::{Duration, Instant},
 };
 use sum_tree::{Bias, Dimensions, Edit, KeyedItem, SeekTarget, SumTree, Summary, TreeMap, TreeSet};
-use text::{LineEnding, Rope};
+use text::{LineEndings, Rope, chunks_with_line_endings};
 use util::{
     ResultExt, maybe,
     paths::{PathMatcher, PathStyle, SanitizedPath, home_dir},
@@ -836,14 +836,14 @@ impl Worktree {
         &self,
         path: Arc<RelPath>,
         text: Rope,
-        line_ending: LineEnding,
+        line_endings: impl Into<LineEndings>,
         encoding: &'static Encoding,
         has_bom: bool,
         cx: &Context<Worktree>,
     ) -> Task<Result<Arc<File>>> {
         match self {
             Worktree::Local(this) => {
-                this.write_file(path, text, line_ending, encoding, has_bom, cx)
+                this.write_file(path, text, line_endings, encoding, has_bom, cx)
             }
             Worktree::Remote(_) => {
                 Task::ready(Err(anyhow!("remote worktree can't yet write files")))
@@ -1640,11 +1640,12 @@ impl LocalWorktree {
         &self,
         path: Arc<RelPath>,
         text: Rope,
-        line_ending: LineEnding,
+        line_endings: impl Into<LineEndings>,
         encoding: &'static Encoding,
         has_bom: bool,
         cx: &Context<Worktree>,
     ) -> Task<Result<Arc<File>>> {
+        let line_endings = line_endings.into();
         let fs = self.fs.clone();
         let is_private = self.is_path_private(&path);
         let abs_path = self.absolutize(&path);
@@ -1653,24 +1654,20 @@ impl LocalWorktree {
             let fs = fs.clone();
             let abs_path = abs_path.clone();
             async move {
-                // For UTF-8, use the optimized `fs.save` which writes Rope chunks directly to disk
-                // without allocating a contiguous string.
-                if encoding == encoding_rs::UTF_8 && !has_bom {
-                    return fs.save(&abs_path, &text, line_ending).await;
+                // For UTF-8 text whose lines all end alike, use the optimized `fs.save` which
+                // writes Rope chunks directly to disk without allocating a contiguous string.
+                if encoding == encoding_rs::UTF_8 && !has_bom && line_endings.is_uniform() {
+                    return fs.save(&abs_path, &text, line_endings.first).await;
                 }
 
-                // For legacy encodings (e.g. Shift-JIS), we fall back to converting the entire Rope
-                // to a String/Bytes in memory before writing.
+                // For legacy encodings (e.g. Shift-JIS) and for text that mixes line endings, we
+                // fall back to converting the entire Rope to a String/Bytes in memory before writing.
                 //
                 // Note: This is inefficient for very large files compared to the streaming approach above,
                 // but supporting streaming writes for arbitrary encodings would require a significant
                 // refactor of the `fs` crate to expose a Writer interface.
-                let text_string = text.to_string();
-                let normalized_text = match line_ending {
-                    LineEnding::Unix => text_string,
-                    LineEnding::Windows => text_string.replace('\n', "\r\n"),
-                    LineEnding::Mac => text_string.replace('\n', "\r"),
-                };
+                let normalized_text =
+                    chunks_with_line_endings(&text, &line_endings).collect::<String>();
 
                 // Create the byte vector manually for UTF-16 encodings because encoding_rs encodes to UTF-8 by default (per WHATWG standards),
                 //  which is not what we want for saving files.

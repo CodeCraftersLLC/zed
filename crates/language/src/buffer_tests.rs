@@ -146,6 +146,73 @@ fn test_set_line_ending(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_a_diff_to_mixed_text_installs_its_line_endings(cx: &mut TestAppContext) {
+    let buffer = cx.new(|cx| Buffer::local("a\nb\n", cx));
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.diff("a\r\nb\nc\r\n", cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.apply_diff(diff, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "a\nb\nc\n");
+        assert_eq!(
+            buffer.line_endings(),
+            LineEndings {
+                first: LineEnding::Windows,
+                changes: vec![(2, LineEnding::Unix), (4, LineEnding::Windows)],
+            }
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_a_diff_that_missed_an_edit_gives_one_line_ending(cx: &mut TestAppContext) {
+    let buffer = cx.new(|cx| Buffer::local("a\nb\n", cx));
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.diff("a\r\nb\nc\r\n", cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "x")], None, cx);
+        buffer.apply_diff(diff, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(
+            buffer.line_endings(),
+            LineEndings::uniform(LineEnding::Windows)
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_edits_that_do_not_come_from_the_text_keep_mixed_line_endings(
+    cx: &mut TestAppContext,
+) {
+    let buffer = cx.new(|cx| Buffer::local("a \r\nb\nc\r\n", cx));
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.remove_trailing_whitespace(cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.apply_diff(diff, cx);
+    });
+    let expected = LineEndings {
+        first: LineEnding::Windows,
+        changes: vec![(2, LineEnding::Unix), (4, LineEnding::Windows)],
+    };
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "a\nb\nc\n");
+        assert_eq!(buffer.line_endings(), expected);
+    });
+
+    buffer.update(cx, |buffer, cx| {
+        buffer.did_reload(buffer.version(), buffer.line_ending(), None, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.line_endings(), expected);
+    });
+}
+
+#[gpui::test]
 fn test_select_language(cx: &mut App) {
     init_settings(cx, |_| {});
 
