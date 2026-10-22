@@ -8,8 +8,8 @@ use ui::prelude::*;
 
 use crate::html::html_parser::{
     HtmlHighlightStyle, HtmlImage, HtmlParagraph, HtmlParagraphChunk, ParsedHtmlBlock,
-    ParsedHtmlElement, ParsedHtmlList, ParsedHtmlListItemType, ParsedHtmlTable, ParsedHtmlTableRow,
-    ParsedHtmlText,
+    ParsedHtmlDetails, ParsedHtmlElement, ParsedHtmlList, ParsedHtmlListItemType, ParsedHtmlTable,
+    ParsedHtmlTableRow, ParsedHtmlText,
 };
 use crate::{MarkdownElement, MarkdownElementBuilder};
 
@@ -138,6 +138,79 @@ impl MarkdownElement {
             ParsedHtmlElement::Image(image) => {
                 self.render_html_image(image, builder);
             }
+            ParsedHtmlElement::Details(details) => {
+                self.render_html_details(details, source_allocator, builder, markdown_end, cx);
+            }
+        }
+    }
+
+    /// The summary line of a `<details>`, which toggles it, and its body while it is open.
+    fn render_html_details(
+        &self,
+        details: &ParsedHtmlDetails,
+        source_allocator: &mut HtmlSourceAllocator,
+        builder: &mut MarkdownElementBuilder,
+        markdown_end: usize,
+        cx: &mut App,
+    ) {
+        let region = (details.source_range.start, details.ordinal);
+        let is_open = self.markdown.read(cx).is_details_open(region, details.open);
+        let markdown = self.markdown.clone();
+
+        builder.push_div(
+            h_flex()
+                .id(("html-details", region.0 * 64 + region.1))
+                .gap_1()
+                .items_start()
+                .mb_2()
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    markdown.update(cx, |markdown, cx| {
+                        markdown.toggle_details(region);
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(if is_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+                ),
+            &details.source_range,
+            markdown_end,
+        );
+        builder.push_div(
+            div().flex_1().min_w_0(),
+            &details.source_range,
+            markdown_end,
+        );
+        builder.push_text_style(TextStyleRefinement {
+            font_weight: Some(FontWeight::SEMIBOLD),
+            ..Default::default()
+        });
+        if details.summary.is_empty() {
+            let start = details.source_range.start;
+            builder.push_text("Details", start..start);
+        } else {
+            self.render_html_paragraph(
+                &details.summary,
+                source_allocator,
+                builder,
+                cx,
+                markdown_end,
+            );
+        }
+        builder.pop_text_style();
+        builder.pop_div();
+        builder.pop_div();
+
+        if is_open && !details.body.is_empty() {
+            builder.push_div(div().pl_5(), &details.source_range, markdown_end);
+            self.render_html_elements(&details.body, source_allocator, builder, markdown_end, cx);
+            builder.pop_div();
         }
     }
 
