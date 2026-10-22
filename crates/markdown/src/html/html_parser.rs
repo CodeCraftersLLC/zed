@@ -13,7 +13,7 @@ use markup5ever_rcdom::{Node, NodeData, RcDom};
 use pulldown_cmark::{Alignment, HeadingLevel};
 use stacksafe::stacksafe;
 
-use crate::details::details_tag_counts;
+use crate::details::details_balance;
 use crate::html::html_minifier::{Minifier, MinifierOptions};
 
 #[derive(Debug, Clone, Default)]
@@ -215,8 +215,8 @@ impl HtmlImage {
 #[derive(Debug)]
 struct ParseHtmlNodeContext {
     list_item_depth: u16,
-    /// Whether the block holds more `<details>` than `</details>`.
-    unclosed_details: bool,
+    /// Which `<details>` of the block, in the order they open, the block does not close.
+    unclosed_details: Vec<usize>,
     /// How many `<details>` elements have been parsed in the block so far.
     details_seen: Cell<usize>,
 }
@@ -225,7 +225,7 @@ impl Default for ParseHtmlNodeContext {
     fn default() -> Self {
         Self {
             list_item_depth: 1,
-            unclosed_details: false,
+            unclosed_details: Vec::new(),
             details_seen: Cell::new(0),
         }
     }
@@ -242,14 +242,13 @@ pub(crate) fn parse_html_block(
         .read_from(&mut cursor)
         .ok()?;
 
-    let (opened_details, closed_details) = details_tag_counts(source);
     let mut children = Vec::new();
     parse_html_node(
         source_range.clone(),
         &dom.document,
         &mut children,
         &ParseHtmlNodeContext {
-            unclosed_details: opened_details > closed_details,
+            unclosed_details: details_balance(source).unclosed,
             ..Default::default()
         },
     );
@@ -619,8 +618,7 @@ fn extract_html_details(
         open: attr_value(attrs, local_name!("open")).is_some(),
         summary,
         body,
-        // Only the first `<details>` of a block can be the one the block leaves open.
-        closed: ordinal != 0 || !context.unclosed_details,
+        closed: !context.unclosed_details.contains(&ordinal),
     }
 }
 

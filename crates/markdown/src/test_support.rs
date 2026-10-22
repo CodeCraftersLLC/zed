@@ -436,6 +436,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn each_details_of_one_block_toggles_its_own_body(cx: &mut TestAppContext) {
+        // One HTML block holds a complete `<details>` and one whose body follows in later blocks.
+        let source = "<details><summary>First</summary>inline</details>\n<details>\n<summary>Second</summary>\n\nsecond body\n\n</details>\n\nafter";
+        let (markdown, cx) = markdown_view(source, cx);
+
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(
+            text.contains("First") && text.contains("Second"),
+            "{text:?}"
+        );
+        assert!(
+            !text.contains("inline") && !text.contains("second body"),
+            "{text:?}"
+        );
+        assert!(text.contains("after"), "{text:?}");
+
+        markdown.update(cx, |markdown, _| markdown.toggle_details((0, 0)));
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(text.contains("inline"), "{text:?}");
+        assert!(!text.contains("second body"), "{text:?}");
+
+        markdown.update(cx, |markdown, _| markdown.toggle_details((0, 0)));
+        markdown.update(cx, |markdown, _| markdown.toggle_details((0, 1)));
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(text.contains("second body"), "{text:?}");
+        assert!(!text.contains("inline"), "{text:?}");
+    }
+
+    #[gpui::test]
     fn a_collapsed_nested_region_hides_the_inner_one(cx: &mut TestAppContext) {
         let source = "<details>\n<summary>A</summary>\n\n<details>\n<summary>B</summary>\n\ninner\n\n</details>\n\nouter body\n\n</details>\n\nafter";
         let (markdown, cx) = markdown_view(source, cx);

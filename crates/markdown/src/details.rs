@@ -16,25 +16,65 @@ pub(crate) struct DetailsSpan {
     pub hidden_events: Range<usize>,
 }
 
-/// Counts of `<details` and `</details` tags in an HTML block.
-pub(crate) fn details_tag_counts(html: &str) -> (usize, usize) {
-    let lowercase = html.to_ascii_lowercase();
-    let count_tags = |prefix: &str| {
-        lowercase
-            .match_indices(prefix)
-            .filter(|(ix, _)| {
-                lowercase[ix + prefix.len()..]
-                    .chars()
-                    .next()
-                    .is_none_or(|next| next.is_whitespace() || next == '>' || next == '/')
-            })
-            .count()
-    };
-    (count_tags("<details"), count_tags("</details"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetailsTag {
+    Open,
+    Close,
 }
 
-/// Pairs every HTML block that opens more `<details>` than it closes with the block that closes
-/// it. The key is the source offset of the opening block.
+/// The `<details` and `</details` tags of an HTML block, in source order.
+fn details_tags(html: &str) -> Vec<DetailsTag> {
+    let lowercase = html.to_ascii_lowercase();
+    lowercase
+        .match_indices('<')
+        .filter_map(|(ix, _)| {
+            let rest = &lowercase[ix..];
+            let (tag, name_len) = if rest.starts_with("<details") {
+                (DetailsTag::Open, "<details".len())
+            } else if rest.starts_with("</details") {
+                (DetailsTag::Close, "</details".len())
+            } else {
+                return None;
+            };
+            rest[name_len..]
+                .chars()
+                .next()
+                .is_none_or(|next| next.is_whitespace() || next == '>' || next == '/')
+                .then_some(tag)
+        })
+        .collect()
+}
+
+/// What an HTML block leaves open and what it closes of the blocks before it.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct DetailsBalance {
+    /// The `<details>` of the block, counted in the order they open, that it does not close.
+    pub unclosed: Vec<usize>,
+    /// How many `</details>` of the block close a `<details>` an earlier block opened.
+    pub closes_earlier: usize,
+}
+
+pub(crate) fn details_balance(html: &str) -> DetailsBalance {
+    let mut balance = DetailsBalance::default();
+    let mut opened = 0;
+    for tag in details_tags(html) {
+        match tag {
+            DetailsTag::Open => {
+                balance.unclosed.push(opened);
+                opened += 1;
+            }
+            DetailsTag::Close => {
+                if balance.unclosed.pop().is_none() {
+                    balance.closes_earlier += 1;
+                }
+            }
+        }
+    }
+    balance
+}
+
+/// Pairs every HTML block that leaves a `<details>` open with the block that closes it. The key is
+/// the source offset of the opening block.
 pub(crate) fn extract_details_spans(
     source: &str,
     events: &[(Range<usize>, MarkdownEvent)],
@@ -55,11 +95,8 @@ pub(crate) fn extract_details_spans(
             .position(|(_, event)| matches!(event, MarkdownEvent::End(MarkdownTagEnd::HtmlBlock)))
             .map_or(events.len() - 1, |offset| index + offset);
 
-        let (opens, closes) = details_tag_counts(&source[range.clone()]);
-        for _ in closes..opens {
-            open.push((range.start, block_end));
-        }
-        for _ in opens..closes {
+        let balance = details_balance(&source[range.clone()]);
+        for _ in 0..balance.closes_earlier {
             if let Some((start, opener_end)) = open.pop() {
                 spans.insert(
                     start,
@@ -68,6 +105,9 @@ pub(crate) fn extract_details_spans(
                     },
                 );
             }
+        }
+        for _ in &balance.unclosed {
+            open.push((range.start, block_end));
         }
         index = block_end + 1;
     }
@@ -85,12 +125,41 @@ mod tests {
         extract_details_spans(source, &parsed.events)
     }
 
+    fn balance(unclosed: &[usize], closes_earlier: usize) -> DetailsBalance {
+        DetailsBalance {
+            unclosed: unclosed.to_vec(),
+            closes_earlier,
+        }
+    }
+
     #[test]
-    fn counts_tags_not_prefixes() {
-        assert_eq!(details_tag_counts("<details><summary>S</summary>"), (1, 0));
-        assert_eq!(details_tag_counts("</details>"), (0, 1));
-        assert_eq!(details_tag_counts("<DETAILS open>x</Details>"), (1, 1));
-        assert_eq!(details_tag_counts("<detailsx>"), (0, 0));
+    fn tags_are_matched_by_name_not_prefix() {
+        assert_eq!(details_balance("<detailsx></detailsx>"), balance(&[], 0));
+        assert_eq!(
+            details_balance("<DETAILS open>x</Details>"),
+            balance(&[], 0)
+        );
+    }
+
+    #[test]
+    fn the_unclosed_details_of_a_block_are_the_ones_without_a_closing_tag() {
+        assert_eq!(
+            details_balance("<details><summary>S</summary>"),
+            balance(&[0], 0)
+        );
+        assert_eq!(details_balance("<details>x</details>"), balance(&[], 0));
+        // The second opens after the first is closed.
+        assert_eq!(
+            details_balance("<details>a</details>\n<details>\n<summary>S</summary>"),
+            balance(&[1], 0)
+        );
+        assert_eq!(
+            details_balance("<details><details>x</details>"),
+            balance(&[0], 0)
+        );
+        assert_eq!(details_balance("<details><details>x"), balance(&[0, 1], 0));
+        // A closing tag for a region an earlier block opened closes nothing in this one.
+        assert_eq!(details_balance("</details>\n<details>"), balance(&[0], 1));
     }
 
     #[test]
@@ -109,6 +178,17 @@ mod tests {
         assert_eq!(
             source[parsed.events[hidden.end].0.clone()].trim_end(),
             "</details>"
+        );
+    }
+
+    #[test]
+    fn a_block_that_closes_one_region_and_opens_another_pairs_both() {
+        let source = "<details>\n<summary>A</summary>\n\nbody A\n\n</details>\n<details>\n<summary>B</summary>\n\nbody B\n\n</details>";
+        let spans = spans(source);
+        let second_opening = source.find("</details>\n<details>").unwrap();
+        assert_eq!(
+            spans.keys().copied().collect::<Vec<_>>(),
+            [0, second_opening]
         );
     }
 
