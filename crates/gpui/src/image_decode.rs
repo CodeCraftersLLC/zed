@@ -5,7 +5,7 @@ use image::{
     DynamicImage, ExtendedColorType, ImageDecoder as _, ImageFormat, ImageReader, ImageResult,
     Limits, metadata::Orientation,
 };
-use std::io::Cursor;
+use std::{borrow::Cow, io::Cursor};
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
@@ -22,7 +22,8 @@ pub struct ImageHeader {
 
 /// Reads the header of `bytes` as `format`. An unreadable orientation tag is treated as "upright".
 pub fn image_header(bytes: &[u8], format: ImageFormat) -> ImageResult<ImageHeader> {
-    let mut decoder = ImageReader::with_format(Cursor::new(bytes), format).into_decoder()?;
+    let bytes = single_ico_entry(bytes, format);
+    let mut decoder = ImageReader::with_format(Cursor::new(&*bytes), format).into_decoder()?;
     let (width, height) = decoder.dimensions();
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let (width, height) = if swaps_axes(orientation) {
@@ -39,18 +40,21 @@ pub fn image_header(bytes: &[u8], format: ImageFormat) -> ImageResult<ImageHeade
 
 /// Decodes `bytes` as `format` within `limits`, upright according to its EXIF orientation.
 ///
-/// An ICO file whose largest entry is a PNG that is not RGBA, which the `image` crate refuses,
-/// is decoded from that entry.
+/// An ICO file is decoded from its largest entry, which is also the entry shown when that is a
+/// PNG that is not RGBA, which the `image` crate refuses.
 pub fn decode_image(
     bytes: &[u8],
     format: ImageFormat,
     limits: Limits,
 ) -> ImageResult<DynamicImage> {
-    match decode_oriented(bytes, format, limits.clone()) {
-        Err(error) if format == ImageFormat::Ico => match largest_png_entry(bytes) {
-            Some(png) => decode_oriented(png, ImageFormat::Png, limits)
-                .map(|image| DynamicImage::ImageRgba8(image.into_rgba8())),
-            None => Err(error),
+    let bytes = single_ico_entry(bytes, format);
+    match decode_oriented(&bytes, format, limits.clone()) {
+        Err(error) if format == ImageFormat::Ico => match best_ico_entry(&bytes) {
+            Some(entry) if entry.payload.starts_with(PNG_SIGNATURE) => {
+                decode_oriented(entry.payload, ImageFormat::Png, limits)
+                    .map(|image| DynamicImage::ImageRgba8(image.into_rgba8()))
+            }
+            _ => Err(error),
         },
         result => result,
     }
@@ -83,30 +87,61 @@ fn swaps_axes(orientation: Orientation) -> bool {
     )
 }
 
-/// The PNG payload of the entry an ICO viewer would show: the one with the greatest bit depth,
-/// and among those the greatest area. `None` when that entry is not a PNG.
-fn largest_png_entry(ico: &[u8]) -> Option<&[u8]> {
+struct IcoEntry<'a> {
+    directory_entry: &'a [u8],
+    payload: &'a [u8],
+}
+
+/// The entry an ICO viewer would show: the one with the greatest area, and among those the
+/// greatest bit depth. `None` when the file has no entry that lies within it.
+fn best_ico_entry(ico: &[u8]) -> Option<IcoEntry<'_>> {
     const HEADER_LEN: usize = 6;
-    const ENTRY_LEN: usize = 16;
     if ico.get(..4)? != [0, 0, 1, 0] {
         return None;
     }
     let count = usize::from(u16::from_le_bytes([*ico.get(4)?, *ico.get(5)?]));
-    let best = (0..count)
+    (0..count)
         .filter_map(|ix| {
-            let start = HEADER_LEN + ix * ENTRY_LEN;
-            let entry = ico.get(start..start + ENTRY_LEN)?;
+            let start = HEADER_LEN + ix * ICO_ENTRY_LEN;
+            let directory_entry = ico.get(start..start + ICO_ENTRY_LEN)?;
             // A stored size of 0 means 256.
             let side = |stored: u8| if stored == 0 { 256 } else { u32::from(stored) };
-            let area = side(entry[0]) * side(entry[1]);
-            let bit_count = u16::from_le_bytes([entry[6], entry[7]]);
-            let len = u32::from_le_bytes(entry[8..12].try_into().ok()?) as usize;
-            let offset = u32::from_le_bytes(entry[12..16].try_into().ok()?) as usize;
+            let area = side(directory_entry[0]) * side(directory_entry[1]);
+            let bit_count = u16::from_le_bytes([directory_entry[6], directory_entry[7]]);
+            let len = u32::from_le_bytes(directory_entry[8..12].try_into().ok()?) as usize;
+            let offset = u32::from_le_bytes(directory_entry[12..16].try_into().ok()?) as usize;
             let payload = ico.get(offset..offset.checked_add(len)?)?;
-            Some(((bit_count, area), payload))
+            Some((
+                (area, bit_count),
+                IcoEntry {
+                    directory_entry,
+                    payload,
+                },
+            ))
         })
-        .max_by_key(|(score, _)| *score)?;
-    best.1.starts_with(PNG_SIGNATURE).then_some(best.1)
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, entry)| entry)
+}
+
+const ICO_ENTRY_LEN: usize = 16;
+
+/// `bytes` as a directory holding only the entry [`best_ico_entry`] picks when it is an ICO: the
+/// `image` crate would pick the entry with the greatest bit depth first, which shows a 16 x 16
+/// icon with an alpha channel rather than a 256 x 256 one without.
+fn single_ico_entry(bytes: &[u8], format: ImageFormat) -> Cow<'_, [u8]> {
+    const SINGLE_ENTRY_PAYLOAD_OFFSET: u32 = 6 + ICO_ENTRY_LEN as u32;
+    if format != ImageFormat::Ico {
+        return Cow::Borrowed(bytes);
+    }
+    let Some(entry) = best_ico_entry(bytes) else {
+        return Cow::Borrowed(bytes);
+    };
+    let mut single = Vec::with_capacity(SINGLE_ENTRY_PAYLOAD_OFFSET as usize + entry.payload.len());
+    single.extend([0, 0, 1, 0, 1, 0]);
+    single.extend(&entry.directory_entry[..12]);
+    single.extend(SINGLE_ENTRY_PAYLOAD_OFFSET.to_le_bytes());
+    single.extend(entry.payload);
+    Cow::Owned(single)
 }
 
 #[cfg(test)]
@@ -173,7 +208,10 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use image::{ImageEncoder as _, Rgb, RgbImage, codecs::jpeg::JpegEncoder};
+    use image::{
+        ImageEncoder as _, Rgb, RgbImage,
+        codecs::{jpeg::JpegEncoder, png::PngEncoder},
+    };
 
     #[test]
     fn an_ico_whose_png_entry_is_rgb_decodes() {
@@ -199,6 +237,48 @@ mod tests {
         let ico = ico_with(&[(16, 16, 24, &small), (48, 48, 24, &large)]);
         let decoded = decode_image(&ico, ImageFormat::Ico, Limits::default()).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (48, 48));
+    }
+
+    fn rgba_png(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(width, height, image::Rgba(color));
+        let mut bytes = Vec::new();
+        PngEncoder::new(&mut bytes)
+            .write_image(image.as_raw(), width, height, ExtendedColorType::Rgba8)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn an_ico_shows_its_largest_entry_not_its_deepest() {
+        let small_with_alpha = rgba_png(16, 16, [1, 2, 3, 255]);
+        let large_without_alpha = png(&RgbImage::from_pixel(256, 256, Rgb([9, 8, 7])), None);
+        // A stored size of 0 means 256.
+        let ico = ico_with(&[
+            (16, 16, 32, &small_with_alpha),
+            (0, 0, 24, &large_without_alpha),
+        ]);
+
+        let by_image_crate = image::load_from_memory_with_format(&ico, ImageFormat::Ico).unwrap();
+        assert_eq!(
+            by_image_crate.width(),
+            16,
+            "the image crate ranks bit depth before area"
+        );
+
+        let decoded = decode_image(&ico, ImageFormat::Ico, Limits::default()).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (256, 256));
+        assert_eq!(decoded.to_rgba8().get_pixel(5, 5).0, [9, 8, 7, 255]);
+        let header = image_header(&ico, ImageFormat::Ico).unwrap();
+        assert_eq!((header.width, header.height), (256, 256));
+    }
+
+    #[test]
+    fn an_ico_prefers_the_deeper_of_two_entries_of_the_same_size() {
+        let shallow = rgba_png(32, 32, [1, 1, 1, 255]);
+        let deep = rgba_png(32, 32, [2, 2, 2, 255]);
+        let ico = ico_with(&[(32, 32, 24, &shallow), (32, 32, 32, &deep)]);
+        let decoded = decode_image(&ico, ImageFormat::Ico, Limits::default()).unwrap();
+        assert_eq!(decoded.to_rgba8().get_pixel(0, 0).0, [2, 2, 2, 255]);
     }
 
     #[test]
