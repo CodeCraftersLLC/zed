@@ -283,6 +283,49 @@ pub trait PlatformDisplay: Debug {
     }
 }
 
+/// What a platform's frame pump knows about a window before it wakes it for a vsync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowPresence {
+    /// The window is minimised to the taskbar or dock.
+    pub minimized: bool,
+    /// The window is shown on screen, as opposed to hidden.
+    pub visible: bool,
+}
+
+impl WindowPresence {
+    /// Whether a vsync should ask the window for a frame. A minimised or hidden
+    /// window shows the user nothing, so waking it only burns CPU; the first vsync
+    /// after it is shown or restored draws it again.
+    pub fn should_present(self) -> bool {
+        self.visible && !self.minimized
+    }
+}
+
+#[cfg(test)]
+mod window_presence_tests {
+    use super::WindowPresence;
+
+    fn presence(minimized: bool, visible: bool) -> WindowPresence {
+        WindowPresence { minimized, visible }
+    }
+
+    #[test]
+    fn a_shown_window_is_presented() {
+        assert!(presence(false, true).should_present());
+    }
+
+    #[test]
+    fn a_minimised_window_is_left_alone() {
+        assert!(!presence(true, true).should_present());
+    }
+
+    #[test]
+    fn a_hidden_window_is_left_alone() {
+        assert!(!presence(false, false).should_present());
+        assert!(!presence(true, false).should_present());
+    }
+}
+
 /// Thermal state of the system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThermalState {
