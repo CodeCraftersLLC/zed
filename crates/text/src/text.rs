@@ -3649,12 +3649,6 @@ pub struct LineEndings {
     pub changes: Vec<(usize, LineEnding)>,
 }
 
-impl From<LineEnding> for LineEndings {
-    fn from(ending: LineEnding) -> Self {
-        Self::uniform(ending)
-    }
-}
-
 impl LineEndings {
     /// Every line uses `ending`.
     pub fn uniform(ending: LineEnding) -> Self {
@@ -3666,6 +3660,17 @@ impl LineEndings {
 
     pub fn is_uniform(&self) -> bool {
         self.changes.is_empty()
+    }
+
+    /// The endings of the lines in `range`, with offsets relative to its start.
+    pub fn slice(&self, range: Range<usize>) -> LineEndings {
+        let mut sliced = LineEndings::uniform(self.ending_at(range.start));
+        for &(start, ending) in &self.changes {
+            if start > range.start && start < range.end {
+                sliced.push_change(start - range.start, ending);
+            }
+        }
+        sliced
     }
 
     /// The ending of the line that holds `offset`.

@@ -1776,7 +1776,7 @@ async fn test_write_file(cx: &mut TestAppContext) {
             tree.write_file(
                 rel_path("tracked-dir/file.txt").into(),
                 "hello".into(),
-                text::LineEnding::default(),
+                text::LineEndings::uniform(text::LineEnding::default()),
                 encoding_rs::UTF_8,
                 false,
                 cx,
@@ -1789,7 +1789,7 @@ async fn test_write_file(cx: &mut TestAppContext) {
             tree.write_file(
                 rel_path("ignored-dir/file.txt").into(),
                 "world".into(),
-                text::LineEnding::default(),
+                text::LineEndings::uniform(text::LineEnding::default()),
                 encoding_rs::UTF_8,
                 false,
                 cx,
@@ -3220,7 +3220,7 @@ fn randomly_mutate_worktree(
                 let task = worktree.write_file(
                     entry.path.clone(),
                     "".into(),
-                    text::LineEnding::default(),
+                    text::LineEndings::uniform(text::LineEnding::default()),
                     encoding_rs::UTF_8,
                     false,
                     cx,
@@ -4818,7 +4818,7 @@ async fn test_write_file_encoding(cx: &mut gpui::TestAppContext) {
             wt.write_file(
                 rel_path,
                 text,
-                text::LineEnding::Unix,
+                text::LineEndings::uniform(text::LineEnding::Unix),
                 case.encoding,
                 case.has_bom,
                 cx,

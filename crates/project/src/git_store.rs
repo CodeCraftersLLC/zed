@@ -1555,7 +1555,16 @@ impl GitStore {
             Some(version) => buffer.rope_for_version(version),
             None => buffer.as_rope().clone(),
         };
-        let line_ending = buffer.line_ending();
+        // The layout indexes the buffer's current text, so it describes `content` only when that is
+        // the text blamed.
+        let line_endings = if version
+            .as_ref()
+            .is_none_or(|version| *version == buffer.version())
+        {
+            buffer.line_endings()
+        } else {
+            text::LineEndings::uniform(buffer.line_ending())
+        };
         let version = version.unwrap_or(buffer.version());
         let buffer_id = buffer.remote_id();
 
@@ -1567,7 +1576,7 @@ impl GitStore {
                 .map_err(|err| anyhow::anyhow!(err))?;
             match repository_state {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
-                    .blame(repo_path.clone(), content, line_ending)
+                    .blame(repo_path.clone(), content, line_endings)
                     .await
                     .with_context(|| format!("Failed to blame {:?}", repo_path.as_ref()))
                     .map(Some),

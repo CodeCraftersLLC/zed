@@ -27,7 +27,7 @@ use ignore::gitignore::GitignoreBuilder;
 use parking_lot::Mutex;
 use rope::Rope;
 use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool, time::SystemTime};
-use text::LineEnding;
+use text::LineEndings;
 use util::{paths::PathStyle, rel_path::RelPath};
 
 #[derive(Clone)]
@@ -953,7 +953,7 @@ impl GitRepository for FakeGitRepository {
         &self,
         path: RepoPath,
         _content: Rope,
-        _line_ending: LineEnding,
+        _line_endings: LineEndings,
     ) -> BoxFuture<'_, Result<git::blame::Blame>> {
         self.with_state_async(false, move |state| {
             state

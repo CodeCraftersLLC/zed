@@ -362,13 +362,15 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
                 let Some(range) = range.buffer_range(vim, editor, window, cx).ok() else {
                     return;
                 };
-                let Some((line_ending, encoding, has_bom, text, whole_buffer)) = editor.buffer().update(cx, |multi, cx| {
+                let Some((line_endings, encoding, has_bom, text, whole_buffer)) = editor.buffer().update(cx, |multi, cx| {
                     Some(multi.as_singleton()?.update(cx, |buffer, _| {
+                        let text = buffer.as_rope().slice_rows(range.start.0..range.end.0 + 1);
+                        let start = buffer.point_to_offset(Point::new(range.start.0, 0));
                         (
-                            buffer.line_ending(),
+                            buffer.line_endings().slice(start..start + text.len()),
                             buffer.encoding(),
                             buffer.has_bom(),
-                            buffer.as_rope().slice_rows(range.start.0..range.end.0 + 1),
+                            text,
                             range.start.0 == 0 && range.end.0 + 1 >= buffer.row_count(),
                         )
                     }))
@@ -463,7 +465,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
                                     return;
                                 };
                                 worktree
-                                    .write_file(path.into_arc(), text.clone(), line_ending, encoding, has_bom, cx)
+                                    .write_file(path.into_arc(), text.clone(), line_endings.clone(), encoding, has_bom, cx)
                                     .detach_and_prompt_err("Failed to write lines", window, cx, |_, _, _| None);
                             });
                         })
@@ -3074,6 +3076,47 @@ mod test {
                 cx,
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_command_write_range_keeps_each_lines_ending(cx: &mut TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        let fs = cx.workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+
+        cx.set_state(
+            indoc! {"
+                    The quick
+                    brown« fox
+                    jumpsˇ» over
+                    the lazy dog
+                "},
+            Mode::Visual,
+        );
+        // The same text, whose lines end CRLF, LF, CRLF, LF.
+        let buffer = cx
+            .update_editor(|editor, _, cx| editor.buffer().read(cx).as_singleton())
+            .unwrap();
+        let diff = cx
+            .update_editor(|_, _, cx| {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.diff("The quick\r\nbrown fox\njumps over\r\nthe lazy dog\n", cx)
+                })
+            })
+            .await;
+        cx.update_editor(|_, _, cx| {
+            buffer.update(cx, |buffer, cx| buffer.apply_diff(diff, cx));
+        });
+
+        cx.simulate_keystrokes(": w space dir/other.rs");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert_eq!(
+            fs.load(Path::new(path!("/root/dir/other.rs")))
+                .await
+                .unwrap(),
+            "brown fox\njumps over\r\n"
+        );
     }
 
     #[gpui::test]

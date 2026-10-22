@@ -1141,6 +1141,36 @@ fn test_ending_at_finds_the_ending_of_the_line_holding_an_offset() {
 }
 
 #[test]
+fn test_slicing_line_endings_keeps_the_endings_of_the_lines_inside() {
+    // "a\nb\nc\nd\n" as CRLF, LF, CRLF, LF.
+    let endings = LineEndings {
+        first: LineEnding::Windows,
+        changes: vec![
+            (2, LineEnding::Unix),
+            (4, LineEnding::Windows),
+            (6, LineEnding::Unix),
+        ],
+    };
+    // Lines `b` and `c`.
+    assert_eq!(
+        endings.slice(2..6),
+        LineEndings {
+            first: LineEnding::Unix,
+            changes: vec![(2, LineEnding::Windows)],
+        }
+    );
+    assert_eq!(
+        endings.slice(4..8),
+        LineEndings {
+            first: LineEnding::Windows,
+            changes: vec![(2, LineEnding::Unix)],
+        }
+    );
+    assert_eq!(endings.slice(0..8), endings);
+    assert_eq!(endings.slice(2..4), LineEndings::uniform(LineEnding::Unix));
+}
+
+#[test]
 fn test_overriding_lines_changes_only_those_lines() {
     // Three lines of "a\nb\nc\n", all CRLF.
     let windows = LineEndings::uniform(LineEnding::Windows);

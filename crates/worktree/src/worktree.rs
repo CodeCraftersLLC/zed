@@ -836,7 +836,7 @@ impl Worktree {
         &self,
         path: Arc<RelPath>,
         text: Rope,
-        line_endings: impl Into<LineEndings>,
+        line_endings: LineEndings,
         encoding: &'static Encoding,
         has_bom: bool,
         cx: &Context<Worktree>,
@@ -1640,12 +1640,11 @@ impl LocalWorktree {
         &self,
         path: Arc<RelPath>,
         text: Rope,
-        line_endings: impl Into<LineEndings>,
+        line_endings: LineEndings,
         encoding: &'static Encoding,
         has_bom: bool,
         cx: &Context<Worktree>,
     ) -> Task<Result<Arc<File>>> {
-        let line_endings = line_endings.into();
         let fs = self.fs.clone();
         let is_private = self.is_path_private(&path);
         let abs_path = self.absolutize(&path);

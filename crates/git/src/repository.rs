@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use smallvec::SmallVec;
 use smol::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use text::LineEnding;
+use text::LineEndings;
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -917,7 +917,7 @@ pub trait GitRepository: Send + Sync {
         &self,
         path: RepoPath,
         content: Rope,
-        line_ending: LineEnding,
+        line_endings: LineEndings,
     ) -> BoxFuture<'_, Result<crate::blame::Blame>>;
 
     /// Returns the absolute path to the repository. For worktrees, this will be the path to the
@@ -2208,14 +2208,14 @@ impl GitRepository for RealGitRepository {
         &self,
         path: RepoPath,
         content: Rope,
-        line_ending: LineEnding,
+        line_endings: LineEndings,
     ) -> BoxFuture<'_, Result<crate::blame::Blame>> {
         let git = self.git_binary_in_worktree();
 
         self.executor
             .spawn(async move {
                 let git = git?;
-                crate::blame::Blame::for_path(&git, &path, &content, line_ending).await
+                crate::blame::Blame::for_path(&git, &path, &content, &line_endings).await
             })
             .boxed()
     }
@@ -3978,6 +3978,56 @@ mod tests {
         assert!(repository.check_access().await.is_err());
         git_init_repo(repo_dir.path());
         assert!(repository.check_access().await.is_ok());
+    }
+
+    #[gpui::test]
+    async fn test_blame_sends_each_line_with_its_own_ending(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let committed = "one\r\ntwo\nthree\r\n";
+        fs::write(repo_dir.path().join("mixed.txt"), committed).unwrap();
+        git_command(repo_dir.path(), ["add", "mixed.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "mixed"]);
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let mut normalized = committed.to_string();
+        let line_endings = text::LineEnding::normalize_with_endings(&mut normalized);
+        let content = Rope::from(normalized.as_str());
+
+        let committed_rows = |blame: &crate::blame::Blame| {
+            blame
+                .entries
+                .iter()
+                .map(|entry| entry.range.end - entry.range.start)
+                .sum::<u32>()
+        };
+
+        let blame = repository
+            .blame(repo_path("mixed.txt"), content.clone(), line_endings)
+            .await
+            .unwrap();
+        assert_eq!(committed_rows(&blame), 3);
+
+        // With one ending for every line the middle line differs from what was committed, so git
+        // blames it on no commit.
+        let blame = repository
+            .blame(
+                repo_path("mixed.txt"),
+                content,
+                LineEndings::uniform(text::LineEnding::Windows),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed_rows(&blame), 2);
     }
 
     #[gpui::test]
