@@ -23,9 +23,12 @@ pub fn deserialize_line_ending(message: proto::LineEnding) -> text::LineEnding {
 }
 
 /// Serializes a [`text::LineEnding`] to be sent over RPC.
+///
+/// The wire format knows only LF and CRLF, so a CR-only buffer is shared as LF; collaboration
+/// replicas never write the file, so the local replica still saves its CR endings.
 pub fn serialize_line_ending(message: text::LineEnding) -> proto::LineEnding {
     match message {
-        text::LineEnding::Unix => proto::LineEnding::Unix,
+        text::LineEnding::Unix | text::LineEnding::Mac => proto::LineEnding::Unix,
         text::LineEnding::Windows => proto::LineEnding::Windows,
     }
 }

@@ -1669,6 +1669,7 @@ impl LocalWorktree {
                 let normalized_text = match line_ending {
                     LineEnding::Unix => text_string,
                     LineEnding::Windows => text_string.replace('\n', "\r\n"),
+                    LineEnding::Mac => text_string.replace('\n', "\r"),
                 };
 
                 // Create the byte vector manually for UTF-16 encodings because encoding_rs encodes to UTF-8 by default (per WHATWG standards),

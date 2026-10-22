@@ -215,6 +215,39 @@ fn test_line_endings() {
 }
 
 #[test]
+fn test_line_ending_detection_reads_the_whole_text() {
+    assert_eq!(LineEnding::detect("a\rb\rc"), LineEnding::Mac);
+    assert_eq!(LineEnding::detect("a\r\nb"), LineEnding::Windows);
+    assert_eq!(LineEnding::detect("a\nb\r\nc"), LineEnding::Unix);
+    assert_eq!(LineEnding::detect("no terminator"), LineEnding::default());
+    // A first line longer than any sampling window must not hide the ending.
+    assert_eq!(
+        LineEnding::detect(&format!("{}\r\nb", "x".repeat(5000))),
+        LineEnding::Windows
+    );
+    assert_eq!(
+        LineEnding::detect(&format!("{}\rb", "é".repeat(5000))),
+        LineEnding::Mac
+    );
+}
+
+#[test]
+fn test_cr_only_text_keeps_its_line_ending() {
+    let buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        "one\rtwo\rthree",
+    );
+    assert_eq!(buffer.text(), "one\ntwo\nthree");
+    assert_eq!(buffer.line_ending(), LineEnding::Mac);
+    assert_eq!(LineEnding::Mac.label(), "CR");
+    assert_eq!(
+        chunks_with_line_ending(buffer.as_rope(), buffer.line_ending()).collect::<String>(),
+        "one\rtwo\rthree"
+    );
+}
+
+#[test]
 fn test_line_len() {
     let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
     buffer.edit([(0..0, "abcd\nefg\nhij")]);

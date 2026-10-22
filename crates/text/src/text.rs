@@ -3574,10 +3574,14 @@ impl FromAnchor for usize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineEnding {
+    /// `\n`
     Unix,
+    /// `\r\n`
     Windows,
+    /// `\r`, the terminator of classic Mac OS text files.
+    Mac,
 }
 
 impl Default for LineEnding {
@@ -3595,6 +3599,7 @@ impl LineEnding {
         match self {
             LineEnding::Unix => "\n",
             LineEnding::Windows => "\r\n",
+            LineEnding::Mac => "\r",
         }
     }
 
@@ -3602,23 +3607,19 @@ impl LineEnding {
         match self {
             LineEnding::Unix => "LF",
             LineEnding::Windows => "CRLF",
+            LineEnding::Mac => "CR",
         }
     }
 
+    /// The ending of the first line terminator in `text`, wherever it is; the platform default
+    /// when the text has none.
     pub fn detect(text: &str) -> Self {
-        let mut max_ix = cmp::min(text.len(), 1000);
-        while !text.is_char_boundary(max_ix) {
-            max_ix -= 1;
-        }
-
-        if let Some(ix) = text[..max_ix].find(['\n']) {
-            if ix > 0 && text.as_bytes()[ix - 1] == b'\r' {
-                Self::Windows
-            } else {
-                Self::Unix
-            }
-        } else {
-            Self::default()
+        let bytes = text.as_bytes();
+        match bytes.iter().position(|byte| matches!(byte, b'\r' | b'\n')) {
+            Some(ix) if bytes[ix] == b'\n' => Self::Unix,
+            Some(ix) if bytes.get(ix + 1) == Some(&b'\n') => Self::Windows,
+            Some(_) => Self::Mac,
+            None => Self::default(),
         }
     }
 
