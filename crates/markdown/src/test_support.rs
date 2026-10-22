@@ -1,6 +1,8 @@
 //! Helpers for tests that need to know what a Markdown view shows.
 
-use std::{cell::RefCell, ops::Range, rc::Rc};
+#[cfg(test)]
+use std::ops::Range;
+use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
     App, AppContext as _, Element, ElementId, Entity, GlobalElementId, Hitbox, InspectorElementId,
@@ -17,6 +19,7 @@ use crate::{
 pub(crate) struct Shown {
     pub lines: Vec<String>,
     /// The destination and source range of each link.
+    #[cfg(test)]
     pub links: Vec<(String, Range<usize>)>,
 }
 
@@ -95,6 +98,7 @@ impl Element for RecordingMarkdown {
                 .iter()
                 .map(|line| line.layout.wrapped_text())
                 .collect(),
+            #[cfg(test)]
             links: text
                 .links
                 .iter()
