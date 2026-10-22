@@ -13416,6 +13416,12 @@ async fn test_saving_changes_only_the_typed_character(cx: &mut gpui::TestAppCont
         ascii("no newline", b"one two"),
         ascii("one nul byte", b"text before\0text after"),
         Case {
+            name: "lf behind a 1500 byte first line",
+            bytes: format!("{long_line}\nsecond\n").into_bytes(),
+            text_start: 0,
+            typed: b"X".to_vec(),
+        },
+        Case {
             name: "crlf behind a 1500 byte first line",
             bytes: format!("{long_line}\r\nsecond\r\n").into_bytes(),
             text_start: 0,
