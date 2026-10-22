@@ -139,6 +139,10 @@ impl EditorconfigStore {
         Ok(())
     }
 
+    pub(crate) fn worktree_ids(&self) -> Vec<WorktreeId> {
+        self.worktree_state.keys().copied().collect()
+    }
+
     pub(crate) fn remove_for_worktree(&mut self, root_id: WorktreeId) {
         self.local_external_config_discovery_tasks.remove(&root_id);
         let Some(removed) = self.worktree_state.remove(&root_id) else {

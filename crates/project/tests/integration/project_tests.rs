@@ -341,6 +341,147 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
     assert_eq!(Some(settings_readme.tab_size), NonZeroU32::new(8));
 }
 
+/// Saves `a.txt` of a cloned repository after typing "X" at its start, the way an embedder
+/// that never rewrites files does. Returns the bytes that reached the disk and whether the
+/// external formatter the repository asked for ran.
+#[cfg(unix)]
+async fn save_in_cloned_repo(
+    cx: &mut gpui::TestAppContext,
+    repo_files: impl FnOnce(&Path) -> serde_json::Value,
+    ignore_local_settings: bool,
+) -> (String, bool) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "format_on_save": "off",
+                        "remove_trailing_whitespace_on_save": false,
+                        "ensure_final_newline_on_save": false
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+            store.set_ignore_local_settings(ignore_local_settings, cx);
+        });
+    });
+
+    let marker_dir = TempTree::new(json!({}));
+    let marker = marker_dir.path().join("formatter-ran");
+    let mut files = repo_files(&marker);
+    files["a.txt"] = json!("one  \ntwo  ");
+    let repo = TempTree::new(files);
+    let project = Project::test(
+        Arc::new(RealFs::new(None, cx.executor())),
+        [repo.path()],
+        cx,
+    )
+    .await;
+    cx.executor().run_until_parked();
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("a.txt")), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "X")], None, cx));
+    project
+        .update(cx, |project, cx| {
+            project.format(
+                HashSet::from_iter([buffer.clone()]),
+                project::lsp_store::LspFormatTarget::Buffers,
+                false,
+                project::lsp_store::FormatTrigger::Save,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    project
+        .update(cx, |project, cx| project.save_buffer(buffer, cx))
+        .await
+        .unwrap();
+
+    let saved = std::fs::read_to_string(repo.path().join("a.txt")).unwrap();
+    (saved, marker.exists())
+}
+
+#[cfg(unix)]
+fn zed_settings_asking_for_an_external_formatter(marker: &Path) -> serde_json::Value {
+    json!({
+        ".zed": {
+            "settings.json": json!({
+                "format_on_save": "on",
+                "remove_trailing_whitespace_on_save": true,
+                "ensure_final_newline_on_save": true,
+                "formatter": {
+                    "external": {
+                        "command": "sh",
+                        "arguments": ["-c", "touch \"$0\"; cat", marker],
+                    }
+                },
+            }).to_string(),
+        },
+    })
+}
+
+const EDITORCONFIG_THAT_REWRITES_ON_SAVE: &str =
+    "root = true\n[*]\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n";
+
+#[cfg(unix)]
+#[gpui::test]
+async fn test_a_repository_s_zed_settings_can_rewrite_a_save_unless_local_settings_are_ignored(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (saved, formatter_ran) =
+        save_in_cloned_repo(cx, zed_settings_asking_for_an_external_formatter, false).await;
+    assert!(
+        formatter_ran,
+        "the fixture must reach the external formatter"
+    );
+    assert_eq!(saved, "Xone\ntwo\n");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+async fn test_ignored_local_settings_stop_a_repository_s_zed_settings_from_running_a_formatter_on_save(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (saved, formatter_ran) =
+        save_in_cloned_repo(cx, zed_settings_asking_for_an_external_formatter, true).await;
+    assert!(
+        !formatter_ran,
+        "an external formatter from the repository ran"
+    );
+    assert_eq!(saved, "Xone  \ntwo  ");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+async fn test_a_repository_s_editorconfig_can_rewrite_a_save_unless_local_settings_are_ignored(
+    cx: &mut gpui::TestAppContext,
+) {
+    let editorconfig = |_: &Path| json!({ ".editorconfig": EDITORCONFIG_THAT_REWRITES_ON_SAVE });
+    let (saved, _) = save_in_cloned_repo(cx, editorconfig, false).await;
+    assert_eq!(saved, "Xone\ntwo\n");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+async fn test_ignored_local_settings_stop_a_repository_s_editorconfig_from_rewriting_a_save(
+    cx: &mut gpui::TestAppContext,
+) {
+    let editorconfig = |_: &Path| json!({ ".editorconfig": EDITORCONFIG_THAT_REWRITES_ON_SAVE });
+    let (saved, _) = save_in_cloned_repo(cx, editorconfig, true).await;
+    assert_eq!(saved, "Xone  \ntwo  ");
+}
+
 #[gpui::test]
 async fn test_external_editorconfig_support(cx: &mut gpui::TestAppContext) {
     init_test(cx);

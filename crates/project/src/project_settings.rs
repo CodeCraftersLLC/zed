@@ -1127,6 +1127,9 @@ impl SettingsObserver {
         let SettingsObserverMode::Local(fs) = &self.mode else {
             return;
         };
+        if cx.global::<SettingsStore>().ignore_local_settings() {
+            return;
+        }
 
         let mut settings_contents = Vec::new();
         for (path, _, change) in changes.iter() {
@@ -1306,6 +1309,9 @@ impl SettingsObserver {
         is_via_collab: bool,
         cx: &mut Context<Self>,
     ) {
+        if cx.global::<SettingsStore>().ignore_local_settings() {
+            return;
+        }
         let worktree_id = worktree.read(cx).id();
         let remote_worktree_id = worktree.read(cx).id();
         let task_store = self.task_store.clone();
