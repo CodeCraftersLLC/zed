@@ -1,7 +1,7 @@
 use collections::HashMap;
 use gpui::{
-    Animation, AnimationExt, AnyElement, ClipboardItem, Context, Entity, ImageSource, RenderImage,
-    StyledText, Task, img, pulsating_between,
+    Animation, AnimationExt, AnyElement, ClipboardItem, Context, Entity, ImageSource,
+    MAX_RASTER_SIDE, RenderImage, StyledText, SvgRenderError, Task, img, pulsating_between,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -36,13 +36,58 @@ pub(crate) struct MermaidState {
     order: Vec<ParsedMarkdownMermaidDiagramContents>,
 }
 
+/// Why a diagram has no picture. The reason is shown above the diagram's source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MermaidError {
+    /// The diagram is of a type the preview does not draw, such as `sankey-beta`.
+    Unsupported(String),
+    /// The raster would be larger than the GPU can hold.
+    TooLarge { width: u32, height: u32 },
+    /// The diagram could not be laid out or rendered, usually because of a syntax error.
+    Failed(String),
+}
+
+impl MermaidError {
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::Unsupported(kind) => format!(
+                "This diagram could not be drawn: Diagram type '{kind}' is not supported in the preview."
+            ),
+            Self::TooLarge { width, height } => format!(
+                "This diagram is too large to draw ({width} × {height} px). The Code tab shows its source."
+            ),
+            Self::Failed(message) => {
+                let first_line = message.lines().next().unwrap_or_default().trim();
+                format!(
+                    "This diagram could not be drawn: {}.",
+                    first_line.trim_end_matches('.')
+                )
+            }
+        }
+    }
+}
+
 struct CachedMermaidDiagram {
-    render_image: Arc<OnceLock<anyhow::Result<Arc<RenderImage>>>>,
+    render_image: Arc<OnceLock<Result<Arc<RenderImage>, MermaidError>>>,
     fallback_image: Option<Arc<RenderImage>>,
     _task: Task<()>,
 }
 
 impl MermaidState {
+    /// The reason line of every diagram that could not be drawn, in document order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn failure_reasons(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .filter_map(
+                |contents| match self.cache.get(contents)?.render_image.get()? {
+                    Err(error) => Some(error.reason()),
+                    Ok(_) => None,
+                },
+            )
+            .collect()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.cache.clear();
         self.order.clear();
@@ -99,7 +144,17 @@ impl CachedMermaidDiagram {
         fallback_image: Option<Arc<RenderImage>>,
         cx: &mut Context<Markdown>,
     ) -> Self {
-        let render_image = Arc::new(OnceLock::<anyhow::Result<Arc<RenderImage>>>::new());
+        let render_image = Arc::new(OnceLock::<Result<Arc<RenderImage>, MermaidError>>::new());
+        if !is_supported_diagram_type(&contents.contents) {
+            let _ = render_image.set(Err(MermaidError::Unsupported(
+                diagram_type(&contents.contents).to_string(),
+            )));
+            return Self {
+                render_image,
+                fallback_image,
+                _task: Task::ready(()),
+            };
+        }
         let render_image_clone = render_image.clone();
         let svg_renderer = cx.svg_renderer();
         let mermaid_theme = build_mermaid_theme(cx);
@@ -108,11 +163,17 @@ impl CachedMermaidDiagram {
             let value = cx
                 .background_spawn(async move {
                     let svg_string =
-                        mermaid_render::render_to_svg(&contents.contents, &mermaid_theme)?;
+                        mermaid_render::render_to_svg(&contents.contents, &mermaid_theme)
+                            .map_err(|error| MermaidError::Failed(error.to_string()))?;
                     let scale = contents.scale as f32 / 100.0;
                     svg_renderer
-                        .render_single_frame(svg_string.as_bytes(), scale)
-                        .map_err(|error| anyhow::anyhow!("{error}"))
+                        .render_single_frame_bounded(svg_string.as_bytes(), scale, MAX_RASTER_SIDE)
+                        .map_err(|error| match error {
+                            SvgRenderError::TooLarge { width, height } => {
+                                MermaidError::TooLarge { width, height }
+                            }
+                            SvgRenderError::Svg(error) => MermaidError::Failed(error.to_string()),
+                        })
                 })
                 .await;
             let _ = render_image_clone.set(value);
@@ -231,6 +292,15 @@ fn parse_mermaid_info(info: &str) -> Option<u32> {
 /// We deliberately block rendering of some diagram types, even though `merman`
 /// supports them, because we have not yet written custom CSS to ensure text is
 /// readable.
+/// The first word of the source, which names the diagram type.
+fn diagram_type(source: &str) -> &str {
+    source
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '\n')
+        .next()
+        .unwrap_or("")
+}
+
 fn is_supported_diagram_type(source: &str) -> bool {
     /// If updating this list, also update the system prompt!
     const SUPPORTED_PREFIXES: &[&str] = &[
@@ -250,11 +320,7 @@ fn is_supported_diagram_type(source: &str) -> bool {
         "xychart-beta",
         "journey",
     ];
-    let first_token = source
-        .trim_start()
-        .split(|c: char| c.is_whitespace() || c == '\n')
-        .next()
-        .unwrap_or("");
+    let first_token = diagram_type(source);
     SUPPORTED_PREFIXES
         .iter()
         .any(|prefix| first_token.eq_ignore_ascii_case(prefix))
@@ -292,9 +358,6 @@ pub(crate) fn extract_mermaid_diagrams(
             .strip_suffix('\n')
             .unwrap_or(&source[metadata.content_range.clone()])
             .to_string();
-        if !is_supported_diagram_type(&contents) {
-            continue;
-        }
         mermaid_diagrams.insert(
             source_range.start,
             ParsedMarkdownMermaidDiagram {
@@ -363,9 +426,10 @@ pub(crate) fn render_mermaid_diagram(
                 })
                 .into_any_element()
         }
-        Some(Err(_)) => {
-            // Render failed — show the source code without tabs
+        Some(Err(error)) => {
+            // Nothing to draw: say why, and show the source under a lone Code tab.
             container
+                .child(render_mermaid_error_header(source_offset, error.reason()))
                 .child(render_mermaid_code_view(&parsed.contents.contents))
                 .when(show_interactive, |container| {
                     container.child(render_mermaid_copy_button(
@@ -437,6 +501,27 @@ pub(crate) fn render_mermaid_diagram(
             }
         }
     }
+}
+
+fn render_mermaid_error_header(source_offset: usize, reason: String) -> impl IntoElement {
+    h_flex()
+        .gap_2()
+        .mb_2p5()
+        .items_center()
+        .child(
+            Button::new(
+                ElementId::named_usize("mermaid-tab-code-only", source_offset),
+                "Code",
+            )
+            .label_size(LabelSize::Small)
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .toggle_state(true),
+        )
+        .child(
+            Label::new(reason)
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
 }
 
 fn render_mermaid_tab_header(
@@ -529,7 +614,7 @@ fn render_mermaid_code_view(contents: &SharedString) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedMermaidDiagram, MermaidDiagramCache, MermaidState,
+        CachedMermaidDiagram, MermaidDiagramCache, MermaidError, MermaidState,
         ParsedMarkdownMermaidDiagramContents, extract_mermaid_diagrams, parse_mermaid_info,
     };
     use crate::{
@@ -674,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_diagram_types_are_skipped() {
+    fn test_unsupported_diagram_types_are_extracted_so_they_can_say_why() {
         let markdown = concat!(
             "```mermaid\nsankey-beta\n```\n\n",
             "```mermaid\nblock-beta\n```\n\n",
@@ -683,15 +768,96 @@ mod tests {
         let events =
             crate::parser::parse_markdown_with_options(markdown, false, false, false).events;
         let diagrams = extract_mermaid_diagrams(markdown, &events);
+        let sources: Vec<_> = diagrams
+            .values()
+            .map(|diagram| {
+                diagram
+                    .contents
+                    .contents
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(sources, ["sankey-beta", "block-beta", "flowchart TD"]);
+    }
+
+    fn mermaid_failures(source: &str, cx: &mut TestAppContext) -> Vec<String> {
+        struct TestWindow;
+
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                format!("```mermaid\n{source}\n```").into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_mermaid_diagrams: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        markdown.read_with(cx, |markdown, _| markdown.mermaid_state.failure_reasons())
+    }
+
+    #[gpui::test]
+    fn an_unsupported_diagram_type_says_so(cx: &mut TestAppContext) {
         assert_eq!(
-            diagrams.len(),
-            1,
-            "Only the flowchart should be extracted; sankey and block should be skipped"
+            mermaid_failures("sankey-beta\n\nSource,Target,1", cx),
+            [
+                "This diagram could not be drawn: Diagram type 'sankey-beta' is not supported in the preview."
+            ]
         );
-        let diagram = diagrams.values().next().unwrap();
+    }
+
+    #[gpui::test]
+    fn a_syntax_error_keeps_its_reason(cx: &mut TestAppContext) {
+        let failures = mermaid_failures("flowchart TD\n  A[unclosed --> B", cx);
+        assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(
-            diagram.contents.contents.contains("flowchart"),
-            "The extracted diagram should be the flowchart"
+            failures[0].starts_with("This diagram could not be drawn: ")
+                && failures[0].len() > "This diagram could not be drawn: .".len(),
+            "{failures:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn an_oversize_diagram_is_an_error_not_a_blank_image(cx: &mut TestAppContext) {
+        let chain: String = (0..400)
+            .map(|ix| format!("  N{ix} --> N{}\n", ix + 1))
+            .collect();
+        let failures = mermaid_failures(&format!("flowchart TD\n{chain}"), cx);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("This diagram is too large to draw ("),
+            "{failures:?}"
+        );
+        assert!(
+            failures[0].ends_with(" px). The Code tab shows its source."),
+            "{failures:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_small_diagram_has_no_reason_line(cx: &mut TestAppContext) {
+        assert!(mermaid_failures("flowchart TD\n  A --> B", cx).is_empty());
+    }
+
+    #[test]
+    fn the_reason_is_one_sentence_whatever_the_renderer_says() {
+        assert_eq!(
+            MermaidError::Failed("Parse error on line 2.\nExpecting 'SQE'".into()).reason(),
+            "This diagram could not be drawn: Parse error on line 2."
         );
     }
 
