@@ -3668,6 +3668,46 @@ impl LineEndings {
         self.changes.is_empty()
     }
 
+    /// The ending of the line that holds `offset`.
+    pub fn ending_at(&self, offset: usize) -> LineEnding {
+        let changed = self.changes.partition_point(|(start, _)| *start <= offset);
+        changed
+            .checked_sub(1)
+            .map_or(self.first, |ix| self.changes[ix].1)
+    }
+
+    /// These endings, except that each of `lines` uses the ending it is paired with. `lines` are
+    /// the spans of whole lines in ascending order, and `len` is the length of the text, whose end
+    /// starts no line.
+    pub fn with_lines_overridden(
+        &self,
+        lines: &[(Range<usize>, LineEnding)],
+        len: usize,
+    ) -> LineEndings {
+        let ending_at = |offset: usize| {
+            let line = lines.partition_point(|(span, _)| span.end <= offset);
+            match lines.get(line) {
+                Some((span, ending)) if span.start <= offset => *ending,
+                _ => self.ending_at(offset),
+            }
+        };
+        let mut line_starts: Vec<usize> = self
+            .changes
+            .iter()
+            .map(|(start, _)| *start)
+            .chain(lines.iter().flat_map(|(span, _)| [span.start, span.end]))
+            .filter(|start| *start > 0 && *start < len)
+            .collect();
+        line_starts.sort_unstable();
+        line_starts.dedup();
+
+        let mut overridden = LineEndings::uniform(ending_at(0));
+        for start in line_starts {
+            overridden.push_change(start, ending_at(start));
+        }
+        overridden
+    }
+
     /// Records that lines from `offset` on use `ending`. A later call for the same offset
     /// overrides the earlier one, and a change to the ending already in force is dropped, so equal
     /// layouts compare equal.

@@ -1127,6 +1127,62 @@ fn mixed_buffer() -> Buffer {
 }
 
 #[test]
+fn test_ending_at_finds_the_ending_of_the_line_holding_an_offset() {
+    let endings = LineEndings {
+        first: LineEnding::Windows,
+        changes: vec![(4, LineEnding::Unix), (8, LineEnding::Windows)],
+    };
+    assert_eq!(endings.ending_at(0), LineEnding::Windows);
+    assert_eq!(endings.ending_at(3), LineEnding::Windows);
+    assert_eq!(endings.ending_at(4), LineEnding::Unix);
+    assert_eq!(endings.ending_at(7), LineEnding::Unix);
+    assert_eq!(endings.ending_at(8), LineEnding::Windows);
+    assert_eq!(endings.ending_at(1000), LineEnding::Windows);
+}
+
+#[test]
+fn test_overriding_lines_changes_only_those_lines() {
+    // Three lines of "a\nb\nc\n", all CRLF.
+    let windows = LineEndings::uniform(LineEnding::Windows);
+    let layout = |first, changes: &[(usize, LineEnding)]| LineEndings {
+        first,
+        changes: changes.to_vec(),
+    };
+
+    assert_eq!(
+        windows.with_lines_overridden(&[(2..4, LineEnding::Unix)], 6),
+        layout(
+            LineEnding::Windows,
+            &[(2, LineEnding::Unix), (4, LineEnding::Windows)]
+        )
+    );
+    assert_eq!(
+        windows.with_lines_overridden(&[(0..2, LineEnding::Unix)], 6),
+        layout(LineEnding::Unix, &[(2, LineEnding::Windows)])
+    );
+    // The end of the text starts no line, so the last line's override needs no change after it.
+    assert_eq!(
+        windows.with_lines_overridden(&[(4..6, LineEnding::Unix)], 6),
+        layout(LineEnding::Windows, &[(4, LineEnding::Unix)])
+    );
+    // Two neighbouring lines that end up alike are one run.
+    assert_eq!(
+        windows.with_lines_overridden(&[(0..2, LineEnding::Unix), (2..4, LineEnding::Unix)], 6),
+        layout(LineEnding::Unix, &[(4, LineEnding::Windows)])
+    );
+    // Overriding a line with the ending it has changes nothing, and runs elsewhere are kept.
+    let mixed = layout(
+        LineEnding::Windows,
+        &[(2, LineEnding::Unix), (4, LineEnding::Windows)],
+    );
+    assert_eq!(
+        mixed.with_lines_overridden(&[(0..2, LineEnding::Windows)], 6),
+        mixed
+    );
+    assert_eq!(mixed.with_lines_overridden(&[], 6), mixed);
+}
+
+#[test]
 fn test_mixed_line_endings_are_tracked_per_line() {
     let buffer = mixed_buffer();
     assert_eq!(buffer.text(), "one\ntwo\nthree\nfour\n");

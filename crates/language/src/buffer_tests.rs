@@ -178,20 +178,61 @@ async fn test_a_diff_to_mixed_text_installs_its_line_endings(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-async fn test_a_diff_that_missed_an_edit_gives_one_line_ending(cx: &mut TestAppContext) {
-    let buffer = cx.new(|cx| Buffer::local("a\nb\n", cx));
+async fn test_a_diff_that_missed_an_edit_changes_only_the_endings_of_lines_it_wrote(
+    cx: &mut TestAppContext,
+) {
+    let buffer = cx.new(|cx| Buffer::local("a\r\nb\nc\r\n", cx));
+    // The loaded text appends a line with its own ending and gives `b` another one.
     let diff = buffer
-        .update(cx, |buffer, cx| buffer.diff("a\r\nb\nc\r\n", cx))
+        .update(cx, |buffer, cx| buffer.diff("a\r\nb\r\nc\r\nd\n", cx))
         .await;
     buffer.update(cx, |buffer, cx| {
         buffer.edit([(0..0, "x")], None, cx);
         buffer.apply_diff(diff, cx);
     });
     buffer.read_with(cx, |buffer, _| {
-        assert_eq!(
-            buffer.line_endings(),
-            LineEndings::uniform(LineEnding::Windows)
-        );
+        assert_eq!(buffer.text(), "xa\nb\nc\nd\n");
+        // `a`, `b` and `c` keep the endings they had; only `d`, which the diff wrote, takes its own.
+        assert_eq!(buffer.text_with_line_endings(), "xa\r\nb\nc\r\nd\n");
+    });
+}
+
+#[gpui::test]
+async fn test_a_diff_that_missed_an_edit_gives_a_rewritten_line_its_loaded_ending(
+    cx: &mut TestAppContext,
+) {
+    let buffer = cx.new(|cx| Buffer::local("ab\ncd\n", cx));
+    // The first line is rewritten in the middle, so the terminator the diff writes ends a line
+    // that began before the diff's edit.
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.diff("aX\r\nY\r\ncd\n", cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(6..6, "z")], None, cx);
+        buffer.apply_diff(diff, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "aX\nY\ncd\nz");
+        let saved = buffer.text_with_line_endings();
+        assert!(saved.starts_with("aX\r\n"), "{saved:?}");
+        assert!(saved.ends_with("cd\nz"), "{saved:?}");
+    });
+}
+
+#[gpui::test]
+async fn test_a_diff_that_missed_an_edit_leaves_a_mixed_buffer_as_it_was(cx: &mut TestAppContext) {
+    let buffer = cx.new(|cx| Buffer::local("one\r\ntwo\nthree\r\n", cx));
+    // The file was rewritten with the first line's ending everywhere, and the diff has no text
+    // change to offer.
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.diff("one\r\ntwo\r\nthree\r\n", cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "x")], None, cx);
+        buffer.apply_diff(diff, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text_with_line_endings(), "xone\r\ntwo\nthree\r\n");
     });
 }
 
