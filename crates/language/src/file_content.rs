@@ -56,7 +56,9 @@ pub fn analyze_byte_content(bytes: &[u8]) -> ByteContent {
         return ByteContent::Unknown;
     }
 
-    let has_significant_nulls = total_null_count >= limit / 16;
+    // A lone NUL in a short file is stray data, not the high bytes of UTF-16 text: with integer
+    // division `limit / 16` is 0 or 1 for any sample under 32 bytes, so one NUL used to qualify.
+    let has_significant_nulls = total_null_count >= 2 && total_null_count * 16 >= limit;
     let nulls_skew_to_even = even_null_count > odd_null_count * 4;
     let nulls_skew_to_odd = odd_null_count > even_null_count * 4;
 
@@ -155,4 +157,38 @@ fn read_u16(bytes: &[u8], offset: usize, little_endian: bool) -> Option<u16> {
         return Some(u16::from_le_bytes(pair));
     }
     Some(u16::from_be_bytes(pair))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_nul_in_a_short_text_file_is_not_utf16() {
+        assert_eq!(
+            analyze_byte_content(b"text before\0text after"),
+            ByteContent::Unknown
+        );
+        // Three bytes are too few to call text: the non-text ratio still marks them binary.
+        assert_eq!(analyze_byte_content(b"a\0b"), ByteContent::Binary);
+
+        let utf16le: Vec<u8> = "hi there"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(utf16le.iter().filter(|byte| **byte == 0).count(), 8);
+        assert_eq!(analyze_byte_content(&utf16le), ByteContent::Utf16Le);
+        let utf16be: Vec<u8> = "hi there"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        assert_eq!(analyze_byte_content(&utf16be), ByteContent::Utf16Be);
+    }
+
+    #[test]
+    fn a_few_nuls_among_many_bytes_are_not_utf16() {
+        let mut text = vec![b'a'; FILE_ANALYSIS_BYTES];
+        text[100] = 0;
+        assert_eq!(analyze_byte_content(&text), ByteContent::Unknown);
+    }
 }
