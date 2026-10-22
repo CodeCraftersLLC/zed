@@ -1088,3 +1088,163 @@ fn test_edit_undo_after_split() {
     assert_eq!(buffer.text(), original);
     buffer.check_invariants();
 }
+
+#[test]
+fn test_normalize_with_endings_records_where_the_ending_changes() {
+    let mut text = "a\rb\r\nc\nd".to_string();
+    let line_endings = LineEnding::normalize_with_endings(&mut text);
+    assert_eq!(text, "a\nb\nc\nd");
+    assert_eq!(
+        line_endings,
+        LineEndings {
+            first: LineEnding::Mac,
+            changes: vec![(2, LineEnding::Windows), (4, LineEnding::Unix)],
+        }
+    );
+
+    let mut uniform = "a\r\nb\r\nc".to_string();
+    assert_eq!(
+        LineEnding::normalize_with_endings(&mut uniform),
+        LineEndings::uniform(LineEnding::Windows)
+    );
+    assert_eq!(uniform, "a\nb\nc");
+
+    let mut untouched = "a\nb".to_string();
+    assert_eq!(
+        LineEnding::normalize_with_endings(&mut untouched),
+        LineEndings::uniform(LineEnding::Unix)
+    );
+    let mut no_terminator = "ab".to_string();
+    assert_eq!(
+        LineEnding::normalize_with_endings(&mut no_terminator),
+        LineEndings::uniform(LineEnding::default())
+    );
+}
+
+fn mixed_buffer() -> Buffer {
+    Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        "one\r\ntwo\nthree\r\nfour\n",
+    )
+}
+
+#[test]
+fn test_mixed_line_endings_are_tracked_per_line() {
+    let buffer = mixed_buffer();
+    assert_eq!(buffer.text(), "one\ntwo\nthree\nfour\n");
+    assert_eq!(buffer.line_ending(), LineEnding::Windows);
+    assert_eq!(
+        buffer.line_endings(),
+        LineEndings {
+            first: LineEnding::Windows,
+            changes: vec![
+                (4, LineEnding::Unix),
+                (8, LineEnding::Windows),
+                (14, LineEnding::Unix)
+            ],
+        }
+    );
+}
+
+#[test]
+fn test_a_new_line_takes_the_ending_of_the_region_it_is_typed_in() {
+    // Enter at the end of a CRLF line.
+    let mut buffer = mixed_buffer();
+    buffer.edit([(3..3, "\nnew")]);
+    assert_eq!(
+        buffer.line_endings(),
+        LineEndings {
+            first: LineEnding::Windows,
+            changes: vec![
+                (8, LineEnding::Unix),
+                (12, LineEnding::Windows),
+                (18, LineEnding::Unix)
+            ],
+        }
+    );
+
+    // Enter at the end of an LF line.
+    let mut buffer = mixed_buffer();
+    buffer.edit([(7..7, "\nnew")]);
+    assert_eq!(
+        buffer.line_endings(),
+        LineEndings {
+            first: LineEnding::Windows,
+            changes: vec![
+                (4, LineEnding::Unix),
+                (12, LineEnding::Windows),
+                (18, LineEnding::Unix)
+            ],
+        }
+    );
+
+    // Enter at the start of an LF line puts the empty line in that line's region.
+    let mut buffer = mixed_buffer();
+    buffer.edit([(4..4, "\n")]);
+    assert_eq!(
+        buffer.line_endings(),
+        LineEndings {
+            first: LineEnding::Windows,
+            changes: vec![
+                (4, LineEnding::Unix),
+                (9, LineEnding::Windows),
+                (15, LineEnding::Unix)
+            ],
+        }
+    );
+
+    // Splitting a CRLF line in the middle keeps both halves CRLF.
+    let mut buffer = mixed_buffer();
+    buffer.edit([(10..10, "\n")]);
+    assert_eq!(
+        buffer.line_endings(),
+        LineEndings {
+            first: LineEnding::Windows,
+            changes: vec![
+                (4, LineEnding::Unix),
+                (8, LineEnding::Windows),
+                (15, LineEnding::Unix)
+            ],
+        }
+    );
+    buffer.check_invariants();
+}
+
+#[test]
+fn test_deleting_a_region_drops_its_ending() {
+    let mut buffer = mixed_buffer();
+    buffer.edit([(4..8, "")]);
+    assert_eq!(buffer.text(), "one\nthree\nfour\n");
+    assert_eq!(
+        buffer.line_endings(),
+        LineEndings {
+            first: LineEnding::Windows,
+            changes: vec![(10, LineEnding::Unix)],
+        }
+    );
+}
+
+#[test]
+fn test_set_line_ending_makes_every_line_use_it() {
+    let mut buffer = mixed_buffer();
+    buffer.set_line_ending(LineEnding::Unix);
+    assert_eq!(
+        buffer.line_endings(),
+        LineEndings::uniform(LineEnding::Unix)
+    );
+    assert_eq!(buffer.line_ending(), LineEnding::Unix);
+}
+
+#[test]
+fn test_line_endings_survive_undo() {
+    let mut buffer = mixed_buffer();
+    let before = buffer.line_endings();
+    buffer.start_transaction();
+    buffer.edit([(0..4, "")]);
+    buffer.end_transaction();
+    assert_ne!(buffer.line_endings(), before);
+    buffer.undo();
+    assert_eq!(buffer.text(), "one\ntwo\nthree\nfour\n");
+    assert_eq!(buffer.line_endings(), before);
+}
