@@ -2028,7 +2028,12 @@ impl Editor {
                         }
                     }
 
-                    project::Event::EntryRenamed(transaction, project_path, abs_path) => {
+                    project::Event::EntryRenamed {
+                        transaction,
+                        new_path: project_path,
+                        new_abs_path: abs_path,
+                        ..
+                    } => {
                         let Some(workspace) = editor.workspace() else {
                             return;
                         };

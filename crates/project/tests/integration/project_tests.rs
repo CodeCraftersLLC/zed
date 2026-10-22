@@ -13317,6 +13317,58 @@ async fn test_undo_encoding_change(cx: &mut gpui::TestAppContext) {
 /// Opening a file, typing one character at its start or end and saving must change that
 /// character and nothing else: not the line endings, the encoding or the byte-order mark.
 #[gpui::test]
+async fn test_renaming_an_entry_reports_where_it_came_from(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({ "side.txt": "", "dir": { "inner.txt": "" } }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let renames = Rc::new(RefCell::new(Vec::new()));
+    let _subscription = cx.update(|cx| {
+        let renames = renames.clone();
+        cx.subscribe(&project, move |_, event, _| {
+            if let Event::EntryRenamed {
+                old_path, new_path, ..
+            } = event
+            {
+                renames.borrow_mut().push((
+                    old_path.path.as_unix_str().to_string(),
+                    new_path.path.as_unix_str().to_string(),
+                ));
+            }
+        })
+    });
+
+    let (worktree_id, file_id, dir_id) = project.read_with(cx, |project, cx| {
+        let worktree = project.worktrees(cx).next().unwrap().read(cx);
+        (
+            worktree.id(),
+            worktree.entry_for_path(rel_path("side.txt")).unwrap().id,
+            worktree.entry_for_path(rel_path("dir")).unwrap().id,
+        )
+    });
+    for (entry_id, to) in [(file_id, "SIDE.txt"), (dir_id, "DIR")] {
+        project
+            .update(cx, |project, cx| {
+                project.rename_entry(entry_id, (worktree_id, rel_path(to)).into(), cx)
+            })
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        *renames.borrow(),
+        [
+            ("side.txt".to_string(), "SIDE.txt".to_string()),
+            ("dir".to_string(), "DIR".to_string()),
+        ]
+    );
+}
+
+#[gpui::test]
 async fn test_saving_changes_only_the_typed_character(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
