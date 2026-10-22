@@ -45,9 +45,12 @@ pub enum CommitDiffPreviewStatus {
 /// uses.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum NoPreviewReason {
-    /// The file is larger than a preview reads, or than the rest of the preview
-    /// has room for. `limit` is the size it may be, when the size is what refused it.
+    /// The file is larger than a preview reads. `limit` is the size it may be,
+    /// when the size is what refused it.
     TooLargeToPreview { limit: Option<u64> },
+    /// The file is not large; the preview had already read as much as it may for
+    /// this commit (or could not afford another read) before it reached the file.
+    BudgetExhausted,
     /// A picture that would decode to more pixels than a preview may hold.
     TooManyPixels { width: u32, height: u32 },
     /// A picture format whose bytes do not decode.
@@ -96,7 +99,10 @@ pub struct CommitDiffPreviewFile {
     pub is_binary: bool,
     /// What a binary file looked like before and after, when known.
     pub binary: Option<BinaryPreview>,
+    /// The contents were not read, so there is no text to diff.
     pub is_truncated: bool,
+    /// Why the contents were not read, when `is_truncated`. `None` reads as too large.
+    pub no_preview_reason: Option<NoPreviewReason>,
     pub load_error: Option<Arc<str>>,
 }
 
@@ -125,16 +131,18 @@ pub struct CommitDiffPreview {
     /// could not be read, drawn as cards above the text diff. A failure is never
     /// drawn as lines of the file.
     cards: Vec<PreviewCard>,
-    /// Files past [`MAX_PREVIEW_CARDS`]: counted, never held, so their image data
-    /// is not kept for cards that are not drawn.
+    /// Before/after cards past [`MAX_PREVIEW_CARDS`]: counted, never held, so their
+    /// image data is not kept for cards that are not drawn. Notice cards are never
+    /// hidden.
     hidden_cards: usize,
     has_text_entries: bool,
     _populate_task: Task<Result<()>>,
 }
 
-/// The most cards drawn at once; the rest are counted in a closing line. Cards
-/// are laid out and painted every frame, and a commit can touch hundreds of
-/// binary files.
+/// The most before/after cards drawn at once; the rest are counted in a closing
+/// line. Cards are laid out and painted every frame, and a commit can touch
+/// hundreds of binary files. Notice cards do not count: each is a title and a
+/// sentence, and the only sign that a file could not be shown.
 const MAX_PREVIEW_CARDS: usize = 40;
 
 enum PreviewCard {
@@ -286,7 +294,7 @@ impl CommitDiffPreviewFile {
         } else if self.is_binary || (self.is_truncated && self.binary.is_some()) {
             FileKind::Card
         } else if self.is_truncated {
-            FileKind::Notice("Too large to preview.".to_string())
+            FileKind::Notice(truncated_notice(self.no_preview_reason).to_string())
         } else {
             FileKind::Text
         }
@@ -341,9 +349,19 @@ impl CommitDiffPreviewFile {
     }
 }
 
+/// What a file whose contents were not read says in place of its lines.
+fn truncated_notice(reason: Option<NoPreviewReason>) -> &'static str {
+    match reason {
+        Some(NoPreviewReason::BudgetExhausted) => {
+            "Not previewed: the preview limit for this commit was reached before this file."
+        }
+        _ => "Too large to preview.",
+    }
+}
+
 struct Split {
     cards: Vec<PreviewCard>,
-    /// Cards past [`MAX_PREVIEW_CARDS`].
+    /// Before/after cards past [`MAX_PREVIEW_CARDS`].
     hidden_cards: usize,
     entries: Vec<PreviewEntry>,
 }
@@ -352,26 +370,26 @@ struct Split {
 /// in file order. Text entries keep the index of their file.
 fn split_files(files: Vec<CommitDiffPreviewFile>) -> Split {
     let mut cards = Vec::new();
+    let mut binary_cards = 0;
     let mut hidden_cards = 0;
     let mut entries = Vec::new();
     for (index, file) in files.into_iter().enumerate() {
-        let kind = file.kind();
-        if matches!(kind, FileKind::Text) {
-            entries.push(file.into_entry(index));
-        } else if cards.len() >= MAX_PREVIEW_CARDS {
-            hidden_cards += 1;
-        } else if let FileKind::Notice(body) = kind {
-            cards.push(PreviewCard::Notice(NoticeCard::new(
+        match file.kind() {
+            FileKind::Text => entries.push(file.into_entry(index)),
+            FileKind::Notice(body) => cards.push(PreviewCard::Notice(NoticeCard::new(
                 &file.display_path,
                 &file.status,
                 body,
-            )));
-        } else {
-            cards.push(PreviewCard::Binary(BinaryCard::new(
-                &file.display_path,
-                &file.status,
-                file.binary.unwrap_or_default(),
-            )));
+            ))),
+            FileKind::Card if binary_cards >= MAX_PREVIEW_CARDS => hidden_cards += 1,
+            FileKind::Card => {
+                binary_cards += 1;
+                cards.push(PreviewCard::Binary(BinaryCard::new(
+                    &file.display_path,
+                    &file.status,
+                    file.binary.unwrap_or_default(),
+                )));
+            }
         }
     }
     Split {
@@ -777,10 +795,10 @@ fn status_label(status: &CommitDiffPreviewStatus) -> &'static str {
 }
 
 /// What the "before" or "after" half of a card says: the size, and when there is
-/// no picture, why.
+/// no picture, why. A side the card shows but knows nothing about says so.
 fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
     let Some(blob) = blob else {
-        return "\u{2014}".to_string();
+        return "Binary file, size unknown".to_string();
     };
     let size = format_binary_size(blob.size);
     if blob.image.is_some() {
@@ -796,6 +814,9 @@ fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
         Some(NoPreviewReason::TooLargeToPreview { limit: None }) => {
             format!("{size} \u{2014} too large to preview")
         }
+        Some(NoPreviewReason::BudgetExhausted) => {
+            format!("{size} \u{2014} not previewed (preview limit reached)")
+        }
         Some(NoPreviewReason::TooManyPixels { width, height }) => {
             format!("Image, {size}, {width} \u{d7} {height} px (too large to preview)")
         }
@@ -803,6 +824,11 @@ fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
         Some(NoPreviewReason::NotAnImage) => format!("Binary, {size} (no preview)"),
         None => size,
     }
+}
+
+fn hidden_cards_footer(hidden: usize) -> String {
+    let files = if hidden == 1 { "file" } else { "files" };
+    format!("\u{2026} and {hidden} more binary {files} not shown")
 }
 
 fn render_binary_side(
@@ -893,10 +919,7 @@ impl Render for CommitDiffPreview {
             .overflow_y_scroll()
             .children(cards)
             .when(hidden > 0, |this| {
-                this.child(
-                    Label::new(format!("\u{2026} and {hidden} more files shown as cards"))
-                        .color(Color::Muted),
-                )
+                this.child(Label::new(hidden_cards_footer(hidden)).color(Color::Muted))
             })
             .when(self.has_text_entries, |this| {
                 this.child(div().flex_1().min_h(px(240.)).child(self.editor.clone()))
@@ -944,6 +967,7 @@ mod tests {
             is_binary: false,
             binary: None,
             is_truncated: false,
+            no_preview_reason: None,
             load_error: None,
         }
         .into_entry(7);
@@ -988,7 +1012,7 @@ mod tests {
             image: None,
             reason: Some(NoPreviewReason::NotAnImage),
         };
-        assert_eq!(binary_blob_caption(None), "\u{2014}");
+        assert_eq!(binary_blob_caption(None), "Binary file, size unknown");
         assert_eq!(binary_blob_caption(Some(&shown)), "2.0 KB");
         assert_eq!(
             binary_blob_caption(Some(&binary)),
@@ -1021,6 +1045,7 @@ mod tests {
             is_binary,
             binary,
             is_truncated,
+            no_preview_reason: None,
             load_error: load_error.map(Into::into),
         }
     }
@@ -1064,7 +1089,12 @@ mod tests {
                 Some(NoPreviewReason::TooLargeToPreview { limit: None })
             ))),
             "3.0 MB \u{2014} too large to preview",
-            "a file refused for the room the rest took names no limit"
+            "a refusal that names no limit names none"
+        );
+        assert_eq!(
+            binary_blob_caption(Some(&side(2048, Some(NoPreviewReason::BudgetExhausted)))),
+            "2.0 KB \u{2014} not previewed (preview limit reached)",
+            "a file the preview ran out of room for is not called too large"
         );
         assert_eq!(
             binary_blob_caption(Some(&side(9, None))),
@@ -1190,6 +1220,7 @@ mod tests {
             is_binary: false,
             binary: None,
             is_truncated: false,
+            no_preview_reason: None,
             load_error: None,
         };
         let mut files = vec![file(
@@ -1209,5 +1240,129 @@ mod tests {
         assert_eq!(split.hidden_cards, 5);
         assert_eq!(split.entries.len(), 1);
         assert_eq!(split.entries[0].index, 1);
+    }
+
+    fn notice_bodies(split: &Split) -> Vec<String> {
+        split
+            .cards
+            .iter()
+            .filter_map(|card| match card {
+                PreviewCard::Notice(card) => Some(card.body.to_string()),
+                PreviewCard::Binary(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_file_that_could_not_be_read_is_drawn_even_past_the_card_cap() {
+        let mut files: Vec<_> = (0..2 * MAX_PREVIEW_CARDS)
+            .map(|_| file(CommitDiffPreviewStatus::Modified, true, false, None, None))
+            .collect();
+        files.push(file(
+            CommitDiffPreviewStatus::Modified,
+            false,
+            false,
+            None,
+            Some("unreadable"),
+        ));
+
+        let split = split_files(files);
+
+        assert_eq!(
+            notice_bodies(&split),
+            ["Could not show this file: unreadable"]
+        );
+        assert_eq!(split.cards.len(), MAX_PREVIEW_CARDS + 1);
+        assert_eq!(split.hidden_cards, MAX_PREVIEW_CARDS);
+    }
+
+    #[test]
+    fn notices_do_not_use_up_the_room_for_before_after_cards() {
+        let mut files: Vec<_> = (0..MAX_PREVIEW_CARDS + 10)
+            .map(|_| {
+                file(
+                    CommitDiffPreviewStatus::Modified,
+                    false,
+                    false,
+                    None,
+                    Some("unreadable"),
+                )
+            })
+            .collect();
+        files.extend(
+            (0..MAX_PREVIEW_CARDS)
+                .map(|_| file(CommitDiffPreviewStatus::Modified, true, false, None, None)),
+        );
+
+        let split = split_files(files);
+
+        assert_eq!(notice_bodies(&split).len(), MAX_PREVIEW_CARDS + 10);
+        assert_eq!(split.hidden_cards, 0, "every before/after card fits");
+    }
+
+    #[test]
+    fn the_footer_counts_files_it_did_not_show() {
+        assert_eq!(
+            hidden_cards_footer(1),
+            "\u{2026} and 1 more binary file not shown"
+        );
+        assert_eq!(
+            hidden_cards_footer(41),
+            "\u{2026} and 41 more binary files not shown"
+        );
+    }
+
+    #[test]
+    fn a_binary_card_with_no_blob_info_says_the_size_is_unknown_on_each_side_it_shows() {
+        let unknown = "Binary file, size unknown";
+        for status in [
+            CommitDiffPreviewStatus::Modified,
+            CommitDiffPreviewStatus::Typechange,
+        ] {
+            let split = split_files(vec![file(status, true, false, None, None)]);
+            let card = only_card(&split);
+            assert!(card.shows_before && card.shows_after);
+            assert_eq!(card.old_caption.as_ref(), unknown);
+            assert_eq!(card.new_caption.as_ref(), unknown);
+        }
+
+        let added = split_files(vec![file(
+            CommitDiffPreviewStatus::Added,
+            true,
+            false,
+            None,
+            None,
+        )]);
+        let card = only_card(&added);
+        assert!(!card.shows_before && card.shows_after);
+        assert_eq!(card.new_caption.as_ref(), unknown);
+
+        let deleted = split_files(vec![file(
+            CommitDiffPreviewStatus::Deleted,
+            true,
+            false,
+            None,
+            None,
+        )]);
+        let card = only_card(&deleted);
+        assert!(card.shows_before && !card.shows_after);
+        assert_eq!(card.old_caption.as_ref(), unknown);
+    }
+
+    #[test]
+    fn a_file_the_preview_ran_out_of_room_for_is_not_called_too_large() {
+        let mut ran_out = file(CommitDiffPreviewStatus::Modified, false, true, None, None);
+        ran_out.no_preview_reason = Some(NoPreviewReason::BudgetExhausted);
+        let too_large = file(CommitDiffPreviewStatus::Modified, false, true, None, None);
+
+        let split = split_files(vec![ran_out, too_large]);
+
+        assert_eq!(
+            notice_bodies(&split),
+            [
+                "Not previewed: the preview limit for this commit was reached before this file.",
+                "Too large to preview."
+            ]
+        );
     }
 }
