@@ -42,4 +42,4 @@ ignored = ["log"]
 
 [features]
 default = []
-test-support = []
+test-support = ["gpui/test-support"]

@@ -2348,6 +2348,14 @@ impl Window {
         self.platform_window.window_controls()
     }
 
+    /// Makes `bounds` readable as [`crate::VisualTestContext::debug_bounds`]`(selector)`
+    /// once this frame is drawn, for elements that paint without a `Div` to put a
+    /// `debug_selector` on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_debug_bounds(&mut self, selector: impl Into<String>, bounds: Bounds<Pixels>) {
+        self.next_frame.debug_bounds.insert(selector.into(), bounds);
+    }
+
     /// Updates the window's title at the platform level.
     pub fn set_window_title(&mut self, title: &str) {
         self.platform_window.set_title(title);
