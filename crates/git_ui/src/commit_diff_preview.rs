@@ -45,8 +45,9 @@ pub enum CommitDiffPreviewStatus {
 /// uses.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum NoPreviewReason {
-    /// The file is larger than a preview reads.
-    TooLargeToPreview,
+    /// The file is larger than a preview reads, or than the rest of the preview
+    /// has room for. `limit` is the size it may be, when the size is what refused it.
+    TooLargeToPreview { limit: Option<u64> },
     /// A picture that would decode to more pixels than a preview may hold.
     TooManyPixels { width: u32, height: u32 },
     /// A picture format whose bytes do not decode.
@@ -786,7 +787,15 @@ fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
         return size;
     }
     match blob.reason {
-        Some(NoPreviewReason::TooLargeToPreview) => format!("{size} (too large to preview)"),
+        Some(NoPreviewReason::TooLargeToPreview { limit: Some(limit) }) => {
+            format!(
+                "{size} \u{2014} too large to preview (limit {})",
+                format_binary_size(limit)
+            )
+        }
+        Some(NoPreviewReason::TooLargeToPreview { limit: None }) => {
+            format!("{size} \u{2014} too large to preview")
+        }
         Some(NoPreviewReason::TooManyPixels { width, height }) => {
             format!("Image, {size}, {width} \u{d7} {height} px (too large to preview)")
         }
@@ -1042,10 +1051,20 @@ mod tests {
         );
         assert_eq!(
             binary_blob_caption(Some(&side(
-                2 * 1024 * 1024,
-                Some(NoPreviewReason::TooLargeToPreview)
+                6 * 1024 * 1024,
+                Some(NoPreviewReason::TooLargeToPreview {
+                    limit: Some(1024 * 1024)
+                })
             ))),
-            "2.0 MB (too large to preview)"
+            "6.0 MB \u{2014} too large to preview (limit 1.0 MB)"
+        );
+        assert_eq!(
+            binary_blob_caption(Some(&side(
+                3 * 1024 * 1024,
+                Some(NoPreviewReason::TooLargeToPreview { limit: None })
+            ))),
+            "3.0 MB \u{2014} too large to preview",
+            "a file refused for the room the rest took names no limit"
         );
         assert_eq!(
             binary_blob_caption(Some(&side(9, None))),
@@ -1064,7 +1083,9 @@ mod tests {
                 old: None,
                 new: Some(side(
                     2 * 1024 * 1024,
-                    Some(NoPreviewReason::TooLargeToPreview),
+                    Some(NoPreviewReason::TooLargeToPreview {
+                        limit: Some(1024 * 1024),
+                    }),
                 )),
             }),
             None,
@@ -1072,7 +1093,10 @@ mod tests {
         let split = split_files(vec![added]);
         let card = only_card(&split);
         assert!(!card.shows_before && card.shows_after);
-        assert_eq!(card.new_caption.as_ref(), "2.0 MB (too large to preview)");
+        assert_eq!(
+            card.new_caption.as_ref(),
+            "2.0 MB \u{2014} too large to preview (limit 1.0 MB)"
+        );
         assert!(split.entries.is_empty(), "no lines of the file are added");
     }
 
