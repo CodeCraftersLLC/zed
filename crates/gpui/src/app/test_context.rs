@@ -1151,8 +1151,9 @@ impl AnyWindowHandle {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Context, InteractiveElement as _, IntoElement, PathPromptOptions, Render, SharedString,
-        StatefulInteractiveElement as _, Styled as _, TestAppContext, Window, div, px,
+        Context, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions,
+        Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestAppContext, Window,
+        div, px,
     };
     use accesskit::{Action, Role};
     use std::{cell::Cell, path::PathBuf, rc::Rc};
@@ -1300,5 +1301,183 @@ mod tests {
         cx.simulate_a11y_action(button_id, Action::Click);
 
         assert_eq!(activations.get(), 1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum Wiring {
+        OnClick,
+        OnClickAndExplicitA11yClick,
+        MouseDownOnly,
+    }
+
+    #[derive(Clone, Default)]
+    struct Presses {
+        button: Rc<Cell<usize>>,
+        explicit_a11y: Rc<Cell<usize>>,
+        decoy: Rc<Cell<usize>>,
+        keyboard_event: Rc<Cell<bool>>,
+    }
+
+    /// A scroller whose only button sits 400px down in it. At the `CLIPPED` height the
+    /// button is clipped out of the window, and the tall decoy below the scroller covers
+    /// the point where the button's bounds are centred: a click hit-tested there lands
+    /// on the decoy.
+    struct ScrolledButton {
+        wiring: Wiring,
+        scroller_height: crate::Pixels,
+        presses: Presses,
+    }
+
+    const CLIPPED: crate::Pixels = px(50.);
+    const SHOWN: crate::Pixels = px(500.);
+
+    impl Render for ScrolledButton {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let presses = self.presses.clone();
+            let button = div()
+                .id("lower")
+                .role(Role::Button)
+                .aria_label("Lower")
+                .w(px(100.))
+                .h(px(30.));
+            let button = match self.wiring {
+                Wiring::OnClick => button.on_click(move |event, _, _| {
+                    presses.button.set(presses.button.get() + 1);
+                    presses.keyboard_event.set(event.is_keyboard());
+                }),
+                Wiring::OnClickAndExplicitA11yClick => button
+                    .on_click({
+                        let presses = presses.clone();
+                        move |_, _, _| presses.button.set(presses.button.get() + 1)
+                    })
+                    .on_a11y_action(Action::Click, move |_, _, _| {
+                        presses.explicit_a11y.set(presses.explicit_a11y.get() + 1)
+                    }),
+                Wiring::MouseDownOnly => button
+                    .on_mouse_down(crate::MouseButton::Left, move |_, _, _| {
+                        presses.button.set(presses.button.get() + 1)
+                    }),
+            };
+            let decoy_presses = self.presses.decoy.clone();
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("scroller")
+                        .w(px(200.))
+                        .h(self.scroller_height)
+                        .overflow_y_scroll()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().h(px(400.)))
+                                .child(button),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("decoy")
+                        .w(px(200.))
+                        .h(px(600.))
+                        .on_click(move |_, _, _| decoy_presses.set(decoy_presses.get() + 1)),
+                )
+        }
+    }
+
+    fn scrolled_button_window(
+        cx: &mut TestAppContext,
+        wiring: Wiring,
+        scroller_height: crate::Pixels,
+    ) -> (&mut crate::VisualTestContext, Presses, accesskit::NodeId) {
+        let presses = Presses::default();
+        let (_view, cx) = cx.add_window_view({
+            let presses = presses.clone();
+            move |_, _| ScrolledButton {
+                wiring,
+                scroller_height,
+                presses,
+            }
+        });
+        cx.enable_accessibility();
+        let (button_id, _) = node_labelled(&cx.a11y_tree().unwrap(), "Lower");
+        (cx, presses, button_id)
+    }
+
+    #[gpui::test]
+    async fn test_a11y_click_reaches_a_control_clipped_out_of_its_scroll_container(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, presses, button) = scrolled_button_window(cx, Wiring::OnClick, CLIPPED);
+
+        cx.simulate_a11y_action(button, Action::Click);
+
+        assert_eq!(presses.button.get(), 1, "the clipped button is pressed");
+        assert_eq!(
+            presses.decoy.get(),
+            0,
+            "nothing under its bounds is pressed"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a11y_click_hands_the_on_click_handler_a_keyboard_event_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, presses, button) = scrolled_button_window(cx, Wiring::OnClick, CLIPPED);
+
+        cx.simulate_a11y_action(button, Action::Click);
+
+        assert_eq!(presses.button.get(), 1);
+        assert!(
+            presses.keyboard_event.get(),
+            "there is no pointer to report"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_an_explicit_a11y_click_listener_replaces_the_on_click_forwarding(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, presses, button) =
+            scrolled_button_window(cx, Wiring::OnClickAndExplicitA11yClick, CLIPPED);
+
+        cx.simulate_a11y_action(button, Action::Click);
+
+        assert_eq!(presses.explicit_a11y.get(), 1);
+        assert_eq!(presses.button.get(), 0, "the control is not pressed twice");
+    }
+
+    #[gpui::test]
+    async fn test_a11y_click_still_presses_a_raw_mouse_listener_where_it_is_drawn(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, presses, button) = scrolled_button_window(cx, Wiring::MouseDownOnly, SHOWN);
+
+        cx.simulate_a11y_action(button, Action::Click);
+
+        assert_eq!(presses.button.get(), 1);
+        assert_eq!(presses.decoy.get(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_on_click_forwarding_is_registered_only_while_accessibility_is_on(
+        cx: &mut TestAppContext,
+    ) {
+        let presses = Presses::default();
+        let (_view, cx) = cx.add_window_view({
+            move |_, _| ScrolledButton {
+                wiring: Wiring::OnClick,
+                scroller_height: CLIPPED,
+                presses,
+            }
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|window, _| window.a11y.action_listeners.is_empty()));
+
+        cx.enable_accessibility();
+
+        assert!(cx.update(|window, _| !window.a11y.action_listeners.is_empty()));
     }
 }
