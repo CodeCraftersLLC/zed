@@ -603,6 +603,7 @@ impl ProjectDiff {
         })
     }
 
+    #[cfg(test)]
     fn new(
         project: Entity<Project>,
         workspace: Entity<Workspace>,
