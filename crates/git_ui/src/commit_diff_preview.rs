@@ -316,7 +316,6 @@ impl CommitDiffPreviewFile {
             ..
         } = self;
         let metadata_path = new_path
-            .clone()
             .or_else(|| old_path.clone())
             .unwrap_or_else(|| display_path.clone());
         let was_deleted = matches!(status, CommitDiffPreviewStatus::Deleted);
