@@ -110,9 +110,10 @@ const ADAM7_PASSES: [(u32, u32, u32, u32); 7] = [
 /// The rows are inflated one at a time and averaged into the thumbnail as they arrive (alpha
 /// weighted), so no raster is ever allocated: memory is the thumbnail's sums plus a few rows,
 /// whatever the picture's size. Every PNG colour type and bit depth is read, and an Adam7
-/// interlaced picture is placed pass by pass. The picture may declare at most as many pixels as a
+/// interlaced picture is placed pass by pass, and the thumbnail is upright by the picture's EXIF
+/// orientation, as [`decode_image`] draws it. The picture may declare at most as many pixels as a
 /// [`MAX_RASTER_SIDE`] square holds and no more than 2^20 on a side; a truncated or damaged file is
-/// an error, not a partial thumbnail. EXIF does not apply to PNG.
+/// an error, not a partial thumbnail.
 ///
 /// `max_side` must be between 1 and [`MAX_THUMBNAIL_SIDE`].
 pub fn png_thumbnail(bytes: &[u8], max_side: u32) -> ImageResult<RgbaImage> {
@@ -136,6 +137,12 @@ pub fn png_thumbnail(bytes: &[u8], max_side: u32) -> ImageResult<RgbaImage> {
 
     let info = reader.info();
     let (width, height, interlaced) = (info.width, info.height, info.interlaced);
+    // An unreadable orientation tag is treated as "upright", as `image_header` does.
+    let orientation = info
+        .exif_metadata
+        .as_deref()
+        .and_then(Orientation::from_exif_chunk)
+        .unwrap_or(Orientation::NoTransforms);
     if width > MAX_STREAMED_SIDE
         || height > MAX_STREAMED_SIDE
         || u64::from(width) * u64::from(height) > MAX_STREAMED_PIXELS
@@ -174,7 +181,10 @@ pub fn png_thumbnail(bytes: &[u8], max_side: u32) -> ImageResult<RgbaImage> {
             * u64::from(rows.sizes[index / thumbnail_width]);
         *pixel = sum.average(covered);
     }
-    Ok(thumbnail)
+    // Turning the thumbnail is the turning of the picture, at the cost of its few pixels.
+    let mut thumbnail = DynamicImage::ImageRgba8(thumbnail);
+    thumbnail.apply_orientation(orientation);
+    Ok(thumbnail.into_rgba8())
 }
 
 /// `width` x `height` scaled to `max_side` on its longer side, never enlarged.
@@ -1205,6 +1215,22 @@ mod tests {
         let thumbnail = png_thumbnail(&bytes, 1).unwrap();
         assert_eq!(thumbnail.dimensions(), (1, 1));
         assert_eq!(thumbnail.get_pixel(0, 0).0, [255, 0, 0, 128]);
+    }
+
+    #[test]
+    fn a_streamed_thumbnail_is_upright_by_the_exif_orientation() {
+        let bytes = png(&landscape(), Some(exif_orientation(6)));
+        let thumbnail = png_thumbnail(&bytes, 100).unwrap();
+        assert_eq!(thumbnail.dimensions(), (2, 4));
+        // The stored top-left corner of an orientation-6 picture is its top-right once upright.
+        assert_eq!(thumbnail.get_pixel(1, 0).0, [255, 0, 0, 255]);
+        assert_eq!(thumbnail.get_pixel(0, 0).0, [0, 0, 255, 255]);
+
+        let unreadable = png(&landscape(), Some(exif_orientation(9)));
+        assert_eq!(
+            png_thumbnail(&unreadable, 100).unwrap().dimensions(),
+            (4, 2)
+        );
     }
 
     #[test]
