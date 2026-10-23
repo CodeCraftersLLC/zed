@@ -86,25 +86,42 @@ pub fn analyze_byte_content(bytes: &[u8]) -> ByteContent {
     }
 }
 
+/// A leading signature that real text almost never starts with. Short ASCII tags (`ID3`, `RIFF`,
+/// `OggS`, `fLaC`) are only trusted with the bytes the format puts right after them, so "RIFF
+/// format notes" stays text. `cherrypick-git`'s `text_decode` classifies the same signatures for
+/// the preview and copy side: keep the two tables identical.
 fn is_known_binary_header(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"%PDF-") // PDF
-        || bytes.starts_with(b"PK\x03\x04") // ZIP local header
-        || bytes.starts_with(b"PK\x05\x06") // ZIP end of central directory
-        || bytes.starts_with(b"PK\x07\x08") // ZIP spanning/splitting
-        || bytes.starts_with(b"\x89PNG\r\n\x1a\n") // PNG
-        || bytes.starts_with(b"\xFF\xD8\xFF") // JPEG
-        || bytes.starts_with(b"GIF87a") // GIF87a
-        || bytes.starts_with(b"GIF89a") // GIF89a
-        || bytes.starts_with(b"IWAD") // Doom IWAD archive
-        || bytes.starts_with(b"PWAD") // Doom PWAD archive
-        || bytes.starts_with(b"RIFF") // WAV, AVI, WebP
-        || bytes.starts_with(b"OggS") // OGG (Vorbis, Opus, FLAC)
-        || bytes.starts_with(b"fLaC") // FLAC
-        || bytes.starts_with(b"ID3") // MP3 with ID3v2 tag
-        || bytes.starts_with(b"\xFF\xFB") // MP3 frame sync (MPEG1 Layer3)
-        || bytes.starts_with(b"\xFF\xFA") // MP3 frame sync (MPEG1 Layer3)
-        || bytes.starts_with(b"\xFF\xF3") // MP3 frame sync (MPEG2 Layer3)
-        || bytes.starts_with(b"\xFF\xF2") // MP3 frame sync (MPEG2 Layer3)
+    const SIGNATURES: &[&[u8]] = &[
+        b"%PDF-",
+        b"PK\x03\x04", // ZIP local header
+        b"PK\x05\x06", // ZIP end of central directory
+        b"PK\x07\x08", // ZIP spanning/splitting
+        b"\x89PNG\r\n\x1a\n",
+        b"\xFF\xD8\xFF", // JPEG
+        b"GIF87a",
+        b"GIF89a",
+        b"\xFF\xFB", // MP3 frame sync (MPEG1 Layer3)
+        b"\xFF\xFA", // MP3 frame sync (MPEG1 Layer3)
+        b"\xFF\xF3", // MP3 frame sync (MPEG2 Layer3)
+        b"\xFF\xF2", // MP3 frame sync (MPEG2 Layer3)
+    ];
+    if SIGNATURES
+        .iter()
+        .any(|signature| bytes.starts_with(signature))
+    {
+        return true;
+    }
+    let after = |tag: &[u8]| bytes.strip_prefix(tag);
+    // RIFF <size> <form>: WAV, AVI, WebP.
+    let riff = after(b"RIFF")
+        .is_some_and(|rest| matches!(rest.get(4..8), Some(b"WAVE" | b"AVI " | b"WEBP")));
+    // ID3v2 <major 2-4> <revision>.
+    let id3 = after(b"ID3").is_some_and(|rest| matches!(rest.first(), Some(2..=4)));
+    // Ogg page: version byte 0.
+    let ogg = after(b"OggS").is_some_and(|rest| rest.first() == Some(&0));
+    // FLAC stream marker is followed by a STREAMINFO block header (type 0..=6).
+    let flac = after(b"fLaC").is_some_and(|rest| rest.first().is_some_and(|b| b & 0x7F <= 6));
+    riff || id3 || ogg || flac
 }
 
 // Null byte skew alone is not enough to identify UTF-16 -- binary formats with
@@ -183,6 +200,66 @@ mod tests {
             .flat_map(u16::to_be_bytes)
             .collect();
         assert_eq!(analyze_byte_content(&utf16be), ByteContent::Utf16Be);
+    }
+
+    #[test]
+    fn ascii_text_that_starts_like_a_binary_tag_is_still_text() {
+        for text in [
+            "ID3 tags are described here",
+            "RIFF format notes",
+            "OggS is a page marker",
+            "fLaC is a codec",
+            "IWAD and PWAD name Doom archives",
+            "PWAD files patch an IWAD",
+        ] {
+            assert_eq!(analyze_byte_content(text.as_bytes()), ByteContent::Unknown);
+        }
+    }
+
+    #[test]
+    fn a_tag_followed_by_what_its_format_puts_there_is_binary() {
+        let mut wav = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        wav.extend_from_slice(&[0, 1, 2, 3]);
+        let tagged = |tag: &[u8], then: &[u8]| [tag, then, &[b'a'; 64]].concat();
+        for bytes in [
+            wav,
+            tagged(b"RIFF\x24\0\0\0", b"AVI LIST"),
+            tagged(b"RIFF\x24\0\0\0", b"WEBPVP8 "),
+            tagged(b"ID3", b"\x02\0"),
+            tagged(b"ID3", b"\x04\0"),
+            tagged(b"OggS", b"\0\x02"),
+            tagged(b"fLaC", b"\0\0\0\x22"),
+            tagged(b"fLaC", b"\x86\0\0\x22"),
+        ] {
+            assert_eq!(
+                analyze_byte_content(&bytes),
+                ByteContent::Binary,
+                "{:?}",
+                &bytes[..12]
+            );
+        }
+    }
+
+    #[test]
+    fn a_tag_without_what_its_format_puts_after_it_is_text() {
+        let tagged = |tag: &[u8], then: &[u8]| [tag, then, &[b'a'; 64]].concat();
+        for bytes in [
+            tagged(b"RIFF", b" is a container, "),
+            tagged(b"RIFF\x24\0\0\0", b"JUNK"),
+            tagged(b"ID3", b"\x01\0"),
+            tagged(b"ID3", b"\x05\0"),
+            tagged(b"OggS", b"\x01\0"),
+            tagged(b"fLaC", b"\x07\0\0\x22"),
+            b"RIFF".to_vec(),
+            b"ID3".to_vec(),
+        ] {
+            assert_eq!(
+                analyze_byte_content(&bytes),
+                ByteContent::Unknown,
+                "{:?}",
+                &bytes[..bytes.len().min(12)]
+            );
+        }
     }
 
     #[test]
