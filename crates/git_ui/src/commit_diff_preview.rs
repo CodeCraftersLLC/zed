@@ -51,7 +51,9 @@ pub enum NoPreviewReason {
     /// The file is not large; the preview had already read as much as it may for
     /// this commit (or could not afford another read) before it reached the file.
     BudgetExhausted,
-    /// A picture that would decode to more pixels than a preview may hold.
+    /// A picture that would decode to more pixels than a preview may hold. A PNG
+    /// is still shown, reduced as it was read row by row; its side then carries
+    /// both the picture and this reason.
     TooManyPixels { width: u32, height: u32 },
     /// A picture format whose bytes do not decode.
     Undecodable,
@@ -60,7 +62,9 @@ pub enum NoPreviewReason {
 }
 
 /// One side of a change that is not shown as text: its size, the picture when it
-/// is an image small enough to show, and why there is none otherwise.
+/// is an image small enough to show, and why there is none otherwise. A picture
+/// that was reduced because the image is too large to decode whole keeps that
+/// reason too.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct BinaryBlob {
     pub size: u64,
@@ -801,7 +805,8 @@ fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
         return "Binary file, size unknown".to_string();
     };
     let size = format_binary_size(blob.size);
-    if blob.image.is_some() {
+    let reduced = matches!(blob.reason, Some(NoPreviewReason::TooManyPixels { .. }));
+    if blob.image.is_some() && !reduced {
         return size;
     }
     match blob.reason {
@@ -1014,6 +1019,19 @@ mod tests {
         };
         assert_eq!(binary_blob_caption(None), "Binary file, size unknown");
         assert_eq!(binary_blob_caption(Some(&shown)), "2.0 KB");
+        let reduced = BinaryBlob {
+            size: 775 * 1024 + 205,
+            image: shown.image.clone(),
+            reason: Some(NoPreviewReason::TooManyPixels {
+                width: 16_000,
+                height: 16_000,
+            }),
+        };
+        assert_eq!(
+            binary_blob_caption(Some(&reduced)),
+            "Image, 775.2 KB, 16000 \u{d7} 16000 px (too large to preview)",
+            "a picture reduced from an image too large to decode still says so"
+        );
         assert_eq!(
             binary_blob_caption(Some(&binary)),
             "Binary, 30.0 MB (no preview)"
