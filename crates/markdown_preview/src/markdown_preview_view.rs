@@ -348,6 +348,26 @@ impl MarkdownPreviewView {
         false
     }
 
+    /// The Markdown this preview shows, for a host test that reads what it drew.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn markdown(&self) -> &Entity<Markdown> {
+        &self.markdown
+    }
+
+    /// What a click on a link to `url` does in this preview, for a host test that
+    /// cannot aim a pointer at a link.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn follow_link(&self, url: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        handle_url_click(
+            url,
+            &cx.entity().downgrade(),
+            self.base_directory.clone(),
+            &self.workspace,
+            window,
+            cx,
+        );
+    }
+
     fn set_editor(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(active) = &self.active_editor
             && active.editor == editor

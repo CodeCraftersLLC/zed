@@ -71,7 +71,9 @@ pub trait Notification:
 pub struct SuppressEvent;
 
 impl Workspace {
-    #[cfg(any(test, feature = "test-support"))]
+    /// The notifications on screen. Not behind `test-support`: enabling that feature on
+    /// `workspace` cascades to `project` and `remote` (Cherry Pick's tests cannot), and a
+    /// host test needs to see that a toast was shown.
     pub fn notification_ids(&self) -> Vec<NotificationId> {
         self.notifications
             .iter()
