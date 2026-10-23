@@ -10,7 +10,12 @@ use image::{
     metadata::Orientation,
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, io::Cursor};
+use std::{
+    borrow::Cow,
+    io::Cursor,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use web_time::{Duration, Instant};
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
@@ -39,9 +44,18 @@ pub fn raster_limits() -> Limits {
 }
 
 /// Reads the header of `bytes` as `format`. An unreadable orientation tag is treated as "upright".
+///
+/// No pixels are decoded and no side is refused however long, but what the decoder buffers for
+/// the metadata it reads (a colour profile that PNG deflates, say) is held to
+/// [`STREAMED_METADATA_BYTES`], not the `image` crate's 512 MiB default: a profile past it is
+/// dropped, and the dimensions are still read.
 pub fn image_header(bytes: &[u8], format: ImageFormat) -> ImageResult<ImageHeader> {
     let bytes = single_ico_entry(bytes, format);
-    let mut decoder = ImageReader::with_format(Cursor::new(&*bytes), format).into_decoder()?;
+    let mut reader = ImageReader::with_format(Cursor::new(&*bytes), format);
+    let mut limits = Limits::no_limits();
+    limits.max_alloc = Some(STREAMED_METADATA_BYTES as u64);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder()?;
     let (width, height) = decoder.dimensions();
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let (width, height) = if swaps_axes(orientation) {
@@ -92,6 +106,30 @@ pub const MAX_THUMBNAIL_SIDE: u32 = 1024;
 /// What the `png` crate may keep for the chunks it buffers (a palette, a colour profile).
 const STREAMED_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
+/// How long [`png_thumbnail`] works before it gives up with [`ThumbnailError::TimedOut`]. A square
+/// [`MAX_RASTER_SIDE`] picture streams in a few seconds; this is the ceiling for a slow machine,
+/// not a budget to spend.
+pub const THUMBNAIL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How many pixels [`png_thumbnail`] streams between two looks at its cancel flag and the clock.
+/// Counted in pixels, not rows, so the wait is about ten milliseconds however wide the rows are.
+const PIXELS_BETWEEN_CHECKS: u64 = 1 << 20;
+
+/// Why [`png_thumbnail`] gave no thumbnail.
+#[derive(Debug, thiserror::Error)]
+pub enum ThumbnailError {
+    /// The picture is not one that can be streamed: it is damaged or truncated, it declares more
+    /// than the budget, or `max_side` is out of range.
+    #[error(transparent)]
+    Image(#[from] ImageError),
+    /// The caller set the cancel flag; no thumbnail is wanted any more.
+    #[error("the thumbnail was cancelled")]
+    Cancelled,
+    /// Streaming took longer than [`THUMBNAIL_DEADLINE`].
+    #[error("the thumbnail took longer than {} seconds", THUMBNAIL_DEADLINE.as_secs())]
+    TimedOut,
+}
+
 /// `(x_start, x_step, y_start, y_step)` of the seven Adam7 passes, in the order their rows are
 /// stored.
 const ADAM7_PASSES: [(u32, u32, u32, u32); 7] = [
@@ -116,13 +154,48 @@ const ADAM7_PASSES: [(u32, u32, u32, u32); 7] = [
 /// an error, not a partial thumbnail.
 ///
 /// `max_side` must be between 1 and [`MAX_THUMBNAIL_SIDE`].
-pub fn png_thumbnail(bytes: &[u8], max_side: u32) -> ImageResult<RgbaImage> {
+///
+/// The work is linear in the pixels the header declares, and a damaged file is found only when the
+/// stream reaches the damage, so the call looks at `cancel` and at [`THUMBNAIL_DEADLINE`] about
+/// every million pixels (about ten milliseconds of work). It returns [`ThumbnailError::Cancelled`]
+/// once `cancel` is set and [`ThumbnailError::TimedOut`] once the deadline has passed, with no
+/// thumbnail.
+pub fn png_thumbnail(
+    bytes: &[u8],
+    max_side: u32,
+    cancel: &AtomicBool,
+) -> Result<RgbaImage, ThumbnailError> {
+    let deadline = Instant::now() + THUMBNAIL_DEADLINE;
+    stream_png_thumbnail(bytes, max_side, || stop_requested(cancel, deadline))
+}
+
+fn stop_requested(cancel: &AtomicBool, deadline: Instant) -> Result<(), ThumbnailError> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(ThumbnailError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(ThumbnailError::TimedOut)
+    } else {
+        Ok(())
+    }
+}
+
+/// [`png_thumbnail`] with the stop decided by `checkpoint`, which is asked before any work and then
+/// every [`PIXELS_BETWEEN_CHECKS`] pixels, and ends the stream by returning an error.
+fn stream_png_thumbnail(
+    bytes: &[u8],
+    max_side: u32,
+    mut checkpoint: impl FnMut() -> Result<(), ThumbnailError>,
+) -> Result<RgbaImage, ThumbnailError> {
+    checkpoint()?;
     if !(1..=MAX_THUMBNAIL_SIDE).contains(&max_side) {
-        return Err(ImageError::Parameter(ParameterError::from_kind(
-            ParameterErrorKind::Generic(format!(
-                "a PNG thumbnail side is between 1 and {MAX_THUMBNAIL_SIDE}, not {max_side}"
-            )),
-        )));
+        return Err(
+            ImageError::Parameter(ParameterError::from_kind(ParameterErrorKind::Generic(
+                format!(
+                    "a PNG thumbnail side is between 1 and {MAX_THUMBNAIL_SIDE}, not {max_side}"
+                ),
+            )))
+            .into(),
+        );
     }
     let mut decoder = png::Decoder::new_with_limits(
         Cursor::new(bytes),
@@ -147,7 +220,7 @@ pub fn png_thumbnail(bytes: &[u8], max_side: u32) -> ImageResult<RgbaImage> {
         || height > MAX_STREAMED_SIDE
         || u64::from(width) * u64::from(height) > MAX_STREAMED_PIXELS
     {
-        return Err(limit_error(LimitErrorKind::DimensionError));
+        return Err(limit_error(LimitErrorKind::DimensionError).into());
     }
     let (color, depth) = reader.output_color_type();
     let samples = Samples::of(color, depth)?;
@@ -158,14 +231,20 @@ pub fn png_thumbnail(bytes: &[u8], max_side: u32) -> ImageResult<RgbaImage> {
     let thumbnail_width = thumbnail_width as usize;
     let mut sums = vec![Sum::default(); thumbnail_width * thumbnail_height as usize];
 
+    let mut pixels_since_check = 0;
     for placement in row_placements(width, height, interlaced) {
+        if pixels_since_check >= PIXELS_BETWEEN_CHECKS {
+            checkpoint()?;
+            pixels_since_check = 0;
+        }
+        pixels_since_check += u64::from(placement.samples);
         let row = reader
             .next_row()
             .map_err(png_error)?
             .ok_or_else(|| png_decode_error("the image data ends before its last row"))?;
         let pixel_bytes = samples.bytes_per_pixel();
         if row.data().len() != placement.samples as usize * pixel_bytes {
-            return Err(png_decode_error("a row is not the length its header gives"));
+            return Err(png_decode_error("a row is not the length its header gives").into());
         }
         let start = rows.cell_of[placement.y as usize] as usize * thumbnail_width;
         let sums_in_row = &mut sums[start..start + thumbnail_width];
@@ -815,6 +894,87 @@ mod tests {
         assert!(decode_image(&bytes, ImageFormat::Png, narrow).is_err());
     }
 
+    /// A 1 x 1 grey PNG carrying a colour profile of `profile_len` zero bytes, which deflates to
+    /// a few hundred kilobytes however long it claims to be.
+    fn png_with_colour_profile(profile_len: usize) -> Vec<u8> {
+        let mut info = png::Info::with_size(1, 1);
+        info.color_type = png::ColorType::Grayscale;
+        info.bit_depth = png::BitDepth::Eight;
+        info.icc_profile = Some(Cow::Owned(vec![0; profile_len]));
+        let mut bytes = Vec::new();
+        png::Encoder::with_info(&mut bytes, info)
+            .unwrap()
+            .write_header()
+            .unwrap()
+            .write_image_data(&[0])
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_header_probe_does_not_inflate_a_colour_profile_past_the_metadata_budget() {
+        let profile_len = 8 * STREAMED_METADATA_BYTES;
+        let bytes = png_with_colour_profile(profile_len);
+        assert!(
+            bytes.len() < profile_len / 100,
+            "the profile must deflate well"
+        );
+
+        let (whole, decoded) = peak_allocation::peak_bytes(|| {
+            decode_image(&bytes, ImageFormat::Png, Limits::no_limits()).unwrap()
+        });
+        drop(whole);
+        assert!(
+            decoded >= profile_len,
+            "the probe saw only {decoded} bytes held to inflate {profile_len}"
+        );
+
+        let (header, probed) =
+            peak_allocation::peak_bytes(|| image_header(&bytes, ImageFormat::Png));
+        let header = header.unwrap();
+        assert_eq!((header.width, header.height), (1, 1));
+        assert!(
+            probed < 2 * STREAMED_METADATA_BYTES,
+            "reading the header held {probed} bytes for a {profile_len} byte profile"
+        );
+    }
+
+    #[test]
+    fn the_header_probe_limits_leave_every_format_its_dimensions() {
+        let picture = DynamicImage::ImageRgb8(RgbImage::from_pixel(6, 4, Rgb([9, 8, 7])));
+        let encoded = |format| {
+            let mut bytes = Vec::new();
+            picture
+                .write_to(&mut Cursor::new(&mut bytes), format)
+                .unwrap();
+            bytes
+        };
+        let mut formats = vec![
+            (ImageFormat::Png, encoded(ImageFormat::Png)),
+            (ImageFormat::Jpeg, encoded(ImageFormat::Jpeg)),
+            (ImageFormat::Gif, encoded(ImageFormat::Gif)),
+            (ImageFormat::WebP, encoded(ImageFormat::WebP)),
+            (ImageFormat::Bmp, encoded(ImageFormat::Bmp)),
+            (ImageFormat::Tiff, encoded(ImageFormat::Tiff)),
+            (ImageFormat::Tga, encoded(ImageFormat::Tga)),
+            (ImageFormat::Qoi, encoded(ImageFormat::Qoi)),
+        ];
+        formats.push((
+            ImageFormat::Ico,
+            ico_with(&[(6, 4, 32, &encoded(ImageFormat::Png))]),
+        ));
+        for (format, bytes) in formats {
+            let header = image_header(&bytes, format).unwrap_or_else(|error| {
+                panic!("the {format:?} header is not read: {error}");
+            });
+            assert_eq!((header.width, header.height), (6, 4), "{format:?}");
+        }
+
+        // No side is refused, however long: the caller decides what it will decode.
+        let header = image_header(&header_only_png(100_000, 100_000), ImageFormat::Png).unwrap();
+        assert_eq!((header.width, header.height), (100_000, 100_000));
+    }
+
     #[test]
     fn the_header_is_read_without_decoding_pixels() {
         // Reading the header of a PNG that declares 16000 x 16000 pixels must not try to allocate or
@@ -1008,6 +1168,15 @@ mod tests {
         ));
     }
 
+    /// [`png_thumbnail`] that is never cancelled, for the tests of what it draws. A stop would be a
+    /// failure of the test, not a result to match.
+    fn streamed_thumbnail(bytes: &[u8], max_side: u32) -> ImageResult<RgbaImage> {
+        png_thumbnail(bytes, max_side, &AtomicBool::new(false)).map_err(|error| match error {
+            ThumbnailError::Image(error) => error,
+            stopped => panic!("the thumbnail was stopped: {stopped}"),
+        })
+    }
+
     /// Appends a PNG chunk, with the CRC the format asks for.
     fn push_png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
         png.extend((data.len() as u32).to_be_bytes());
@@ -1162,7 +1331,7 @@ mod tests {
             "a PNG wider than MAX_RASTER_SIDE is refused by the whole-image decode"
         );
 
-        let thumbnail = png_thumbnail(&bytes, 100).unwrap();
+        let thumbnail = streamed_thumbnail(&bytes, 100).unwrap();
         assert_eq!(thumbnail.dimensions(), (100, 2));
         for y in 0..2 {
             assert_eq!(thumbnail.get_pixel(0, y).0, [255, 0, 0, 255]);
@@ -1179,7 +1348,7 @@ mod tests {
         let bytes = two_tone_png((300, 20_000), [green, yellow], false);
         assert!(decode_image(&bytes, ImageFormat::Png, raster_limits()).is_err());
 
-        let thumbnail = png_thumbnail(&bytes, 100).unwrap();
+        let thumbnail = streamed_thumbnail(&bytes, 100).unwrap();
         assert_eq!(thumbnail.dimensions(), (2, 100));
         for x in 0..2 {
             assert_eq!(thumbnail.get_pixel(x, 0).0, [0, 255, 0, 255]);
@@ -1193,7 +1362,7 @@ mod tests {
     fn a_thumbnail_cell_is_the_mean_of_the_pixels_it_covers() {
         const ROWS: [[u8; 6]; 2] = [[0, 100, 50, 150, 10, 30], [20, 200, 70, 50, 90, 13]];
         let bytes = grey_png(6, 2, |x, y| ROWS[y as usize][x as usize]);
-        let thumbnail = png_thumbnail(&bytes, 3).unwrap();
+        let thumbnail = streamed_thumbnail(&bytes, 3).unwrap();
         assert_eq!(thumbnail.dimensions(), (3, 1));
         let cells: Vec<[u8; 4]> = thumbnail.pixels().map(|pixel| pixel.0).collect();
         assert_eq!(
@@ -1212,7 +1381,7 @@ mod tests {
             |_| {},
             &[255, 0, 0, 255, 0, 0, 255, 0],
         );
-        let thumbnail = png_thumbnail(&bytes, 1).unwrap();
+        let thumbnail = streamed_thumbnail(&bytes, 1).unwrap();
         assert_eq!(thumbnail.dimensions(), (1, 1));
         assert_eq!(thumbnail.get_pixel(0, 0).0, [255, 0, 0, 128]);
     }
@@ -1220,7 +1389,7 @@ mod tests {
     #[test]
     fn a_streamed_thumbnail_is_upright_by_the_exif_orientation() {
         let bytes = png(&landscape(), Some(exif_orientation(6)));
-        let thumbnail = png_thumbnail(&bytes, 100).unwrap();
+        let thumbnail = streamed_thumbnail(&bytes, 100).unwrap();
         assert_eq!(thumbnail.dimensions(), (2, 4));
         // The stored top-left corner of an orientation-6 picture is its top-right once upright.
         assert_eq!(thumbnail.get_pixel(1, 0).0, [255, 0, 0, 255]);
@@ -1228,7 +1397,7 @@ mod tests {
 
         let unreadable = png(&landscape(), Some(exif_orientation(9)));
         assert_eq!(
-            png_thumbnail(&unreadable, 100).unwrap().dimensions(),
+            streamed_thumbnail(&unreadable, 100).unwrap().dimensions(),
             (4, 2)
         );
     }
@@ -1236,7 +1405,7 @@ mod tests {
     #[test]
     fn a_picture_already_within_the_side_is_not_enlarged() {
         let bytes = grey_png(4, 2, |x, y| (x * 10 + y) as u8);
-        let thumbnail = png_thumbnail(&bytes, 100).unwrap();
+        let thumbnail = streamed_thumbnail(&bytes, 100).unwrap();
         assert_eq!(thumbnail.dimensions(), (4, 2));
         assert_eq!(thumbnail.get_pixel(3, 1).0, [31, 31, 31, 255]);
     }
@@ -1307,7 +1476,7 @@ mod tests {
                 },
                 case.data,
             );
-            let thumbnail = png_thumbnail(&bytes, 8).unwrap();
+            let thumbnail = streamed_thumbnail(&bytes, 8).unwrap();
             let pixels: Vec<[u8; 4]> = thumbnail.pixels().map(|pixel| pixel.0).collect();
             assert_eq!(pixels, case.expected, "{}", case.name);
         }
@@ -1342,8 +1511,8 @@ mod tests {
 
             for side in [width.max(height), 4, 2, 1] {
                 assert_eq!(
-                    png_thumbnail(&interlaced, side).unwrap(),
-                    png_thumbnail(&plain, side).unwrap(),
+                    streamed_thumbnail(&interlaced, side).unwrap(),
+                    streamed_thumbnail(&plain, side).unwrap(),
                     "{width}x{height} within {side}"
                 );
             }
@@ -1356,7 +1525,7 @@ mod tests {
         for cut in [0, 4, PNG_SIGNATURE.len(), 20, 33, bytes.len() / 2] {
             assert!(
                 matches!(
-                    png_thumbnail(&bytes[..cut], 16),
+                    streamed_thumbnail(&bytes[..cut], 16),
                     Err(ImageError::Decoding(_))
                 ),
                 "cut at {cut} of {}",
@@ -1364,14 +1533,14 @@ mod tests {
             );
         }
         for cut in 0..bytes.len() {
-            let _ = png_thumbnail(&bytes[..cut], 16);
+            let _ = streamed_thumbnail(&bytes[..cut], 16);
         }
 
         let mut damaged = bytes;
         let middle = damaged.len() / 2;
         damaged[middle] ^= 0xFF;
-        assert!(png_thumbnail(&damaged, 16).is_err());
-        assert!(png_thumbnail(b"not a png at all", 16).is_err());
+        assert!(streamed_thumbnail(&damaged, 16).is_err());
+        assert!(streamed_thumbnail(b"not a png at all", 16).is_err());
     }
 
     #[test]
@@ -1380,7 +1549,7 @@ mod tests {
         let too_long = header_only_png(MAX_STREAMED_SIDE + 1, 1);
         for header in [too_many_pixels, too_long] {
             assert!(matches!(
-                png_thumbnail(&header, 64),
+                streamed_thumbnail(&header, 64),
                 Err(ImageError::Limits(error)) if matches!(error.kind(), LimitErrorKind::DimensionError)
             ));
         }
@@ -1388,7 +1557,7 @@ mod tests {
         // The largest header a PNG can state is refused before anything is sized from it.
         let largest = header_only_png(i32::MAX as u32, i32::MAX as u32);
         assert!(matches!(
-            png_thumbnail(&largest, 64),
+            streamed_thumbnail(&largest, 64),
             Err(ImageError::Limits(_))
         ));
 
@@ -1396,7 +1565,7 @@ mod tests {
         // no pixels.
         let at_the_budget = header_only_png(MAX_RASTER_SIDE, MAX_RASTER_SIDE);
         assert!(matches!(
-            png_thumbnail(&at_the_budget, 64),
+            streamed_thumbnail(&at_the_budget, 64),
             Err(ImageError::Decoding(_))
         ));
     }
@@ -1406,11 +1575,88 @@ mod tests {
         let bytes = grey_png(2, 2, |_, _| 0);
         for side in [0, MAX_THUMBNAIL_SIDE + 1] {
             assert!(matches!(
-                png_thumbnail(&bytes, side),
+                streamed_thumbnail(&bytes, side),
                 Err(ImageError::Parameter(_))
             ));
         }
-        assert!(png_thumbnail(&bytes, MAX_THUMBNAIL_SIDE).is_ok());
+        assert!(streamed_thumbnail(&bytes, MAX_THUMBNAIL_SIDE).is_ok());
+    }
+
+    /// A grey PNG of 16.7 million pixels: sixteen looks at the cancel flag and the clock.
+    fn long_stream() -> (Vec<u8>, u64) {
+        (grey_png(4096, 4096, |x, y| (x ^ y) as u8), 4096 * 4096)
+    }
+
+    /// `stream_png_thumbnail` with `stop` asked at every checkpoint, and how often it was asked.
+    fn stream_counting_checkpoints(
+        bytes: &[u8],
+        mut stop: impl FnMut(usize) -> Result<(), ThumbnailError>,
+    ) -> (Result<RgbaImage, ThumbnailError>, usize) {
+        let mut asked = 0;
+        let result = stream_png_thumbnail(bytes, 64, || {
+            asked += 1;
+            stop(asked)
+        });
+        (result, asked)
+    }
+
+    #[test]
+    fn a_long_stream_is_asked_whether_to_go_on_once_per_million_pixels() {
+        let (bytes, pixels) = long_stream();
+        let (result, asked) = stream_counting_checkpoints(&bytes, |_| Ok(()));
+        result.unwrap();
+        assert_eq!(asked as u64, 1 + (pixels - 1) / PIXELS_BETWEEN_CHECKS);
+    }
+
+    #[test]
+    fn a_stream_cancelled_midway_stops_at_that_check() {
+        let (bytes, _) = long_stream();
+        let cancel = AtomicBool::new(false);
+        let far_deadline = Instant::now() + Duration::from_secs(3600);
+        let (result, asked) = stream_counting_checkpoints(&bytes, |asked| {
+            if asked == 3 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            stop_requested(&cancel, far_deadline)
+        });
+        assert!(matches!(result, Err(ThumbnailError::Cancelled)));
+        assert_eq!(asked, 3, "the stream went on after it was cancelled");
+    }
+
+    #[test]
+    fn a_cancelled_thumbnail_does_no_work() {
+        let cancelled = AtomicBool::new(true);
+        let (bytes, _) = long_stream();
+        for input in [&bytes[..], b"not a png at all"] {
+            assert!(matches!(
+                png_thumbnail(input, 64, &cancelled),
+                Err(ThumbnailError::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_stream_past_its_deadline_is_stopped_at_its_next_check() {
+        let (bytes, _) = long_stream();
+        let never_cancelled = AtomicBool::new(false);
+        let now = Instant::now();
+        let (result, asked) =
+            stream_counting_checkpoints(&bytes, |_| stop_requested(&never_cancelled, now));
+        assert!(matches!(result, Err(ThumbnailError::TimedOut)));
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn a_cancel_outranks_a_deadline_and_a_live_flag_does_not_stop_a_thumbnail() {
+        let now = Instant::now();
+        assert!(matches!(
+            stop_requested(&AtomicBool::new(true), now),
+            Err(ThumbnailError::Cancelled)
+        ));
+        let live = AtomicBool::new(false);
+        stop_requested(&live, now + Duration::from_secs(60)).unwrap();
+        let picture = png_thumbnail(&grey_png(2, 2, |_, _| 7), 2, &live).unwrap();
+        assert_eq!(picture.dimensions(), (2, 2));
     }
 
     fn animated_png(canvas: (u32, u32), frames: &[((u32, u32), u8)]) -> Vec<u8> {
@@ -1433,7 +1679,7 @@ mod tests {
     #[test]
     fn an_animated_png_is_thumbnailed_from_its_first_frame() {
         let bytes = animated_png((4, 4), &[((4, 4), 10), ((4, 4), 200)]);
-        let thumbnail = png_thumbnail(&bytes, 4).unwrap();
+        let thumbnail = streamed_thumbnail(&bytes, 4).unwrap();
         assert_eq!(thumbnail.dimensions(), (4, 4));
         assert!(thumbnail.pixels().all(|pixel| pixel.0 == [10, 10, 10, 255]));
     }
@@ -1444,7 +1690,7 @@ mod tests {
         // is never drawn from part of it.
         let bytes = animated_png((4, 4), &[((2, 2), 10), ((4, 4), 200)]);
         assert!(matches!(
-            png_thumbnail(&bytes, 4),
+            streamed_thumbnail(&bytes, 4),
             Err(ImageError::Decoding(_))
         ));
     }
@@ -1461,7 +1707,7 @@ mod tests {
             "the probe saw only {whole} bytes held to decode {raster_bytes}"
         );
 
-        let (thumbnail, streamed) = peak_allocation::peak_bytes(|| png_thumbnail(bytes, 100));
+        let (thumbnail, streamed) = peak_allocation::peak_bytes(|| streamed_thumbnail(bytes, 100));
         thumbnail.unwrap();
         assert!(
             streamed < raster_bytes / 8,
