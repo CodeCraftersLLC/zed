@@ -614,6 +614,11 @@ pub(crate) fn header_jump_data(
     }
 }
 
+/// A deleted file has nothing to open: the button would do nothing.
+fn offers_open_file(can_open: bool, disk_state: language::DiskState) -> bool {
+    can_open && !disk_state.is_deleted()
+}
+
 pub(crate) fn render_buffer_header(
     editor: &Entity<Editor>,
     for_excerpt: &ExcerptBoundaryInfo,
@@ -658,7 +663,8 @@ pub(crate) fn render_buffer_header(
         .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
         .unwrap_or_default();
     let file = buffer.file();
-    let can_open_excerpts = file.is_none_or(|file| file.can_open());
+    let can_open_excerpts =
+        file.is_none_or(|file| offers_open_file(file.can_open(), file.disk_state()));
     let path_style = file.map(|file| file.path_style(cx));
     let relative_path = buffer.resolve_file_path(include_root, cx);
     let (parent_path, filename) = if let Some(path) = &relative_path {
@@ -1069,4 +1075,21 @@ fn file_status_label_color(file_status: Option<FileStatus>) -> Color {
             Color::Default
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offers_open_file;
+    use language::DiskState;
+
+    #[test]
+    fn open_file_is_not_offered_for_a_deleted_file() {
+        assert!(!offers_open_file(true, DiskState::Deleted));
+        assert!(!offers_open_file(
+            true,
+            DiskState::Historic { was_deleted: true }
+        ));
+        assert!(offers_open_file(true, DiskState::New));
+        assert!(!offers_open_file(false, DiskState::New));
+    }
 }
