@@ -789,6 +789,69 @@ mod tests {
         assert_eq!(layout.runs[0].glyphs[1].id, GlyphId(69u32)); // b
     }
 
+    /// CoreText joins and reorders right-to-left text itself, even across a font-run boundary
+    /// (the `break_ligature` size change), so the macOS shaper needs no bidi handling.
+    #[test]
+    fn test_layout_line_arabic_is_joined_and_in_visual_order() {
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+        let word = "\u{645}\u{631}\u{62d}\u{628}\u{627}";
+        let glyphs = |text: &str, runs: &[FontRun]| {
+            fonts
+                .layout_line(text, px(16.), runs)
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| (glyph.id, glyph.index)))
+                .collect::<Vec<_>>()
+        };
+
+        let whole = glyphs(
+            word,
+            &[FontRun {
+                font_id,
+                len: word.len(),
+            }],
+        );
+        let indices = whole.iter().map(|(_, index)| *index).collect::<Vec<_>>();
+        assert!(
+            indices.windows(2).all(|pair| pair[0] > pair[1]),
+            "right-to-left glyphs come out in visual order, last letter first: {indices:?}"
+        );
+
+        let alone = glyphs(
+            "\u{645}",
+            &[FontRun {
+                font_id,
+                len: "\u{645}".len(),
+            }],
+        );
+        let first_letter = whole.last().unwrap().0;
+        assert_ne!(
+            first_letter, alone[0].0,
+            "the word-initial letter takes its joined form, not the isolated one"
+        );
+
+        let split_at = "\u{645}\u{631}".len();
+        let split = glyphs(
+            word,
+            &[
+                FontRun {
+                    font_id,
+                    len: split_at,
+                },
+                FontRun {
+                    font_id,
+                    len: word.len() - split_at,
+                },
+            ],
+        );
+        assert_eq!(
+            whole.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            split.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "a font-run boundary inside a word must not change how its letters join"
+        );
+    }
+
     #[test]
     fn test_layout_line_zwnj_insertion() {
         let fonts = MacTextSystem::new();
