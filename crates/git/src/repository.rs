@@ -1802,10 +1802,18 @@ impl GitRepository for RealGitRepository {
 
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>> {
         let git = self.git_binary_in_worktree();
-        let args = git_status_args(path_prefixes);
+        let path_prefixes = path_prefixes.to_vec();
         log::debug!("Checking for git status in {path_prefixes:?}");
         self.executor.spawn(async move {
             let git = git?;
+            let configured = git
+                .build_command(&["config", "--get", "status.showUntrackedFiles"])
+                .output()
+                .await?;
+            let args = git_status_args(
+                &path_prefixes,
+                String::from_utf8_lossy(&configured.stdout).trim(),
+            );
             let output = git.build_command(&args).output().await?;
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3404,11 +3412,18 @@ fn parse_initial_graph_output<'a>(
         .collect()
 }
 
-fn git_status_args(path_prefixes: &[RepoPath]) -> Vec<OsString> {
+/// Untracked files are listed one by one (`all`) because the diff pane opens each as a file,
+/// unless the repository hides them with `status.showUntrackedFiles = no`.
+fn git_status_args(path_prefixes: &[RepoPath], show_untracked_files: &str) -> Vec<OsString> {
+    let untracked_files = if show_untracked_files.eq_ignore_ascii_case("no") {
+        "--untracked-files=no"
+    } else {
+        "--untracked-files=all"
+    };
     let mut args = vec![
         OsString::from("status"),
         OsString::from("--porcelain=v1"),
-        OsString::from("--untracked-files=all"),
+        OsString::from(untracked_files),
         OsString::from("--no-renames"),
         OsString::from("-z"),
         OsString::from("--"),
@@ -3910,6 +3925,21 @@ mod tests {
             "git command failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn status_hides_untracked_files_only_when_the_repository_says_no() {
+        let flag = |setting: &str| {
+            git_status_args(&[], setting)
+                .into_iter()
+                .find(|arg| arg.to_string_lossy().starts_with("--untracked-files"))
+                .unwrap()
+        };
+        assert_eq!(flag(""), "--untracked-files=all");
+        assert_eq!(flag("all"), "--untracked-files=all");
+        assert_eq!(flag("normal"), "--untracked-files=all");
+        assert_eq!(flag("no"), "--untracked-files=no");
+        assert_eq!(flag("NO"), "--untracked-files=no");
     }
 
     fn git_init_repo(path: &Path) {
