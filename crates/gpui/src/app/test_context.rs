@@ -366,6 +366,11 @@ impl TestAppContext {
         self.test_platform.pending_prompt()
     }
 
+    /// The styling level of the open alert dialog, if any.
+    pub fn pending_prompt_level(&self) -> Option<crate::PromptLevel> {
+        self.test_platform.pending_prompt_level()
+    }
+
     /// All the urls that have been opened with cx.open_url() during this test.
     pub fn opened_url(&self) -> Option<String> {
         self.test_platform.opened_url.borrow().clone()

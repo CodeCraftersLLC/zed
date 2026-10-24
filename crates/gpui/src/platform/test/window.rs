@@ -215,7 +215,7 @@ impl PlatformWindow for TestWindow {
 
     fn prompt(
         &self,
-        _level: crate::PromptLevel,
+        level: crate::PromptLevel,
         msg: &str,
         detail: Option<&str>,
         answers: &[PromptButton],
@@ -226,7 +226,7 @@ impl PlatformWindow for TestWindow {
                 .platform
                 .upgrade()
                 .expect("platform dropped")
-                .prompt(msg, detail, answers),
+                .prompt(level, msg, detail, answers),
         )
     }
 

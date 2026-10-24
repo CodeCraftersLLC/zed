@@ -2,9 +2,9 @@ use crate::{
     AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
     DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, PathPromptOptions, Platform,
     PlatformDisplay, PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper,
-    PlatformTextSystem, PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
-    SourceMetadata, Task, TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams,
-    size,
+    PlatformTextSystem, PromptButton, PromptLevel, ScreenCaptureFrame, ScreenCaptureSource,
+    ScreenCaptureStream, SourceMetadata, Task, TestDisplay, TestWindow, ThermalState,
+    WindowAppearance, WindowParams, size,
 };
 use anyhow::Result;
 use collections::VecDeque;
@@ -76,6 +76,7 @@ impl ScreenCaptureStream for TestScreenCaptureStream {
 }
 
 struct TestPrompt {
+    level: PromptLevel,
     msg: String,
     detail: Option<String>,
     answers: Vec<String>,
@@ -200,6 +201,10 @@ impl TestPlatform {
         !self.prompts.borrow().multiple_choice.is_empty()
     }
 
+    pub(crate) fn pending_prompt_level(&self) -> Option<PromptLevel> {
+        Some(self.prompts.borrow().multiple_choice.front()?.level)
+    }
+
     pub(crate) fn pending_prompt(&self) -> Option<(String, String)> {
         let prompts = self.prompts.borrow();
         let prompt = prompts.multiple_choice.front()?;
@@ -215,6 +220,7 @@ impl TestPlatform {
 
     pub(crate) fn prompt(
         &self,
+        level: PromptLevel,
         msg: &str,
         detail: Option<&str>,
         answers: &[PromptButton],
@@ -225,6 +231,7 @@ impl TestPlatform {
             .borrow_mut()
             .multiple_choice
             .push_back(TestPrompt {
+                level,
                 msg: msg.to_string(),
                 detail: detail.map(|s| s.to_string()),
                 answers,

@@ -85,7 +85,7 @@ fn has_execute_bit(_path: &Path) -> bool {
 
 /// True when the default handler would run `path` rather than show it. A link is judged
 /// by its target as well as its own name, so `notes.txt -> tool.exe` is a program too.
-fn is_program_or_shortcut(path: &Path) -> bool {
+pub fn is_program_or_shortcut(path: &Path) -> bool {
     let target = std::fs::canonicalize(path).ok();
     [Some(path), target.as_deref()]
         .into_iter()

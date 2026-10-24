@@ -1330,6 +1330,7 @@ pub struct FakeFs {
     // Use an unfair lock to ensure tests are deterministic.
     state: Arc<Mutex<FakeFsState>>,
     executor: gpui::BackgroundExecutor,
+    case_insensitive: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "test-support")]
@@ -1641,12 +1642,20 @@ impl FakeFs {
     /// https://doc.rust-lang.org/nightly/std/time/struct.SystemTime.html#platform-specific-behavior
     const SYSTEMTIME_INTERVAL: Duration = Duration::from_nanos(100);
 
+    /// Makes the worktree scanner report a case-insensitive filesystem (Windows, default macOS).
+    /// Only the reported flag changes: paths in the fake tree are still matched exactly.
+    pub fn set_case_insensitive(&self, case_insensitive: bool) {
+        self.case_insensitive
+            .store(case_insensitive, Ordering::Release);
+    }
+
     pub fn new(executor: gpui::BackgroundExecutor) -> Arc<Self> {
         let (tx, rx) = async_channel::bounded::<PathBuf>(10);
 
         let this = Arc::new_cyclic(|this| Self {
             this: this.clone(),
             executor: executor.clone(),
+            case_insensitive: Default::default(),
             state: Arc::new(Mutex::new(FakeFsState {
                 root: FakeFsEntry::Dir {
                     inode: 0,
@@ -3219,7 +3228,7 @@ impl Fs for FakeFs {
     }
 
     async fn is_case_sensitive(&self) -> bool {
-        true
+        !self.case_insensitive.load(Ordering::Acquire)
     }
 
     fn subscribe_to_jobs(&self) -> JobEventReceiver {

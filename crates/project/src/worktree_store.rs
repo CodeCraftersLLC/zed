@@ -587,7 +587,13 @@ impl WorktreeStore {
                             },
                         )
                         .await
-                        .with_context(|| format!("renaming {old_path:?} into {new_path:?}"))
+                        .with_context(|| {
+                            format!(
+                                "renaming {} into {}",
+                                old_path.display(),
+                                new_path.display()
+                            )
+                        })
                     };
 
                 let rename = cx.background_spawn({
