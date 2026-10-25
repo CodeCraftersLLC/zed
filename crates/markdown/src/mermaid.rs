@@ -308,11 +308,18 @@ fn diagram_type(source: &str) -> &str {
         // YAML block scalar of the front matter.
         lines.by_ref().find(|line| line.trim_end() == "---");
     }
-    lines
-        .map(str::trim)
-        .find(|line| !line.starts_with("%%"))
-        .and_then(|line| line.split_whitespace().next())
-        .unwrap_or("")
+    let mut lines = lines.map(str::trim);
+    while let Some(line) = lines.next() {
+        if line.starts_with("%%{") {
+            // A directive may run over several lines, to the one that holds its `}%%`.
+            if !line.contains("}%%") {
+                lines.by_ref().find(|line| line.contains("}%%"));
+            }
+        } else if !line.starts_with("%%") {
+            return line.split_whitespace().next().unwrap_or("");
+        }
+    }
+    ""
 }
 
 /// We deliberately block rendering of some diagram types, even though `merman`
@@ -830,6 +837,11 @@ mod tests {
                 "sequenceDiagram",
             ),
             ("%% a note\n%% another\npie title Pets", "pie"),
+            ("%%{\n  init: {}\n}%%\nflowchart TD", "flowchart"),
+            (
+                "%%{ init: {\n  \"theme\": \"dark\"\n} }%%\n%% note\ngantt",
+                "gantt",
+            ),
             ("---\ntitle: t\n---\n%%{init: {}}%%\ngantt", "gantt"),
             ("sankey-beta\na,b,1", "sankey-beta"),
             ("", ""),
