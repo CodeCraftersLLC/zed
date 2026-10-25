@@ -3485,18 +3485,20 @@ async fn cached_show_untracked_files(
         "git config failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let (value, mut files) = parse_config_list(&output.stdout, &git.working_directory);
+    let (value, mut files, watchable) = parse_config_list(&output.stdout, &git.working_directory);
     for candidate in candidates {
         if !files.contains(&candidate) {
             files.push(candidate);
         }
     }
     let stamp = config_stamp(&files);
-    // A file touched since the read began may have changed under it: read again next time.
-    if !stamp
-        .iter()
-        .flatten()
-        .any(|(modified, _)| *modified >= read_at)
+    // A file touched since the read began may have changed under it: read again next time. So is
+    // a value some of whose files cannot be watched.
+    if watchable
+        && !stamp
+            .iter()
+            .flatten()
+            .any(|(modified, _)| *modified >= read_at)
     {
         *cache.lock() = Some(ShowUntrackedFiles {
             value: value.clone(),
@@ -3511,10 +3513,12 @@ async fn cached_show_untracked_files(
 /// of `git config --list --show-origin -z`, which is `origin NUL key NL value NUL` for each entry.
 /// Relative origins are relative to `working_directory`, where git ran. A file an `include.path` or
 /// `includeIf.<condition>.path` entry names is a config file too, even when it is empty or missing
-/// and so is the origin of no entry yet.
-fn parse_config_list(output: &[u8], working_directory: &Path) -> (String, Vec<PathBuf>) {
+/// and so is the origin of no entry yet. The last item is false when an include names a file this
+/// cannot place (`~user/...`, `%(prefix)/...`), so the files cannot vouch for the value.
+fn parse_config_list(output: &[u8], working_directory: &Path) -> (String, Vec<PathBuf>, bool) {
     let mut value = String::new();
     let mut files = Vec::new();
+    let mut watchable = true;
     let mut watch = |file: PathBuf| {
         if !files.contains(&file) {
             files.push(file);
@@ -3531,14 +3535,20 @@ fn parse_config_list(output: &[u8], working_directory: &Path) -> (String, Vec<Pa
             value = entry_value.to_string();
         }
         if let Some(origin_file) = origin_file {
-            let target = is_include_path_key(key)
-                .then(|| include_target(entry_value, &origin_file))
-                .flatten();
+            let target = if is_include_path_key(key) {
+                include_target(entry_value, &origin_file)
+            } else {
+                IncludeTarget::Nothing
+            };
             watch(origin_file);
-            target.map(&mut watch);
+            match target {
+                IncludeTarget::Nothing => {}
+                IncludeTarget::File(file) => watch(file),
+                IncludeTarget::Unplaceable => watchable = false,
+            }
         }
     }
-    (value, files)
+    (value, files, watchable)
 }
 
 /// `include.path` and `includeIf.<condition>.path`, which git reads case-insensitively.
@@ -3547,16 +3557,36 @@ fn is_include_path_key(key: &str) -> bool {
     key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"))
 }
 
-/// The file an include entry in `including_file` names: `~/` is the home directory and a relative
-/// path is relative to the including file's directory.
-fn include_target(path: &str, including_file: &Path) -> Option<PathBuf> {
+/// What an include entry names.
+#[derive(Debug, PartialEq)]
+enum IncludeTarget {
+    Nothing,
+    File(PathBuf),
+    /// A path form only git resolves: another user's home or git's install prefix.
+    Unplaceable,
+}
+
+/// The file an include entry in `including_file` names: `:(optional)` marks a file that may be
+/// missing, `~/` is the home directory and a relative path is relative to the including file's
+/// directory.
+fn include_target(path: &str, including_file: &Path) -> IncludeTarget {
+    let path = path.strip_prefix(":(optional)").unwrap_or(path);
     if path.is_empty() {
-        return None;
+        return IncludeTarget::Nothing;
     }
     if let Some(from_home) = path.strip_prefix("~/") {
-        return std::env::home_dir().map(|home| home.join(from_home));
+        return std::env::home_dir().map_or(IncludeTarget::Unplaceable, |home| {
+            IncludeTarget::File(home.join(from_home))
+        });
     }
-    Some(including_file.parent()?.join(path))
+    if path.starts_with('~') || path.starts_with("%(prefix)/") {
+        return IncludeTarget::Unplaceable;
+    }
+    including_file
+        .parent()
+        .map_or(IncludeTarget::Unplaceable, |dir| {
+            IncludeTarget::File(dir.join(path))
+        })
 }
 
 /// Whether `status.showUntrackedFiles` is set to a value git reads as false, which hides untracked
@@ -4210,7 +4240,7 @@ mod tests {
             command line:\0core.fsmonitor\nfalse\0\
             file:/mnt/custom/included\0status.showuntrackedfiles\nno\0\
             file:.git/config\0user.name\nA\0";
-        let (value, files) = parse_config_list(output, Path::new("/work"));
+        let (value, files, _) = parse_config_list(output, Path::new("/work"));
         assert_eq!(value, "no", "the last entry wins");
         assert_eq!(
             files,
@@ -4223,7 +4253,7 @@ mod tests {
         );
         assert_eq!(
             parse_config_list(b"", Path::new("/work")),
-            (String::new(), vec![])
+            (String::new(), vec![], true)
         );
         assert_eq!(
             parse_config_list(b"file:a\0status.showuntrackedfiles\0", Path::new("/work")).0,
@@ -4239,7 +4269,8 @@ mod tests {
             file:/mnt/custom/included\0INCLUDE.PATH\nnested/deeper.cfg\0\
             file:.git/config\0core.editor\nvim\0\
             file:.git/config\0include.path\n\0";
-        let (_, files) = parse_config_list(output, Path::new("/work"));
+        let (_, files, watchable) = parse_config_list(output, Path::new("/work"));
+        assert!(watchable);
         assert_eq!(
             files,
             [
@@ -4250,6 +4281,38 @@ mod tests {
                 PathBuf::from("/mnt/custom/nested/deeper.cfg"),
             ],
             "relative targets are relative to the including file; an empty path names nothing"
+        );
+    }
+
+    #[test]
+    fn an_optional_include_is_watched_at_the_file_it_names() {
+        let output = b"file:.git/config\0include.path\n:(optional)../shared.cfg\0\
+            file:.git/config\0include.path\n:(optional)\0";
+        let (_, files, watchable) = parse_config_list(output, Path::new("/work"));
+        assert!(watchable);
+        assert_eq!(
+            files,
+            [
+                PathBuf::from("/work/.git/config"),
+                PathBuf::from("/work/.git/../shared.cfg"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_include_only_git_can_place_leaves_the_value_unwatchable() {
+        for path in [
+            "~someone/x.cfg",
+            "%(prefix)/etc/x.cfg",
+            ":(optional)~someone/x",
+        ] {
+            let output = format!("file:.git/config\0include.path\n{path}\0");
+            let (_, _, watchable) = parse_config_list(output.as_bytes(), Path::new("/work"));
+            assert!(!watchable, "{path}");
+        }
+        assert_eq!(
+            include_target("%(prefix)/x", Path::new("/work/.git/config")),
+            IncludeTarget::Unplaceable
         );
     }
 
