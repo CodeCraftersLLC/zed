@@ -431,6 +431,7 @@ fn zed_settings_asking_for_an_external_formatter(marker: &Path) -> serde_json::V
     })
 }
 
+#[cfg(unix)]
 const EDITORCONFIG_THAT_REWRITES_ON_SAVE: &str =
     "root = true\n[*]\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n";
 
@@ -7040,6 +7041,66 @@ async fn test_line_ending_editorconfig_on_format_and_save(cx: &mut gpui::TestApp
         assert_eq!(
             file_system.load(&saved_path).await.unwrap(),
             expected_saved_contents,
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_an_enforced_line_ending_reaches_every_line_of_a_mixed_file(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    for (end_of_line, mixed, expected) in [
+        ("lf", "one\ntwo\r\nthree\n", "one\ntwo\nthree\n"),
+        ("crlf", "one\r\ntwo\nthree\r\n", "one\r\ntwo\r\nthree\r\n"),
+    ] {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                ".editorconfig": format!("root = true\n[*.rs]\nend_of_line = {end_of_line}\n"),
+                "mixed.rs": mixed,
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(rust_lang());
+        cx.executor().run_until_parked();
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("mixed.rs")), cx)
+            })
+            .await
+            .unwrap();
+        buffer.read_with(cx, |buffer, _| {
+            assert!(!buffer.line_endings().is_uniform(), "{end_of_line}");
+        });
+
+        project
+            .update(cx, |project, cx| {
+                project.format(
+                    HashSet::from_iter([buffer.clone()]),
+                    project::lsp_store::LspFormatTarget::Buffers,
+                    false,
+                    project::lsp_store::FormatTrigger::Save,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer, cx))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.load(path!("/dir/mixed.rs").as_ref()).await.unwrap(),
+            expected,
+            "end_of_line = {end_of_line}"
         );
     }
 }
