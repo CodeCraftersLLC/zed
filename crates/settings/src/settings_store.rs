@@ -1044,8 +1044,11 @@ impl SettingsStore {
     /// and which formatters, language servers and binaries run, for an embedder
     /// that has no trust prompt. Only user, global and default settings remain.
     ///
-    /// Anything already loaded is dropped. Turning this off again does not restore it;
-    /// the files are read again when they next change.
+    /// The settings and editorconfig data already loaded are dropped. Turning this off again
+    /// does not restore them; the files are read again when they next change. The tasks and
+    /// debug scenarios a project carries are not held here: its settings observer stops reading
+    /// them, but ones it has already read stay in its task store. An embedder that ignores
+    /// local settings sets this before it opens a project.
     pub fn set_ignore_local_settings(&mut self, ignore: bool, cx: &mut App) {
         self.ignore_local_settings = ignore;
         if !ignore {
@@ -2878,6 +2881,35 @@ mod tests {
             default_line_length
         );
         assert!(editorconfig_worktrees(&store, cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_ignoring_local_settings_cancels_a_discovery_in_flight(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/repo"),
+            serde_json::json!({ ".editorconfig": "[*]\n", "sub": {} }),
+        )
+        .await;
+        let worktree_id = WorktreeId::from_usize(0);
+        let mut store = cx.update(|cx| SettingsStore::new(cx, &test_settings()));
+
+        cx.update(|cx| {
+            store.editorconfig_store.update(cx, |editorconfig, cx| {
+                editorconfig.discover_local_external_configs_chain(
+                    worktree_id,
+                    std::path::Path::new(util::path!("/repo/sub")).into(),
+                    fs.clone(),
+                    cx,
+                )
+            });
+            store.set_ignore_local_settings(true, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| assert!(editorconfig_worktrees(&store, cx).is_empty()));
     }
 
     #[gpui::test]
