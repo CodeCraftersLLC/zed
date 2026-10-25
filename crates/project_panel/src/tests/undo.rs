@@ -326,6 +326,31 @@ async fn drag_undo_redo(cx: &mut gpui::TestAppContext) {
     cx.assert_fs_state_is(&["a.txt", "b.txt", "a.rs", "src/"]);
 }
 
+/// `WorktreeStore::rename_entry` recreates a missing destination directory when the rename
+/// reports NotFound, which is what makes undoing a move out of a since-deleted folder work.
+#[gpui::test]
+async fn undo_of_a_drag_recreates_a_deleted_original_parent(cx: &mut gpui::TestAppContext) {
+    let mut cx = TestContext::new(cx).await;
+
+    cx.create_directory("src").await;
+    cx.create_file("src/a.rs").await;
+    cx.drag(&["src/a.rs"], "");
+    cx.assert_fs_state_is(&["a.txt", "b.txt", "a.rs", "src/"]);
+
+    cx.fs
+        .remove_dir(
+            Path::new(&path("/workspace/src")),
+            fs::RemoveOptions::default(),
+        )
+        .await
+        .unwrap();
+    cx.cx.run_until_parked();
+    cx.assert_not_exists("src");
+
+    cx.undo().await;
+    cx.assert_fs_state_is(&["a.txt", "b.txt", "src/", "src/a.rs"]);
+}
+
 #[gpui::test]
 async fn drag_multiple_undo_redo(cx: &mut gpui::TestAppContext) {
     let mut cx = TestContext::new(cx).await;

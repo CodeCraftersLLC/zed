@@ -71,11 +71,15 @@ fn has_program_extension(path: &Path) -> bool {
         .any(|program| extension.eq_ignore_ascii_case(program))
 }
 
+/// Only extension-less files are judged by the execute bit: exFAT, NTFS, SMB and WSL mounts
+/// report every file as executable, and a name with an extension is already covered by
+/// `PROGRAM_OR_SHORTCUT_EXTENSIONS`.
 #[cfg(unix)]
 fn has_execute_bit(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    path.extension().is_none()
+        && std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
@@ -301,6 +305,22 @@ mod tests {
 
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!is_program_or_shortcut(&binary));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_execute_bit_on_a_named_document_does_not_hide_the_default_app() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["report.pdf", "notes.txt", "data.bin"] {
+            let document = dir.path().join(name);
+            std::fs::write(&document, "x").unwrap();
+            std::fs::set_permissions(&document, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                !is_program_or_shortcut(&document),
+                "{name} on a mount that reports every file as executable"
+            );
+        }
     }
 
     #[cfg(unix)]

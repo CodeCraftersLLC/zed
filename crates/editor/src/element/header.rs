@@ -614,9 +614,15 @@ pub(crate) fn header_jump_data(
     }
 }
 
-/// A deleted file has nothing to open: the button would do nothing.
-fn offers_open_file(can_open: bool, disk_state: language::DiskState) -> bool {
-    can_open && !disk_state.is_deleted()
+/// Whether a header carries the Open File button. A deleted file has nothing to open (the
+/// button would do nothing) and a header without a path has nothing to name. `file` is the
+/// buffer file's `(can_open, disk_state)`; no file at all (a scratch buffer) still offers it.
+fn shows_open_file_button(
+    file: Option<(bool, language::DiskState)>,
+    has_relative_path: bool,
+) -> bool {
+    has_relative_path
+        && file.is_none_or(|(can_open, disk_state)| can_open && !disk_state.is_deleted())
 }
 
 pub(crate) fn render_buffer_header(
@@ -663,8 +669,7 @@ pub(crate) fn render_buffer_header(
         .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
         .unwrap_or_default();
     let file = buffer.file();
-    let can_open_excerpts =
-        file.is_none_or(|file| offers_open_file(file.can_open(), file.disk_state()));
+    let open_file_button_file = file.map(|file| (file.can_open(), file.disk_state()));
     let path_style = file.map(|file| file.path_style(cx));
     let relative_path = buffer.resolve_file_path(include_root, cx);
     let (parent_path, filename) = if let Some(path) = &relative_path {
@@ -892,36 +897,39 @@ pub(crate) fn render_buffer_header(
                                     })
                             },
                         ))
-                        .when(can_open_excerpts && relative_path.is_some(), |this| {
-                            this.child(
-                                div()
-                                    .when(!is_selected, |this| {
-                                        this.visible_on_hover("buffer-header-group")
-                                    })
-                                    .child(
-                                        Button::new("open-file-button", "Open File")
-                                            .style(ButtonStyle::OutlinedGhost)
-                                            .when(is_selected, |this| {
-                                                this.key_binding(KeyBinding::for_action_in(
-                                                    &OpenExcerpts,
-                                                    &focus_handle,
-                                                    cx,
-                                                ))
-                                            })
-                                            .on_click(window.listener_for(editor, {
-                                                let jump_data = jump_data.clone();
-                                                move |editor, e: &ClickEvent, window, cx| {
-                                                    editor.open_excerpts_common(
-                                                        Some(jump_data.clone()),
-                                                        e.modifiers().secondary(),
-                                                        window,
+                        .when(
+                            shows_open_file_button(open_file_button_file, relative_path.is_some()),
+                            |this| {
+                                this.child(
+                                    div()
+                                        .when(!is_selected, |this| {
+                                            this.visible_on_hover("buffer-header-group")
+                                        })
+                                        .child(
+                                            Button::new("open-file-button", "Open File")
+                                                .style(ButtonStyle::OutlinedGhost)
+                                                .when(is_selected, |this| {
+                                                    this.key_binding(KeyBinding::for_action_in(
+                                                        &OpenExcerpts,
+                                                        &focus_handle,
                                                         cx,
-                                                    );
-                                                }
-                                            })),
-                                    ),
-                            )
-                        })
+                                                    ))
+                                                })
+                                                .on_click(window.listener_for(editor, {
+                                                    let jump_data = jump_data.clone();
+                                                    move |editor, e: &ClickEvent, window, cx| {
+                                                        editor.open_excerpts_common(
+                                                            Some(jump_data.clone()),
+                                                            e.modifiers().secondary(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                })),
+                                        ),
+                                )
+                            },
+                        )
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(window.listener_for(editor, {
                             let buffer_id = for_excerpt.buffer_id();
@@ -1079,17 +1087,22 @@ fn file_status_label_color(file_status: Option<FileStatus>) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::offers_open_file;
+    use super::shows_open_file_button;
     use language::DiskState;
 
     #[test]
-    fn open_file_is_not_offered_for_a_deleted_file() {
-        assert!(!offers_open_file(true, DiskState::Deleted));
-        assert!(!offers_open_file(
-            true,
-            DiskState::Historic { was_deleted: true }
+    fn the_header_shows_open_file_only_for_an_openable_existing_file_with_a_path() {
+        assert!(!shows_open_file_button(
+            Some((true, DiskState::Deleted)),
+            true
         ));
-        assert!(offers_open_file(true, DiskState::New));
-        assert!(!offers_open_file(false, DiskState::New));
+        assert!(!shows_open_file_button(
+            Some((true, DiskState::Historic { was_deleted: true })),
+            true
+        ));
+        assert!(shows_open_file_button(Some((true, DiskState::New)), true));
+        assert!(!shows_open_file_button(Some((false, DiskState::New)), true));
+        assert!(shows_open_file_button(None, true), "a scratch buffer");
+        assert!(!shows_open_file_button(None, false), "nothing to name");
     }
 }
