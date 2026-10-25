@@ -298,7 +298,10 @@ impl SvgRenderer {
         if let Some(max_side) = max_side
             && (width > max_side
                 || height > max_side
-                || u64::from(width) * u64::from(height) * 4 > MAX_RASTER_BYTES)
+                || u64::from(width)
+                    .checked_mul(u64::from(height))
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .is_none_or(|bytes| bytes > MAX_RASTER_BYTES))
         {
             return Err(SvgRenderError::TooLarge { width, height });
         }
@@ -427,6 +430,21 @@ mod tests {
         format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="{width}" height="{height}" fill="red"/></svg>"#
         )
+    }
+
+    #[test]
+    fn an_overflowing_size_is_refused_not_wrapped() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let svg = plain_svg(100, 100);
+        for scale in [1e20, f32::INFINITY] {
+            assert!(
+                matches!(
+                    renderer.render_single_frame_bounded(svg.as_bytes(), scale, u32::MAX),
+                    Err(SvgRenderError::TooLarge { .. })
+                ),
+                "scale {scale} must be refused as too large"
+            );
+        }
     }
 
     #[test]
