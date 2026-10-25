@@ -754,9 +754,14 @@ impl MarkdownPreviewView {
         if let Some(workspace_entity) = self.workspace.upgrade() {
             let workspace = workspace_entity.read(cx);
             host_image_resolver = workspace.markdown_image_resolver();
-            if let Some(tree) = workspace.project().read(cx).worktrees(cx).next() {
-                workspace_directory = Some(tree.read(cx).abs_path().to_path_buf());
-            }
+            workspace_directory = document_worktree_directory(
+                workspace
+                    .project()
+                    .read(cx)
+                    .worktrees(cx)
+                    .map(|tree| tree.read(cx).abs_path().to_path_buf()),
+                self.base_directory.as_deref(),
+            );
         }
 
         let markdown_style = if let Some(theme) = preview_theme {
@@ -987,7 +992,25 @@ fn resolve_image_source(
     }
 }
 
-/// Resolves a preview image to a file inside the first worktree. Remote URLs, `data:` and
+/// The worktree root a document's images are confined to: the innermost root that contains the
+/// document's directory, or the first root when the document lies in none of them.
+fn document_worktree_directory(
+    roots: impl IntoIterator<Item = PathBuf>,
+    base_directory: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut roots = roots.into_iter();
+    let first = roots.next()?;
+    let Some(base_directory) = base_directory else {
+        return Some(first);
+    };
+    std::iter::once(first.clone())
+        .chain(roots)
+        .filter(|root| base_directory.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .or(Some(first))
+}
+
+/// Resolves a preview image to a file inside the document's worktree. Remote URLs, `data:` and
 /// every other scheme are refused, and so is any path that leaves the worktree, whether
 /// through `..`, an absolute path or a symlink. A leading `/` or `\` means the worktree root.
 fn resolve_preview_image(
@@ -1521,12 +1544,14 @@ mod persistence {
 mod tests {
     use crate::markdown_preview_view::ImageSource;
     use crate::markdown_preview_view::Resource;
-    use crate::markdown_preview_view::{resolve_image_source, resolve_preview_image};
+    use crate::markdown_preview_view::{
+        document_worktree_directory, resolve_image_source, resolve_preview_image,
+    };
     use buffer_diff::BufferDiff;
     use editor::Editor;
     use gpui::{AppContext as _, Entity, TestAppContext};
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1568,6 +1593,27 @@ mod tests {
             Some(workspace_directory),
         );
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn images_are_confined_to_the_worktree_that_holds_the_document() {
+        let roots = || {
+            [
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/b/inner"),
+            ]
+        };
+        let pick = |base: &str| document_worktree_directory(roots(), Some(Path::new(base)));
+        assert_eq!(pick("/a/docs"), Some(PathBuf::from("/a")));
+        assert_eq!(pick("/b/docs"), Some(PathBuf::from("/b")));
+        assert_eq!(pick("/b/inner/docs"), Some(PathBuf::from("/b/inner")));
+        assert_eq!(pick("/elsewhere"), Some(PathBuf::from("/a")));
+        assert_eq!(
+            document_worktree_directory(roots(), None),
+            Some(PathBuf::from("/a"))
+        );
+        assert_eq!(document_worktree_directory([], Some(Path::new("/a"))), None);
     }
 
     #[test]
