@@ -2220,11 +2220,16 @@ impl BufferSnapshot {
 
     /// The ending of the first line. Use [`Self::line_endings`] when the text mixes endings.
     pub fn line_ending(&self) -> LineEnding {
-        if self.line_ending_changes.is_empty() {
-            self.line_ending
-        } else {
-            self.line_endings().first
+        // Edits keep the changes in order and can only gather them at the start of the text, where
+        // the last one that did is the first line's ending. Later ones are not resolved.
+        let mut first = self.line_ending;
+        for (anchor, ending) in self.line_ending_changes.iter() {
+            if anchor.to_offset(self) > 0 {
+                break;
+            }
+            first = *ending;
         }
+        first
     }
 
     /// The text as it is saved to disk: each line with the ending it was loaded with. [`Self::text`]

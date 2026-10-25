@@ -41,13 +41,14 @@ impl MarkdownElement {
     pub(crate) fn render_html_block(
         &self,
         block: &ParsedHtmlBlock,
+        closed_through: Option<usize>,
         builder: &mut MarkdownElementBuilder,
         markdown_end: usize,
         cx: &mut App,
     ) {
         let mut source_allocator = HtmlSourceAllocator::new(block.source_range.clone());
         self.render_html_elements(
-            &block.children,
+            block.elements(closed_through),
             &mut source_allocator,
             builder,
             markdown_end,
@@ -167,6 +168,10 @@ impl MarkdownElement {
                 .gap_1()
                 .items_start()
                 .mb_2()
+                .rounded_sm()
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .focus_visible(|style| style.border_color(cx.theme().colors().border_focused))
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     markdown.update(cx, |markdown, cx| {

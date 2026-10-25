@@ -1169,6 +1169,27 @@ impl Selection {
     }
 }
 
+/// What the collapsed `<details>` an HTML block opens hide, and where the furthest-reaching one is
+/// closed. Regions one block opens together nest, so that one hides the others' bodies too.
+fn collapsed_details(
+    open_ended: Vec<&html::html_parser::ParsedHtmlDetails>,
+    block_start: usize,
+    spans: &BTreeMap<(usize, usize), DetailsSpan>,
+    is_open: impl Fn((usize, usize), bool) -> bool,
+) -> (Range<usize>, Option<(usize, usize)>) {
+    open_ended
+        .into_iter()
+        .filter(|details| !is_open((block_start, details.ordinal), details.open))
+        .filter_map(|details| spans.get(&(block_start, details.ordinal)))
+        .max_by_key(|span| (span.hidden_events.end, span.close))
+        .map_or((0..0, None), |span| {
+            (
+                span.hidden_events.clone(),
+                Some((span.hidden_events.end, span.close)),
+            )
+        })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ParsedMarkdown {
     pub source: SharedString,
@@ -2163,6 +2184,9 @@ impl Element for MarkdownElement {
         let mut handled_html_block = false;
         // The events a collapsed `<details>` hides.
         let mut hidden_events = 0..0;
+        // Where the collapsed `<details>` ends: the closing block's event index and which of its
+        // `</details>` tags it is.
+        let mut closing_region: Option<(usize, usize)> = None;
         let mut rendered_mermaid_block = false;
         let mut rendered_metadata_block = false;
         for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
@@ -2417,28 +2441,24 @@ impl Element for MarkdownElement {
                         MarkdownTag::HtmlBlock => {
                             builder.push_div(div(), range, markdown_end);
                             if let Some(block) = parsed_markdown.html_blocks.get(&range.start) {
-                                self.render_html_block(block, &mut builder, markdown_end, cx);
+                                let closed_through = closing_region
+                                    .take_if(|(closing_index, _)| *closing_index == index)
+                                    .map(|(_, close)| close);
+                                self.render_html_block(
+                                    block,
+                                    closed_through,
+                                    &mut builder,
+                                    markdown_end,
+                                    cx,
+                                );
                                 handled_html_block = true;
-                                // Regions one block opens together nest, so the collapsed one that
-                                // reaches furthest hides the others' bodies too.
                                 let markdown = self.markdown.read(cx);
-                                hidden_events = block
-                                    .open_ended_details()
-                                    .into_iter()
-                                    .filter(|details| {
-                                        !markdown.is_details_open(
-                                            (range.start, details.ordinal),
-                                            details.open,
-                                        )
-                                    })
-                                    .filter_map(|details| {
-                                        parsed_markdown
-                                            .details_spans
-                                            .get(&(range.start, details.ordinal))
-                                    })
-                                    .map(|span| span.hidden_events.clone())
-                                    .max_by_key(|hidden| hidden.end)
-                                    .unwrap_or(0..0);
+                                (hidden_events, closing_region) = collapsed_details(
+                                    block.open_ended_details(closed_through),
+                                    range.start,
+                                    &parsed_markdown.details_spans,
+                                    |region, open| markdown.is_details_open(region, open),
+                                );
                             }
                         }
                         MarkdownTag::List(bullet_index) => {

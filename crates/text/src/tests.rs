@@ -1127,6 +1127,20 @@ fn mixed_buffer() -> Buffer {
 }
 
 #[test]
+fn test_the_first_line_ending_follows_edits_that_delete_the_first_lines() {
+    let mut buffer = mixed_buffer();
+    assert_eq!(buffer.line_ending(), LineEnding::Windows);
+    for deleted in ["one\n", "two\n", "three\n"] {
+        let start = buffer.text().find(deleted).unwrap();
+        buffer.edit([(start..start + deleted.len(), "")]);
+        let snapshot = buffer.snapshot();
+        assert_eq!(snapshot.line_ending(), snapshot.line_endings().first);
+    }
+    assert_eq!(buffer.text(), "four\n");
+    assert_eq!(buffer.line_ending(), LineEnding::Unix);
+}
+
+#[test]
 fn test_ending_at_finds_the_ending_of_the_line_holding_an_offset() {
     let endings = LineEndings {
         first: LineEnding::Windows,

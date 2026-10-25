@@ -300,14 +300,16 @@ fn parse_mermaid_info(info: &str) -> Option<u32> {
 fn diagram_type(source: &str) -> &str {
     let mut lines = source
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.trim().is_empty())
         .peekable();
-    if lines.peek() == Some(&"---") {
+    if lines.peek().is_some_and(|line| line.trim() == "---") {
         lines.next();
-        lines.by_ref().find(|line| *line == "---");
+        // The closing `---` starts its line, as Mermaid reads it: an indented one belongs to a
+        // YAML block scalar of the front matter.
+        lines.by_ref().find(|line| line.trim_end() == "---");
     }
     lines
+        .map(str::trim)
         .find(|line| !line.starts_with("%%"))
         .and_then(|line| line.split_whitespace().next())
         .unwrap_or("")
@@ -832,6 +834,11 @@ mod tests {
             ("sankey-beta\na,b,1", "sankey-beta"),
             ("", ""),
             ("---\ntitle: never closed", ""),
+            // An indented `---` is YAML content, not the end of the front matter.
+            (
+                "---\ndescription: |\n  one\n  ---\n  two\n---\nflowchart TD",
+                "flowchart",
+            ),
         ] {
             assert_eq!(super::diagram_type(source), expected, "{source:?}");
         }

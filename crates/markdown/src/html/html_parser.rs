@@ -13,7 +13,7 @@ use markup5ever_rcdom::{Node, NodeData, RcDom};
 use pulldown_cmark::{Alignment, HeadingLevel};
 use stacksafe::stacksafe;
 
-use crate::details::details_balance;
+use crate::details::{closing_tails, details_balance};
 use crate::html::html_minifier::{Minifier, MinifierOptions};
 
 #[derive(Debug, Clone, Default)]
@@ -21,15 +21,32 @@ use crate::html::html_minifier::{Minifier, MinifierOptions};
 pub(crate) struct ParsedHtmlBlock {
     pub source_range: Range<usize>,
     pub children: Vec<ParsedHtmlElement>,
+    /// For each `</details>` of the block that closes a region an earlier block opened, the
+    /// content after it, or `None` when nothing but whitespace comes before the tag. A collapsed
+    /// region hides the content before its closing tag, so it shows this in place of `children`.
+    pub closing_tails: Vec<Option<Vec<ParsedHtmlElement>>>,
 }
 
 impl ParsedHtmlBlock {
     /// The `<details>` this block opens but does not close, outermost first. Their bodies are in
     /// the blocks after it.
-    pub(crate) fn open_ended_details(&self) -> Vec<&ParsedHtmlDetails> {
+    pub(crate) fn open_ended_details(
+        &self,
+        closed_through: Option<usize>,
+    ) -> Vec<&ParsedHtmlDetails> {
         let mut found = Vec::new();
-        collect_open_ended_details(&self.children, &mut found);
+        collect_open_ended_details(self.elements(closed_through), &mut found);
         found
+    }
+
+    /// What the block shows. `closed_through` is the `</details>` (counted among those that close
+    /// an earlier block's region) of a collapsed region that ends in this block: what comes
+    /// before that tag is hidden with the rest of the region.
+    pub(crate) fn elements(&self, closed_through: Option<usize>) -> &[ParsedHtmlElement] {
+        closed_through
+            .and_then(|close| self.closing_tails.get(close))
+            .and_then(Option::as_ref)
+            .unwrap_or(&self.children)
     }
 }
 
@@ -254,7 +271,32 @@ pub(crate) fn parse_html_block(
     source: &str,
     source_range: Range<usize>,
 ) -> Option<ParsedHtmlBlock> {
-    let bytes = cleanup_html(source);
+    let children = parse_html_children(source, 0, 0, &source_range)?;
+    let closing_tails = closing_tails(source)
+        .into_iter()
+        .map(|tail| {
+            tail.and_then(|tail| {
+                parse_html_children(source, tail.start, tail.opened_before, &source_range)
+            })
+        })
+        .collect();
+
+    Some(ParsedHtmlBlock {
+        source_range,
+        children,
+        closing_tails,
+    })
+}
+
+/// The elements of `source` from byte `from` on. `opened_before` is how many `<details>` the part
+/// before `from` opens, so the ones after it keep the numbers they have in the whole block.
+fn parse_html_children(
+    source: &str,
+    from: usize,
+    opened_before: usize,
+    source_range: &Range<usize>,
+) -> Option<Vec<ParsedHtmlElement>> {
+    let bytes = cleanup_html(&source[from..]);
     let mut cursor = std::io::Cursor::new(bytes);
     let dom = parse_document(RcDom::default(), ParseOpts::default())
         .from_utf8()
@@ -263,7 +305,7 @@ pub(crate) fn parse_html_block(
 
     let mut children = Vec::new();
     let unclosed_details = details_balance(source).unclosed;
-    let details_seen = Cell::new(0);
+    let details_seen = Cell::new(opened_before);
     parse_html_node(
         source_range.clone(),
         &dom.document,
@@ -274,11 +316,7 @@ pub(crate) fn parse_html_block(
             details_seen: &details_seen,
         },
     );
-
-    Some(ParsedHtmlBlock {
-        source_range,
-        children,
-    })
+    Some(children)
 }
 
 fn cleanup_html(source: &str) -> Vec<u8> {
@@ -936,6 +974,56 @@ mod tests {
         };
         assert!(has_details("1 < 2 <details><summary>S</summary>"));
         assert!(!has_details("<b <details><summary>S</summary>"));
+    }
+
+    fn paragraph_text(element: &ParsedHtmlElement) -> String {
+        let ParsedHtmlElement::Paragraph(paragraph) = element else {
+            panic!("expected paragraph, got {element:?}");
+        };
+        paragraph
+            .contents
+            .iter()
+            .map(|chunk| match chunk {
+                HtmlParagraphChunk::Text(text) => text.contents.to_string(),
+                chunk => panic!("expected text, got {chunk:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_closing_block_keeps_the_content_after_the_tag_apart_from_the_content_before_it() {
+        let html = "<p>hidden</p>\n</details>\n<p>shown</p>";
+        let parsed = parse_html_block(html, 0..html.len()).unwrap();
+        assert_eq!(parsed.children.len(), 2);
+        assert_eq!(paragraph_text(&parsed.children[0]), "hidden");
+        let tail = parsed.elements(Some(0));
+        assert_eq!(tail.len(), 1);
+        assert_eq!(paragraph_text(&tail[0]), "shown");
+        // Without a collapsed region closing here, the block shows all of it.
+        assert_eq!(parsed.elements(None).len(), 2);
+    }
+
+    #[test]
+    fn a_closing_block_with_nothing_before_the_tag_has_no_tail() {
+        let html = "</details>\n<p>shown</p>";
+        let parsed = parse_html_block(html, 0..html.len()).unwrap();
+        assert_eq!(parsed.closing_tails, [None]);
+        assert_eq!(parsed.elements(Some(0)).len(), parsed.children.len());
+    }
+
+    #[test]
+    fn a_details_after_the_closing_tag_keeps_its_number_in_the_block() {
+        let html = "<p>x</p></details>\n<details>\n<summary>S</summary>";
+        let parsed = parse_html_block(html, 0..html.len()).unwrap();
+        let ordinals = |tail: Option<usize>| {
+            parsed
+                .open_ended_details(tail)
+                .iter()
+                .map(|details| details.ordinal)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ordinals(None), [0]);
+        assert_eq!(ordinals(Some(0)), [0]);
     }
 
     #[test]
