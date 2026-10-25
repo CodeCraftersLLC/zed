@@ -614,9 +614,9 @@ pub(crate) fn header_jump_data(
     }
 }
 
-/// Whether a header carries the Open File button. A deleted file has nothing to open (the
-/// button would do nothing) and a header without a path has nothing to name. `file` is the
-/// buffer file's `(can_open, disk_state)`; no file at all (a scratch buffer) still offers it.
+/// Whether a header carries the Open File button and lets its file name open the file. A deleted
+/// file has nothing to open (the action would do nothing) and a header without a path has nothing
+/// to name; a buffer with no file has no path. `file` is the buffer file's `(can_open, disk_state)`.
 fn shows_open_file_button(
     file: Option<(bool, language::DiskState)>,
     has_relative_path: bool,
@@ -672,6 +672,7 @@ pub(crate) fn render_buffer_header(
     let open_file_button_file = file.map(|file| (file.can_open(), file.disk_state()));
     let path_style = file.map(|file| file.path_style(cx));
     let relative_path = buffer.resolve_file_path(include_root, cx);
+    let shows_open_file = shows_open_file_button(open_file_button_file, relative_path.is_some());
     let (parent_path, filename) = if let Some(path) = &relative_path {
         if let Some(path_style) = path_style {
             let (dir, file_name) = path_style.split(path);
@@ -843,24 +844,30 @@ pub(crate) fn render_buffer_header(
                                                     ),
                                             )
                                             .tooltip(move |_, cx| {
-                                                Tooltip::with_meta(
-                                                    "Open File",
-                                                    None,
-                                                    full_path.clone(),
-                                                    cx,
-                                                )
-                                            })
-                                            .on_click(window.listener_for(editor, {
-                                                let jump_data = jump_data.clone();
-                                                move |editor, e: &ClickEvent, window, cx| {
-                                                    editor.open_excerpts_common(
-                                                        Some(jump_data.clone()),
-                                                        e.modifiers().secondary(),
-                                                        window,
+                                                if shows_open_file {
+                                                    Tooltip::with_meta(
+                                                        "Open File",
+                                                        None,
+                                                        full_path.clone(),
                                                         cx,
-                                                    );
+                                                    )
+                                                } else {
+                                                    Tooltip::simple(full_path.clone(), cx)
                                                 }
-                                            })),
+                                            })
+                                            .when(shows_open_file, |button| {
+                                                button.on_click(window.listener_for(editor, {
+                                                    let jump_data = jump_data.clone();
+                                                    move |editor, e: &ClickEvent, window, cx| {
+                                                        editor.open_excerpts_common(
+                                                            Some(jump_data.clone()),
+                                                            e.modifiers().secondary(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                }))
+                                            }),
                                     )
                                     .when_some(parent_path, |then, path| {
                                         then.child(
@@ -897,39 +904,36 @@ pub(crate) fn render_buffer_header(
                                     })
                             },
                         ))
-                        .when(
-                            shows_open_file_button(open_file_button_file, relative_path.is_some()),
-                            |this| {
-                                this.child(
-                                    div()
-                                        .when(!is_selected, |this| {
-                                            this.visible_on_hover("buffer-header-group")
-                                        })
-                                        .child(
-                                            Button::new("open-file-button", "Open File")
-                                                .style(ButtonStyle::OutlinedGhost)
-                                                .when(is_selected, |this| {
-                                                    this.key_binding(KeyBinding::for_action_in(
-                                                        &OpenExcerpts,
-                                                        &focus_handle,
+                        .when(shows_open_file, |this| {
+                            this.child(
+                                div()
+                                    .when(!is_selected, |this| {
+                                        this.visible_on_hover("buffer-header-group")
+                                    })
+                                    .child(
+                                        Button::new("open-file-button", "Open File")
+                                            .style(ButtonStyle::OutlinedGhost)
+                                            .when(is_selected, |this| {
+                                                this.key_binding(KeyBinding::for_action_in(
+                                                    &OpenExcerpts,
+                                                    &focus_handle,
+                                                    cx,
+                                                ))
+                                            })
+                                            .on_click(window.listener_for(editor, {
+                                                let jump_data = jump_data.clone();
+                                                move |editor, e: &ClickEvent, window, cx| {
+                                                    editor.open_excerpts_common(
+                                                        Some(jump_data.clone()),
+                                                        e.modifiers().secondary(),
+                                                        window,
                                                         cx,
-                                                    ))
-                                                })
-                                                .on_click(window.listener_for(editor, {
-                                                    let jump_data = jump_data.clone();
-                                                    move |editor, e: &ClickEvent, window, cx| {
-                                                        editor.open_excerpts_common(
-                                                            Some(jump_data.clone()),
-                                                            e.modifiers().secondary(),
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    }
-                                                })),
-                                        ),
-                                )
-                            },
-                        )
+                                                    );
+                                                }
+                                            })),
+                                    ),
+                            )
+                        })
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(window.listener_for(editor, {
                             let buffer_id = for_excerpt.buffer_id();
@@ -1091,7 +1095,16 @@ mod tests {
     use language::DiskState;
 
     #[test]
-    fn the_header_shows_open_file_only_for_an_openable_existing_file_with_a_path() {
+    fn the_header_shows_open_file_only_for_an_openable_existing_file() {
+        let present = DiskState::Present {
+            mtime: fs::MTime::from_seconds_and_nanos(100, 0),
+            size: 10,
+        };
+        assert!(shows_open_file_button(Some((true, present)), true));
+        assert!(
+            shows_open_file_button(Some((true, DiskState::New)), true),
+            "a new, unsaved file still has a buffer to open"
+        );
         assert!(!shows_open_file_button(
             Some((true, DiskState::Deleted)),
             true
@@ -1100,9 +1113,7 @@ mod tests {
             Some((true, DiskState::Historic { was_deleted: true })),
             true
         ));
-        assert!(shows_open_file_button(Some((true, DiskState::New)), true));
-        assert!(!shows_open_file_button(Some((false, DiskState::New)), true));
-        assert!(shows_open_file_button(None, true), "a scratch buffer");
-        assert!(!shows_open_file_button(None, false), "nothing to name");
+        assert!(!shows_open_file_button(Some((false, present)), true));
+        assert!(!shows_open_file_button(Some((true, present)), false));
     }
 }
