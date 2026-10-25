@@ -150,7 +150,7 @@ use ui::{Window, prelude::*};
 use url::Url;
 use util::{
     ResultExt, TryFutureExt,
-    paths::{PathStyle, SanitizedPath},
+    paths::{PathStyle, SanitizedPath, UrlExt as _},
     rel_path::RelPath,
     serde::default_true,
 };
@@ -4802,7 +4802,7 @@ impl Workspace {
 
         if let Ok(url) = Url::parse(url_or_path) {
             match url.scheme() {
-                "file" => match url.to_file_path() {
+                "file" => match url.to_file_path_ext(path_style) {
                     Ok(path) => open_abs_path(self, path, cx),
                     Err(()) => log::warn!("not opening {url_or_path:?}: it is not a local file"),
                 },
