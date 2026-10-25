@@ -295,12 +295,21 @@ fn parse_mermaid_info(info: &str) -> Option<u32> {
     )
 }
 
-/// The first word of the source, which names the diagram type.
+/// The first word of the diagram itself, which names its type: the front matter between `---`
+/// lines, and the `%%` directives and comments before the diagram, are not part of it.
 fn diagram_type(source: &str) -> &str {
-    source
-        .trim_start()
-        .split(|c: char| c.is_whitespace() || c == '\n')
-        .next()
+    let mut lines = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .peekable();
+    if lines.peek() == Some(&"---") {
+        lines.next();
+        lines.by_ref().find(|line| *line == "---");
+    }
+    lines
+        .find(|line| !line.starts_with("%%"))
+        .and_then(|line| line.split_whitespace().next())
         .unwrap_or("")
 }
 
@@ -364,6 +373,9 @@ pub(crate) fn extract_mermaid_diagrams(
             .strip_suffix('\n')
             .unwrap_or(&source[metadata.content_range.clone()])
             .to_string();
+        if contents.trim().is_empty() {
+            continue;
+        }
         mermaid_diagrams.insert(
             source_range.start,
             ParsedMarkdownMermaidDiagram {
@@ -435,7 +447,11 @@ pub(crate) fn render_mermaid_diagram(
         Some(Err(error)) => {
             // Nothing to draw: say why, and show the source under a lone Code tab.
             container
-                .child(render_mermaid_error_header(source_offset, error.reason()))
+                .child(render_mermaid_error_header(
+                    source_offset,
+                    error.reason(),
+                    show_interactive,
+                ))
                 .child(render_mermaid_code_view(&parsed.contents.contents))
                 .when(show_interactive, |container| {
                     container.child(render_mermaid_copy_button(
@@ -509,20 +525,26 @@ pub(crate) fn render_mermaid_diagram(
     }
 }
 
-fn render_mermaid_error_header(source_offset: usize, reason: String) -> impl IntoElement {
+fn render_mermaid_error_header(
+    source_offset: usize,
+    reason: String,
+    show_interactive: bool,
+) -> impl IntoElement {
     h_flex()
         .gap_2()
         .mb_2p5()
         .items_center()
-        .child(
-            Button::new(
-                ElementId::named_usize("mermaid-tab-code-only", source_offset),
-                "Code",
+        .when(show_interactive, |header| {
+            header.child(
+                Button::new(
+                    ElementId::named_usize("mermaid-tab-code-only", source_offset),
+                    "Code",
+                )
+                .label_size(LabelSize::Small)
+                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                .toggle_state(true),
             )
-            .label_size(LabelSize::Small)
-            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-            .toggle_state(true),
-        )
+        })
         .child(
             Label::new(reason)
                 .size(LabelSize::Small)
@@ -790,6 +812,43 @@ mod tests {
             })
             .collect();
         assert_eq!(sources, ["sankey-beta", "block-beta", "flowchart TD"]);
+    }
+
+    #[test]
+    fn test_the_diagram_type_is_read_past_front_matter_and_directives() {
+        for (source, expected) in [
+            ("flowchart TD\n    A --> B", "flowchart"),
+            ("  \n  graph LR", "graph"),
+            (
+                "---\ntitle: Flow\n---\nflowchart TD\n    A --> B",
+                "flowchart",
+            ),
+            (
+                "%%{init: {\"theme\": \"dark\"}}%%\nsequenceDiagram\n",
+                "sequenceDiagram",
+            ),
+            ("%% a note\n%% another\npie title Pets", "pie"),
+            ("---\ntitle: t\n---\n%%{init: {}}%%\ngantt", "gantt"),
+            ("sankey-beta\na,b,1", "sankey-beta"),
+            ("", ""),
+            ("---\ntitle: never closed", ""),
+        ] {
+            assert_eq!(super::diagram_type(source), expected, "{source:?}");
+        }
+        assert!(super::is_supported_diagram_type(
+            "---\ntitle: Flow\n---\nflowchart TD"
+        ));
+        assert!(!super::is_supported_diagram_type(
+            "---\ntitle: x\n---\nsankey-beta"
+        ));
+    }
+
+    #[test]
+    fn test_an_empty_mermaid_block_is_not_a_diagram() {
+        let markdown = "```mermaid\n```\n\n```mermaid\n\n  \n```";
+        let events =
+            crate::parser::parse_markdown_with_options(markdown, false, false, false).events;
+        assert!(extract_mermaid_diagrams(markdown, &events).is_empty());
     }
 
     fn mermaid_failures(source: &str, cx: &mut TestAppContext) -> Vec<String> {

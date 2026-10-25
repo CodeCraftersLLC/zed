@@ -22,27 +22,64 @@ enum DetailsTag {
     Close,
 }
 
-/// The `<details` and `</details` tags of an HTML block, in source order.
+/// The `<details` and `</details` tags of an HTML block, in source order. Text that only looks like
+/// one, inside a comment, a quoted attribute value or the body of a `<script>` or `<style>`, is not
+/// a tag.
 fn details_tags(html: &str) -> Vec<DetailsTag> {
+    // ASCII lowercasing keeps every byte offset, so offsets into `lowercase` index `html` too.
     let lowercase = html.to_ascii_lowercase();
-    lowercase
-        .match_indices('<')
-        .filter_map(|(ix, _)| {
-            let rest = &lowercase[ix..];
-            let (tag, name_len) = if rest.starts_with("<details") {
-                (DetailsTag::Open, "<details".len())
-            } else if rest.starts_with("</details") {
-                (DetailsTag::Close, "</details".len())
-            } else {
-                return None;
-            };
-            rest[name_len..]
-                .chars()
-                .next()
-                .is_none_or(|next| next.is_whitespace() || next == '>' || next == '/')
-                .then_some(tag)
-        })
-        .collect()
+    let mut tags = Vec::new();
+    let mut ix = 0;
+    while let Some(offset) = lowercase[ix..].find('<') {
+        let start = ix + offset;
+        let rest = &lowercase[start..];
+        if let Some(comment) = rest.strip_prefix("<!--") {
+            ix = start + "<!--".len() + comment.find("-->").map_or(comment.len(), |end| end + 3);
+            continue;
+        }
+        let tag_end = start + tag_len(rest);
+        ix = tag_end;
+
+        let (closing, after_bracket) = match rest[1..].strip_prefix('/') {
+            Some(after_slash) => (true, after_slash),
+            None => (false, &rest[1..]),
+        };
+        let name_len = after_bracket
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .unwrap_or(after_bracket.len());
+        match (&after_bracket[..name_len], closing) {
+            ("details", false) => tags.push(DetailsTag::Open),
+            ("details", true) => tags.push(DetailsTag::Close),
+            (raw_text @ ("script" | "style"), false) => {
+                let closer = format!("</{raw_text}");
+                ix = lowercase[tag_end..]
+                    .find(&closer)
+                    .map_or(lowercase.len(), |closer_at| tag_end + closer_at);
+            }
+            _ => {}
+        }
+    }
+    tags
+}
+
+/// The length of the tag at the start of `rest`, through its `>`. A quoted attribute value may
+/// hold a `>`.
+fn tag_len(rest: &str) -> usize {
+    let mut quote = None;
+    let mut after_equals = false;
+    for (ix, c) in rest.char_indices() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '>' => return ix + 1,
+            None if after_equals && (c == '"' || c == '\'') => quote = Some(c),
+            None => {}
+        }
+        if quote.is_none() && !c.is_whitespace() {
+            after_equals = c == '=';
+        }
+    }
+    rest.len()
 }
 
 /// What an HTML block leaves open and what it closes of the blocks before it.
@@ -74,14 +111,16 @@ pub(crate) fn details_balance(html: &str) -> DetailsBalance {
 }
 
 /// Pairs every HTML block that leaves a `<details>` open with the block that closes it. The key is
-/// the source offset of the opening block.
+/// the source offset of the opening block and the ordinal of the `<details>` in it, which tells
+/// apart the regions one block opens together.
 pub(crate) fn extract_details_spans(
     source: &str,
     events: &[(Range<usize>, MarkdownEvent)],
-) -> BTreeMap<usize, DetailsSpan> {
+) -> BTreeMap<(usize, usize), DetailsSpan> {
     let mut spans = BTreeMap::new();
-    // The opening blocks still waiting for their close: (source offset, index of its End event).
-    let mut open: Vec<(usize, usize)> = Vec::new();
+    // The regions still waiting for their close: (source offset of the opening block, ordinal in
+    // it, index of its End event).
+    let mut open: Vec<(usize, usize, usize)> = Vec::new();
 
     let mut index = 0;
     while index < events.len() {
@@ -97,17 +136,17 @@ pub(crate) fn extract_details_spans(
 
         let balance = details_balance(&source[range.clone()]);
         for _ in 0..balance.closes_earlier {
-            if let Some((start, opener_end)) = open.pop() {
+            if let Some((start, ordinal, opener_end)) = open.pop() {
                 spans.insert(
-                    start,
+                    (start, ordinal),
                     DetailsSpan {
                         hidden_events: opener_end + 1..index,
                     },
                 );
             }
         }
-        for _ in &balance.unclosed {
-            open.push((range.start, block_end));
+        for &ordinal in &balance.unclosed {
+            open.push((range.start, ordinal, block_end));
         }
         index = block_end + 1;
     }
@@ -120,7 +159,7 @@ mod tests {
     use super::*;
     use crate::parser::parse_markdown_with_options;
 
-    fn spans(source: &str) -> BTreeMap<usize, DetailsSpan> {
+    fn spans(source: &str) -> BTreeMap<(usize, usize), DetailsSpan> {
         let parsed = parse_markdown_with_options(source, true, false, false);
         extract_details_spans(source, &parsed.events)
     }
@@ -166,9 +205,9 @@ mod tests {
     fn a_region_that_spans_blocks_is_paired() {
         let source = "<details>\n<summary>S</summary>\n\nbody\n\n</details>\n\nafter";
         let spans = spans(source);
-        assert_eq!(spans.keys().copied().collect::<Vec<_>>(), [0]);
+        assert_eq!(spans.keys().copied().collect::<Vec<_>>(), [(0, 0)]);
         let parsed = parse_markdown_with_options(source, true, false, false);
-        let hidden = &spans[&0].hidden_events;
+        let hidden = &spans[&(0, 0)].hidden_events;
         assert!(!hidden.is_empty());
         // The closing block starts right after the hidden events.
         assert_eq!(
@@ -188,7 +227,7 @@ mod tests {
         let second_opening = source.find("</details>\n<details>").unwrap();
         assert_eq!(
             spans.keys().copied().collect::<Vec<_>>(),
-            [0, second_opening]
+            [(0, 0), (second_opening, 0)]
         );
     }
 
@@ -202,11 +241,55 @@ mod tests {
         let source = "<details>\n<summary>A</summary>\n\n<details>\n<summary>B</summary>\n\nx\n\n</details>\n\n</details>\n";
         let spans = spans(source);
         assert_eq!(spans.len(), 2);
-        let outer = &spans[&0];
+        let outer = &spans[&(0, 0)];
         let inner_start = source.find("<details>\n<summary>B").unwrap();
-        let inner = &spans[&inner_start];
+        let inner = &spans[&(inner_start, 0)];
         assert!(outer.hidden_events.start < inner.hidden_events.start);
         assert!(inner.hidden_events.end < outer.hidden_events.end);
+    }
+
+    #[test]
+    fn regions_opened_by_one_block_keep_a_span_each() {
+        let source = "<details>\n<summary>A</summary>\n<details>\n<summary>B</summary>\n\nx\n\n</details>\n\ny\n\n</details>\n";
+        let spans = spans(source);
+        assert_eq!(
+            spans.keys().copied().collect::<Vec<_>>(),
+            [(0, 0), (0, 1)],
+            "{spans:?}"
+        );
+        let (outer, inner) = (&spans[&(0, 0)], &spans[&(0, 1)]);
+        assert_eq!(outer.hidden_events.start, inner.hidden_events.start);
+        assert!(inner.hidden_events.end < outer.hidden_events.end);
+    }
+
+    #[test]
+    fn text_that_only_looks_like_a_tag_is_not_one() {
+        assert_eq!(
+            details_balance("<!-- <details> --><details>x"),
+            balance(&[0], 0)
+        );
+        assert_eq!(
+            details_balance("<details>x<!-- </details> -->"),
+            balance(&[0], 0)
+        );
+        assert_eq!(
+            details_balance("<p title=\"<details>\">x</p><details>"),
+            balance(&[0], 0)
+        );
+        assert_eq!(
+            details_balance("<p title='a > <details>'>x</p><details>"),
+            balance(&[0], 0)
+        );
+        assert_eq!(
+            details_balance("<script>var s = '<details>';</script><details>"),
+            balance(&[0], 0)
+        );
+        assert_eq!(
+            details_balance("<style>/* </details> */</style><details>"),
+            balance(&[0], 0)
+        );
+        // An unterminated comment swallows the rest, as a browser reads it.
+        assert_eq!(details_balance("<details><!-- <details>"), balance(&[0], 0));
     }
 
     #[test]
