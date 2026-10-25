@@ -794,37 +794,41 @@ mod tests {
     #[test]
     fn test_layout_line_arabic_is_joined_and_in_visual_order() {
         let fonts = MacTextSystem::new();
-        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+        // A font that has Arabic letters, so no fallback font is part of what is compared; where
+        // it is not installed CoreText falls back from Helvetica, which is deterministic on a
+        // machine, and the comparisons below are all made on that machine.
+        let font_id = fonts
+            .font_id(&font("Arial Unicode MS"))
+            .or_else(|_| fonts.font_id(&font("Helvetica")))
+            .unwrap();
         let word = "\u{645}\u{631}\u{62d}\u{628}\u{627}";
         let glyphs = |text: &str, runs: &[FontRun]| {
             fonts
                 .layout_line(text, px(16.), runs)
                 .runs
                 .iter()
-                .flat_map(|run| run.glyphs.iter().map(|glyph| (glyph.id, glyph.index)))
+                .flat_map(|run| {
+                    run.glyphs
+                        .iter()
+                        .map(|glyph| (glyph.id, glyph.index, glyph.position.x))
+                })
                 .collect::<Vec<_>>()
         };
-
-        let whole = glyphs(
-            word,
-            &[FontRun {
+        let one_run = |text: &str| {
+            [FontRun {
                 font_id,
-                len: word.len(),
-            }],
-        );
-        let indices = whole.iter().map(|(_, index)| *index).collect::<Vec<_>>();
+                len: text.len(),
+            }]
+        };
+
+        let whole = glyphs(word, &one_run(word));
+        let indices = whole.iter().map(|(_, index, _)| *index).collect::<Vec<_>>();
         assert!(
             indices.windows(2).all(|pair| pair[0] > pair[1]),
             "right-to-left glyphs come out in visual order, last letter first: {indices:?}"
         );
 
-        let alone = glyphs(
-            "\u{645}",
-            &[FontRun {
-                font_id,
-                len: "\u{645}".len(),
-            }],
-        );
+        let alone = glyphs("\u{645}", &one_run("\u{645}"));
         let first_letter = whole.last().unwrap().0;
         assert_ne!(
             first_letter, alone[0].0,
@@ -845,10 +849,24 @@ mod tests {
                 },
             ],
         );
+        for (name, layout) in [("whole", &whole), ("split", &split)] {
+            let positions = layout.iter().map(|(_, _, x)| *x).collect::<Vec<_>>();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "{name}: glyphs are laid out left to right: {positions:?}"
+            );
+        }
         assert_eq!(
-            whole.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            split.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            "a font-run boundary inside a word must not change how its letters join"
+            whole
+                .iter()
+                .map(|(id, index, _)| (*id, *index))
+                .collect::<Vec<_>>(),
+            split
+                .iter()
+                .map(|(id, index, _)| (*id, *index))
+                .collect::<Vec<_>>(),
+            "a font-run boundary inside a word must not change how its letters join, or which \
+             letter each glyph stands for"
         );
     }
 
