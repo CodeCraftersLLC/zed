@@ -3421,8 +3421,10 @@ struct ShowUntrackedFiles {
 
 /// The files git may read `status.showUntrackedFiles` from, whether or not they exist yet: the
 /// repository's config, the linked worktree's own (`$GIT_DIR/config.worktree`, which for a main
-/// worktree is the repository's) and the system, global and XDG ones. The files git reports
-/// having read, `include`d ones among them, are added when the value is read.
+/// worktree is the repository's) and the system, global and XDG ones, and `HEAD`, which an
+/// `includeIf "onbranch:..."` reads: switching branch can change the value with no config file
+/// touched. The files git reports having read, `include`d ones among them, are added when the
+/// value is read.
 fn git_config_candidates(git_dir: &Path, common_dir: &Path) -> Vec<PathBuf> {
     let home = std::env::home_dir();
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
@@ -3435,6 +3437,7 @@ fn git_config_candidates(git_dir: &Path, common_dir: &Path) -> Vec<PathBuf> {
     let mut files = vec![
         common_dir.join("config"),
         git_dir.join("config.worktree"),
+        git_dir.join("HEAD"),
         system,
     ];
     files.extend(global);
@@ -3502,31 +3505,69 @@ async fn cached_show_untracked_files(
 
 /// The value of `status.showUntrackedFiles` (empty when unset) and the config files in the output
 /// of `git config --list --show-origin -z`, which is `origin NUL key NL value NUL` for each entry.
-/// Relative origins are relative to `working_directory`, where git ran.
+/// Relative origins are relative to `working_directory`, where git ran. A file an `include.path` or
+/// `includeIf.<condition>.path` entry names is a config file too, even when it is empty or missing
+/// and so is the origin of no entry yet.
 fn parse_config_list(output: &[u8], working_directory: &Path) -> (String, Vec<PathBuf>) {
     let mut value = String::new();
     let mut files = Vec::new();
+    let mut watch = |file: PathBuf| {
+        if !files.contains(&file) {
+            files.push(file);
+        }
+    };
     let mut fields = output.split(|byte| *byte == 0);
     while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
-        if let Some(file) = origin.strip_prefix(b"file:") {
-            let file = working_directory.join(String::from_utf8_lossy(file).as_ref());
-            if !files.contains(&file) {
-                files.push(file);
-            }
-        }
+        let origin_file = origin
+            .strip_prefix(b"file:")
+            .map(|file| working_directory.join(String::from_utf8_lossy(file).as_ref()));
         let entry = String::from_utf8_lossy(entry);
         let (key, entry_value) = entry.split_once('\n').unwrap_or((&entry, ""));
         if key.eq_ignore_ascii_case("status.showuntrackedfiles") {
             value = entry_value.to_string();
         }
+        if let Some(origin_file) = origin_file {
+            let target = is_include_path_key(key)
+                .then(|| include_target(entry_value, &origin_file))
+                .flatten();
+            watch(origin_file);
+            target.map(&mut watch);
+        }
     }
     (value, files)
+}
+
+/// `include.path` and `includeIf.<condition>.path`, which git reads case-insensitively.
+fn is_include_path_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"))
+}
+
+/// The file an include entry in `including_file` names: `~/` is the home directory and a relative
+/// path is relative to the including file's directory.
+fn include_target(path: &str, including_file: &Path) -> Option<PathBuf> {
+    if path.is_empty() {
+        return None;
+    }
+    if let Some(from_home) = path.strip_prefix("~/") {
+        return std::env::home_dir().map(|home| home.join(from_home));
+    }
+    Some(including_file.parent()?.join(path))
+}
+
+/// Whether `status.showUntrackedFiles` is set to a value git reads as false, which hides untracked
+/// files: `no`, `false`, `off` or an integer zero, in any case.
+fn hides_untracked_files(value: &str) -> bool {
+    ["no", "false", "off"]
+        .iter()
+        .any(|falsy| value.eq_ignore_ascii_case(falsy))
+        || value.parse::<i64>() == Ok(0)
 }
 
 /// Untracked files are listed one by one (`all`) because the diff pane opens each as a file,
 /// unless the repository hides them with `status.showUntrackedFiles = no`.
 fn git_status_args(path_prefixes: &[RepoPath], show_untracked_files: &str) -> Vec<OsString> {
-    let untracked_files = if show_untracked_files.eq_ignore_ascii_case("no") {
+    let untracked_files = if hides_untracked_files(show_untracked_files) {
         "--untracked-files=no"
     } else {
         "--untracked-files=all"
@@ -4051,6 +4092,13 @@ mod tests {
         assert_eq!(flag("normal"), "--untracked-files=all");
         assert_eq!(flag("no"), "--untracked-files=no");
         assert_eq!(flag("NO"), "--untracked-files=no");
+        // Git reads the value as a boolean too: these hide untracked files, as `no` does.
+        for falsy in ["false", "FALSE", "off", "Off", "0", "00"] {
+            assert_eq!(flag(falsy), "--untracked-files=no", "{falsy}");
+        }
+        for shown in ["true", "yes", "on", "1", "2"] {
+            assert_eq!(flag(shown), "--untracked-files=all", "{shown}");
+        }
     }
 
     #[test]
@@ -4153,6 +4201,103 @@ mod tests {
             parse_config_list(b"file:a\0status.showuntrackedfiles\0", Path::new("/work")).0,
             "",
             "a key with no value is not a value"
+        );
+    }
+
+    #[test]
+    fn a_file_an_include_entry_names_is_watched_even_when_no_entry_comes_from_it() {
+        let output = b"file:.git/config\0include.path\n../shared.cfg\0\
+            file:.git/config\0includeIf.onbranch:main.path\n/abs/branch.cfg\0\
+            file:/mnt/custom/included\0INCLUDE.PATH\nnested/deeper.cfg\0\
+            file:.git/config\0core.editor\nvim\0\
+            file:.git/config\0include.path\n\0";
+        let (_, files) = parse_config_list(output, Path::new("/work"));
+        assert_eq!(
+            files,
+            [
+                PathBuf::from("/work/.git/config"),
+                PathBuf::from("/work/.git/../shared.cfg"),
+                PathBuf::from("/abs/branch.cfg"),
+                PathBuf::from("/mnt/custom/included"),
+                PathBuf::from("/mnt/custom/nested/deeper.cfg"),
+            ],
+            "relative targets are relative to the including file; an empty path names nothing"
+        );
+    }
+
+    #[gpui::test]
+    async fn status_rereads_when_an_included_file_that_was_missing_appears(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        git_init_repo(dir.path());
+        fs::write(dir.path().join("draft.md"), "x").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let included = outside.path().join("later.cfg");
+        git_command(
+            dir.path(),
+            ["config", "include.path", included.to_str().unwrap()],
+        );
+        let repo = RealGitRepository::new(
+            &dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        assert_eq!(repo.status(&[]).await.unwrap().entries.len(), 1);
+
+        fs::write(&included, "[status]\n\tshowUntrackedFiles = no\n").unwrap();
+        assert_eq!(
+            repo.status(&[]).await.unwrap().entries.len(),
+            0,
+            "the file git ignored while it was missing now hides untracked files"
+        );
+    }
+
+    #[gpui::test]
+    async fn status_rereads_when_the_branch_changes_under_an_onbranch_include(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        git_init_repo(dir.path());
+        git_command(dir.path(), ["commit", "--allow-empty", "-m", "init"]);
+        fs::write(dir.path().join("draft.md"), "x").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let included = outside.path().join("feature.cfg");
+        fs::write(&included, "[status]\n\tshowUntrackedFiles = no\n").unwrap();
+        git_command(
+            dir.path(),
+            [
+                "config",
+                "includeIf.onbranch:feature.path",
+                included.to_str().unwrap(),
+            ],
+        );
+        let repo = RealGitRepository::new(
+            &dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        assert_eq!(repo.status(&[]).await.unwrap().entries.len(), 1);
+
+        git_command(dir.path(), ["checkout", "-b", "feature"]);
+        fs::File::options()
+            .write(true)
+            .open(dir.path().join(".git/HEAD"))
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            repo.status(&[]).await.unwrap().entries.len(),
+            0,
+            "no config file changed, the branch did"
         );
     }
 
