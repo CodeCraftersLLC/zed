@@ -71,21 +71,27 @@ impl InlineTag {
         if closing {
             return Self::Close(kind);
         }
-        if inner.trim_end_matches('>').trim_end().ends_with('/') && kind != InlineTagKind::LineBreak
-        {
+        let attributes = inner[name_len..].trim_end_matches('>');
+        if is_self_closing(attributes) && kind != InlineTagKind::LineBreak {
             return Self::Ignored;
         }
         let href = (kind == InlineTagKind::Link)
-            .then(|| attribute_value(&inner[name_len..], "href"))
+            .then(|| attribute_value(attributes, "href"))
             .flatten();
         Self::Open { kind, href }
     }
 }
 
-/// The value of attribute `name` in the text of a tag after its name, if it has one.
-fn attribute_value(attributes: &str, name: &str) -> Option<String> {
-    let mut rest = attributes.trim_end_matches('>');
-    loop {
+/// One attribute of a tag.
+struct Attribute<'a> {
+    name: &'a str,
+    value: Option<&'a str>,
+    quoted: bool,
+}
+
+/// The attributes in the text of a tag after its name, up to its `>`.
+fn attributes(mut rest: &str) -> impl Iterator<Item = Attribute<'_>> {
+    std::iter::from_fn(move || {
         rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '/');
         if rest.is_empty() {
             return None;
@@ -93,31 +99,65 @@ fn attribute_value(attributes: &str, name: &str) -> Option<String> {
         let name_len = rest
             .find(|c: char| c.is_whitespace() || c == '=' || c == '/')
             .unwrap_or(rest.len());
-        let (attribute, after) = rest.split_at(name_len);
-        let after = after.trim_start();
-        let Some(after_equals) = after.strip_prefix('=') else {
+        let (name, after) = rest.split_at(name_len);
+        let Some(after_equals) = after.trim_start().strip_prefix('=') else {
             rest = after;
-            continue;
+            return Some(Attribute {
+                name,
+                value: None,
+                quoted: false,
+            });
         };
         let after_equals = after_equals.trim_start();
-        let (value, remaining) = match after_equals.chars().next() {
+        let (value, remaining, quoted) = match after_equals.chars().next() {
             Some(quote @ ('"' | '\'')) => {
                 let body = &after_equals[1..];
                 let end = body.find(quote).unwrap_or(body.len());
-                (&body[..end], body.get(end + 1..).unwrap_or(""))
+                (&body[..end], body.get(end + 1..).unwrap_or(""), true)
             }
             _ => {
                 let end = after_equals
                     .find(char::is_whitespace)
                     .unwrap_or(after_equals.len());
-                (&after_equals[..end], &after_equals[end..])
+                (&after_equals[..end], &after_equals[end..], false)
             }
         };
-        if attribute.eq_ignore_ascii_case(name) {
-            return Some(decode_ampersands(value).into_owned());
-        }
         rest = remaining;
+        Some(Attribute {
+            name,
+            value: Some(value),
+            quoted,
+        })
+    })
+}
+
+/// The value of attribute `name` in the text of a tag after its name, if it has one.
+fn attribute_value(attributes_text: &str, name: &str) -> Option<String> {
+    attributes(attributes_text)
+        .find_map(|attribute| {
+            attribute
+                .name
+                .eq_ignore_ascii_case(name)
+                .then_some(attribute.value)
+                .flatten()
+        })
+        .map(|value| decode_ampersands(value).into_owned())
+}
+
+/// Whether the text of a tag after its name ends in `/>`. A `/` that ends an unquoted attribute
+/// value, as in `<a href=https://example.com/>`, belongs to the value and closes nothing.
+fn is_self_closing(attributes_text: &str) -> bool {
+    let attributes_text = attributes_text.trim_end();
+    if !attributes_text.ends_with('/') {
+        return false;
     }
+    let ends_a_value = attributes(attributes_text).last().is_some_and(|last| {
+        !last.quoted
+            && last
+                .value
+                .is_some_and(|value| value.ends_with('/') && attributes_text.ends_with(value))
+    });
+    !ends_a_value
 }
 
 /// The only entity that matters in a URL: `&amp;` between query parameters.
@@ -165,6 +205,42 @@ mod tests {
             "<img src=\"a.png\">",
             "<b/>",
             "x",
+        ] {
+            assert_eq!(InlineTag::parse(source), InlineTag::Ignored, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_slash_that_ends_an_unquoted_value_does_not_close_the_tag() {
+        for source in [
+            "<a href=https://example.com/>",
+            "<a href=https://example.com/docs/>",
+            "<a class=x href=/>",
+        ] {
+            assert!(
+                matches!(
+                    InlineTag::parse(source),
+                    InlineTag::Open {
+                        kind: InlineTagKind::Link,
+                        href: Some(_)
+                    }
+                ),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            InlineTag::parse("<a href=https://example.com/>"),
+            InlineTag::Open {
+                kind: InlineTagKind::Link,
+                href: Some("https://example.com/".to_string())
+            }
+        );
+        for source in [
+            "<a href=\"x/\"/>",
+            "<a href=x />",
+            "<a href=x/ />",
+            "<a href='x' />",
+            "<b hidden/>",
         ] {
             assert_eq!(InlineTag::parse(source), InlineTag::Ignored, "{source}");
         }
