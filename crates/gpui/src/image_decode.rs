@@ -254,6 +254,10 @@ fn stream_png_thumbnail(
         }
     }
 
+    // The chunks after the last row are part of the file: damage there is damage, as it is when
+    // the picture is decoded whole.
+    reader.finish().map_err(png_error)?;
+
     let mut thumbnail = RgbaImage::new(thumbnail_width as u32, thumbnail_height);
     for (index, (pixel, sum)) in thumbnail.pixels_mut().zip(&sums).enumerate() {
         let covered = u64::from(columns.sizes[index % thumbnail_width])
@@ -447,12 +451,28 @@ pub fn decode_bgra_frames(bytes: &[u8], format: ImageFormat) -> ImageResult<Smal
             if decoder.has_animation() {
                 decoder.set_background_color(Rgba([0, 0, 0, 0]))?;
                 let canvas = decoder.dimensions();
-                collect_animation(decoder.into_frames(), format, canvas, limits)
+                let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+                let mut frames = collect_animation(decoder.into_frames(), format, canvas, limits)?;
+                orient_frames(&mut frames, orientation);
+                Ok(frames)
             } else {
                 decode_still(bytes, format, limits)
             }
         }
         _ => decode_still(bytes, format, limits),
+    }
+}
+
+/// Turns every frame upright by `orientation`, as a still image is.
+fn orient_frames(frames: &mut [Frame], orientation: Orientation) {
+    if orientation == Orientation::NoTransforms {
+        return;
+    }
+    for frame in frames {
+        let upright = std::mem::replace(frame.buffer_mut(), RgbaImage::new(0, 0));
+        let mut upright = DynamicImage::ImageRgba8(upright);
+        upright.apply_orientation(orientation);
+        *frame.buffer_mut() = upright.into_rgba8();
     }
 }
 
@@ -1541,6 +1561,36 @@ mod tests {
         damaged[middle] ^= 0xFF;
         assert!(streamed_thumbnail(&damaged, 16).is_err());
         assert!(streamed_thumbnail(b"not a png at all", 16).is_err());
+    }
+
+    #[test]
+    fn every_frame_of_an_animation_is_turned_upright() {
+        let mut frame = RgbaImage::from_pixel(4, 2, Rgba([0, 0, 255, 255]));
+        frame.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        let mut frames = [Frame::new(frame.clone()), Frame::new(frame)];
+        orient_frames(&mut frames, Orientation::NoTransforms);
+        assert_eq!(frames[0].buffer().dimensions(), (4, 2));
+
+        orient_frames(&mut frames, Orientation::Rotate90);
+        for frame in &frames {
+            assert_eq!(frame.buffer().dimensions(), (2, 4));
+            // The red corner moved from the top-left to the top-right.
+            assert_eq!(frame.buffer().get_pixel(1, 0), &Rgba([255, 0, 0, 255]));
+            assert_eq!(frame.buffer().get_pixel(0, 0), &Rgba([0, 0, 255, 255]));
+        }
+    }
+
+    #[test]
+    fn damage_after_the_last_row_is_an_error_too() {
+        let mut bytes = two_tone_png((64, 64), [RED, BLUE], true);
+        assert!(streamed_thumbnail(&bytes, 16).is_ok());
+        // The last byte is the checksum of the closing chunk.
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        assert!(matches!(
+            streamed_thumbnail(&bytes, 16),
+            Err(ImageError::Decoding(_))
+        ));
     }
 
     #[test]

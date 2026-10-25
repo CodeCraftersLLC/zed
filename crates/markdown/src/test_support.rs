@@ -287,7 +287,7 @@ mod tests {
             assert_eq!(style.font_weight, default_style.font_weight);
             assert_eq!(style.font_style, FontStyle::Italic);
 
-            builder.close_all_inline_tags();
+            builder.close_all_inline_tags(0);
             assert_eq!(builder.text_style().font_style, default_style.font_style);
 
             for (kind, has_style) in [
@@ -396,6 +396,118 @@ mod tests {
     }
 
     #[gpui::test]
+    fn an_html_link_left_open_runs_to_the_end_of_its_block(cx: &mut TestAppContext) {
+        let source = "go <a href=\"https://example.com/x\">here and more\n\nnext";
+        let (markdown, cx) = markdown_view(source, cx);
+        let shown = draw_markdown(&markdown, cx);
+        assert_eq!(shown.links.len(), 1);
+        assert_eq!(
+            source[shown.links[0].1.clone()].trim_end(),
+            "<a href=\"https://example.com/x\">here and more"
+        );
+    }
+
+    /// A window whose root view is the Markdown element, which is what a screen reader reads.
+    struct MarkdownWindow(Entity<Markdown>);
+
+    impl Render for MarkdownWindow {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            MarkdownElement::new(self.0.clone(), MarkdownStyle::default()).code_block_renderer(
+                CodeBlockRenderer::Default {
+                    copy_button_visibility: CopyButtonVisibility::Hidden,
+                    wrap_button_visibility: WrapButtonVisibility::Hidden,
+                    border: false,
+                },
+            )
+        }
+    }
+
+    fn accessible_markdown_view<'a>(
+        source: &str,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<Markdown>, &'a mut VisualTestContext) {
+        cx.update(|cx| {
+            if !cx.has_global::<settings::SettingsStore>() {
+                settings::init(cx);
+            }
+            if !cx.has_global::<theme::GlobalTheme>() {
+                theme_settings::init(theme::LoadThemes::JustBase, cx);
+            }
+        });
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                source.to_string().into(),
+                None,
+                None,
+                MarkdownOptions {
+                    parse_html: true,
+                    render_mermaid_diagrams: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        let (_, cx) = cx.add_window_view({
+            let markdown = markdown.clone();
+            move |_, _| MarkdownWindow(markdown)
+        });
+        cx.enable_accessibility();
+        (markdown, cx)
+    }
+
+    /// The role, node and expanded state of each node a screen reader is given.
+    fn a11y_nodes(
+        cx: &mut VisualTestContext,
+    ) -> Vec<(gpui::accesskit::Role, gpui::accesskit::NodeId, Option<bool>)> {
+        cx.a11y_tree()
+            .expect("the window built an accessibility tree")
+            .nodes
+            .into_iter()
+            .map(|(id, node)| (node.role(), id, node.is_expanded()))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn a_details_summary_is_an_expandable_control_for_a_screen_reader(cx: &mut TestAppContext) {
+        let source = "<details>\n<summary>S</summary>\n\nbody\n\n</details>";
+        let (markdown, cx) = accessible_markdown_view(source, cx);
+        cx.run_until_parked();
+
+        let toggle = |cx: &mut VisualTestContext| {
+            a11y_nodes(cx)
+                .into_iter()
+                .find(|(role, _, _)| *role == gpui::accesskit::Role::DisclosureTriangle)
+                .map(|(_, id, expanded)| (id, expanded))
+        };
+        let (id, expanded) = toggle(cx).expect("the summary is a disclosure control");
+        assert_eq!(expanded, Some(false));
+
+        cx.simulate_a11y_action(id, gpui::accesskit::Action::Click);
+        assert_eq!(toggle(cx).map(|(_, expanded)| expanded), Some(Some(true)));
+        assert!(
+            markdown.read_with(cx, |markdown, _| markdown.is_details_open((0, 0), false)),
+            "the click toggled the region"
+        );
+    }
+
+    #[gpui::test]
+    fn a_diagram_that_cannot_be_drawn_has_no_code_button_when_controls_are_hidden(
+        cx: &mut TestAppContext,
+    ) {
+        let (markdown, cx) = accessible_markdown_view("```mermaid\nsankey-beta\na,b,1\n```", cx);
+        cx.run_until_parked();
+        let reasons =
+            markdown.read_with(cx, |markdown, _| markdown.mermaid_state.failure_reasons());
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+
+        let buttons: Vec<_> = a11y_nodes(cx)
+            .into_iter()
+            .filter(|(role, _, _)| *role == gpui::accesskit::Role::Button)
+            .collect();
+        assert!(buttons.is_empty(), "{buttons:?}");
+    }
+
+    #[gpui::test]
     fn a_details_region_shows_its_summary_and_expands_on_toggle(cx: &mut TestAppContext) {
         let source = "<details>\n<summary>S</summary>\n\nbody\n\n</details>\n\nafter";
         let (markdown, cx) = markdown_view(source, cx);
@@ -462,6 +574,69 @@ mod tests {
         let text = rendered_plain_text(&markdown, cx);
         assert!(text.contains("second body"), "{text:?}");
         assert!(!text.contains("inline"), "{text:?}");
+    }
+
+    #[gpui::test]
+    fn nested_regions_one_block_opens_together_toggle_separately(cx: &mut TestAppContext) {
+        let source = "<details>\n<summary>A</summary>\n<details>\n<summary>B</summary>\n\ninner\n\n</details>\n\nouter body\n\n</details>\n\nafter";
+        let (markdown, cx) = markdown_view(source, cx);
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(
+            text.contains('A') && !text.contains('B') && !text.contains("outer body"),
+            "{text:?}"
+        );
+
+        markdown.update(cx, |markdown, _| markdown.toggle_details((0, 0)));
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(
+            text.contains('B') && text.contains("outer body"),
+            "{text:?}"
+        );
+        assert!(!text.contains("inner"), "{text:?}");
+        assert!(text.contains("after"), "{text:?}");
+
+        markdown.update(cx, |markdown, _| markdown.toggle_details((0, 1)));
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(
+            text.contains("inner") && text.contains("outer body"),
+            "{text:?}"
+        );
+
+        markdown.update(cx, |markdown, _| markdown.toggle_details((0, 0)));
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(
+            !text.contains("inner") && !text.contains("outer body") && text.contains("after"),
+            "{text:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_region_in_a_list_item_is_numbered_and_closed_with_the_block(cx: &mut TestAppContext) {
+        let source = "<details>x</details>\n<ul><li><details><summary>S</summary>\n\nbody\n\n</details></li></ul>\n\nafter";
+        let (markdown, cx) = markdown_view(source, cx);
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(
+            text.contains('S') && !text.contains("body") && text.contains("after"),
+            "{text:?}"
+        );
+
+        // The region in the list is the block's second.
+        markdown.update(cx, |markdown, _| markdown.toggle_details((0, 1)));
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(text.contains("body"), "{text:?}");
+    }
+
+    #[gpui::test]
+    fn a_toggle_does_not_outlive_the_document_it_was_made_in(cx: &mut TestAppContext) {
+        let source = "<details>\n<summary>S</summary>\n\nbody\n\n</details>";
+        let (markdown, cx) = markdown_view(source, cx);
+        markdown.update(cx, |markdown, _| markdown.toggle_details((0, 0)));
+        assert!(rendered_plain_text(&markdown, cx).contains("body"));
+
+        markdown.update(cx, |markdown, cx| markdown.replace("", cx));
+        markdown.update(cx, |markdown, cx| markdown.replace(source, cx));
+        let text = rendered_plain_text(&markdown, cx);
+        assert!(text.contains('S') && !text.contains("body"), "{text:?}");
     }
 
     #[gpui::test]

@@ -823,6 +823,11 @@ impl SettingsObserver {
                     &trusted_worktrees,
                     move |settings_observer, _, e, cx| match e {
                         TrustedWorktreesEvent::Trusted(_, trusted_paths) => {
+                            // What waited for trust was read before settings were ignored.
+                            if cx.global::<SettingsStore>().ignore_local_settings() {
+                                settings_observer.pending_local_settings.clear();
+                                return;
+                            }
                             for trusted_path in trusted_paths {
                                 if let Some(pending_local_settings) = settings_observer
                                     .pending_local_settings

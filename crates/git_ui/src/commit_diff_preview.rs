@@ -298,7 +298,7 @@ impl CommitDiffPreviewFile {
         } else if self.is_binary || (self.is_truncated && self.binary.is_some()) {
             FileKind::Card
         } else if self.is_truncated {
-            FileKind::Notice(truncated_notice(self.no_preview_reason).to_string())
+            FileKind::Notice(truncated_notice(self.no_preview_reason))
         } else {
             FileKind::Text
         }
@@ -353,12 +353,19 @@ impl CommitDiffPreviewFile {
 }
 
 /// What a file whose contents were not read says in place of its lines.
-fn truncated_notice(reason: Option<NoPreviewReason>) -> &'static str {
+fn truncated_notice(reason: Option<NoPreviewReason>) -> String {
     match reason {
         Some(NoPreviewReason::BudgetExhausted) => {
             "Not previewed: the preview limit for this commit was reached before this file."
+                .to_string()
         }
-        _ => "Too large to preview.",
+        Some(NoPreviewReason::TooLargeToPreview { limit: Some(limit) }) => {
+            format!(
+                "Too large to preview (limit {}).",
+                format_binary_size(limit)
+            )
+        }
+        _ => "Too large to preview.".to_string(),
     }
 }
 
@@ -1364,6 +1371,26 @@ mod tests {
         let card = only_card(&deleted);
         assert!(card.shows_before && !card.shows_after);
         assert_eq!(card.old_caption.as_ref(), unknown);
+    }
+
+    #[test]
+    fn an_over_limit_text_file_names_the_limit_when_it_is_known() {
+        let mut over_limit = file(CommitDiffPreviewStatus::Modified, false, true, None, None);
+        over_limit.no_preview_reason = Some(NoPreviewReason::TooLargeToPreview {
+            limit: Some(2 * 1024 * 1024),
+        });
+        let mut unknown_limit = file(CommitDiffPreviewStatus::Modified, false, true, None, None);
+        unknown_limit.no_preview_reason = Some(NoPreviewReason::TooLargeToPreview { limit: None });
+
+        let split = split_files(vec![over_limit, unknown_limit]);
+
+        assert_eq!(
+            notice_bodies(&split),
+            [
+                "Too large to preview (limit 2.0 MB).",
+                "Too large to preview."
+            ]
+        );
     }
 
     #[test]

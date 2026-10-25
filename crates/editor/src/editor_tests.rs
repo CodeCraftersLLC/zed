@@ -28472,11 +28472,43 @@ async fn test_disabled_debugging_hides_gutter_breakpoint_entries(cx: &mut TestAp
     assert!(labels.contains(&"Set Breakpoint".to_string()), "{labels:?}");
     assert!(labels.contains(&"Add Bookmark".to_string()), "{labels:?}");
 
+    // A debug line and a refresh of inline values that are under way when debugging is turned off.
+    let refresh_guard = Rc::new(());
+    editor.update(cx, |editor, cx| {
+        let anchor = editor
+            .buffer()
+            .read(cx)
+            .snapshot(cx)
+            .anchor_before(Point::new(1, 0));
+        editor.highlight_rows::<ActiveDebugLine>(
+            anchor..anchor,
+            |_| gpui::red(),
+            RowHighlightOptions::default(),
+            cx,
+        );
+        assert_eq!(editor.highlighted_rows::<ActiveDebugLine>(cx).count(), 1);
+        let guard = refresh_guard.clone();
+        editor.inline_value_cache.refresh_task = cx.spawn(async move |_, _| {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Some(())
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(Rc::strong_count(&refresh_guard), 2);
+
     editor.update(cx, |editor, cx| editor.set_debugging_enabled(false, cx));
-    editor.read_with(cx, |editor, _| {
+    editor.read_with(cx, |editor, cx| {
         assert!(editor.breakpoint_store().is_none());
         assert!(!editor.inline_values_enabled());
+        assert_eq!(editor.highlighted_rows::<ActiveDebugLine>(cx).count(), 0);
     });
+    cx.run_until_parked();
+    assert_eq!(
+        Rc::strong_count(&refresh_guard),
+        1,
+        "the running refresh was cancelled"
+    );
     let labels = gutter_menu_labels(&editor, cx);
     assert_eq!(labels, ["Add Bookmark"], "only the bookmark entry is left");
 

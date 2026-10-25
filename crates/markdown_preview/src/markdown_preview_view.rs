@@ -913,7 +913,9 @@ fn handle_url_click(
                                 cx,
                             );
                         }
-                    } else {
+                    } else if !markdown.read(cx).is_parsing() {
+                        // While an edit is being parsed the heading may only be missing from the
+                        // page as it was.
                         workspace
                             .update(cx, |workspace, cx| {
                                 workspace.show_toast(
@@ -1010,10 +1012,12 @@ fn resolve_preview_image(
         None => base_directory?.join(&decoded),
     };
 
+    // The image is loaded from the path that was checked, so a symlink swapped in afterwards
+    // cannot lead out of the worktree.
     let resolved = candidate.canonicalize().ok()?;
     resolved
         .starts_with(workspace_directory.canonicalize().ok()?)
-        .then(|| ImageSource::Resource(Resource::Path(Arc::from(candidate.as_path()))))
+        .then(|| ImageSource::Resource(Resource::Path(Arc::from(resolved.as_path()))))
 }
 
 impl Focusable for MarkdownPreviewView {
@@ -1650,6 +1654,26 @@ mod tests {
         assert!(resolve_preview_image("/docs/link.png", Some(&docs), Some(&worktree)).is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_worktree_resolves_to_what_it_points_at() {
+        let tree = TempTree::new(json!({ "worktree": { "docs": {}, "real.png": "mock data" } }));
+        let worktree = tree.path().join("worktree");
+        let docs = worktree.join("docs");
+        std::os::unix::fs::symlink(worktree.join("real.png"), docs.join("alias.png"))
+            .expect("create symlink");
+
+        let Some(ImageSource::Resource(Resource::Path(path))) =
+            resolve_preview_image("alias.png", Some(&docs), Some(&worktree))
+        else {
+            panic!("the alias did not resolve");
+        };
+        assert_eq!(
+            path.as_ref(),
+            worktree.join("real.png").canonicalize().unwrap()
+        );
+    }
+
     #[gpui::test]
     async fn toggles_task_checkbox_and_saves_when_preview_is_active(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
@@ -1812,6 +1836,65 @@ mod tests {
         assert_eq!(
             Markdown::missing_heading_message("nope"),
             "There is no heading “nope” on this page"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_link_to_a_heading_being_parsed_does_not_say_it_is_missing(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/dir"), json!({ "doc.md": "# Intro\n" }))
+            .await;
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/dir/doc.md"))],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let (workspace, preview) = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let editor: Entity<Editor> = workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<Editor>(cx))
+                    .unwrap();
+                let preview = workspace.update(cx, |workspace, cx| {
+                    MarkdownPreviewView::create_markdown_view(workspace, editor, window, cx)
+                });
+                (workspace, preview)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let markdown = preview.read_with(cx, |preview, _| preview.markdown.clone());
+        markdown.update(cx, |markdown, cx| markdown.append("\n# Fresh\n", cx));
+        assert!(markdown.read_with(cx, |markdown, _| markdown.is_parsing()));
+
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                super::handle_url_click(
+                    "#fresh".into(),
+                    &preview.downgrade(),
+                    None,
+                    &workspace.downgrade(),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        assert!(
+            workspace
+                .read_with(cx, |workspace, _| workspace.notification_ids())
+                .is_empty()
         );
     }
 
@@ -2378,6 +2461,10 @@ mod tests {
     ) {
         match resolved {
             Some(ImageSource::Resource(Resource::Path(path))) => {
+                // A resolved path is the real one, with every symlink followed.
+                let expected_path = expected_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| expected_path.to_path_buf());
                 assert_eq!(path.as_ref(), expected_path);
             }
             _ => panic!("Expected preview image to resolve to a local path"),

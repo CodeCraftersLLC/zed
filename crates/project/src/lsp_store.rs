@@ -137,7 +137,7 @@ use std::{
     vec,
 };
 use sum_tree::Dimensions;
-use text::{Anchor, BufferId, LineEnding, OffsetRangeExt, ToPoint as _};
+use text::{Anchor, BufferId, LineEnding, LineEndings, OffsetRangeExt, ToPoint as _};
 
 use util::{
     ConnectionResult, ResultExt as _, debug_panic, defer, maybe, merge_json_value_into,
@@ -1689,7 +1689,9 @@ impl LocalLspStore {
         };
         if let Some((desired_line_ending, preserve_existing)) = line_ending_policy {
             buffer.handle.update(cx, |buffer, cx| {
-                if buffer.line_ending() == desired_line_ending {
+                // The first line alone is not enough: a mixed file whose first line already
+                // has the wanted ending still has lines that do not.
+                if buffer.line_endings() == LineEndings::uniform(desired_line_ending) {
                     return;
                 }
                 if preserve_existing && had_existing_line_endings {

@@ -6280,8 +6280,11 @@ impl Editor {
         self.breakpoint_store = None;
         self.show_breakpoints = Some(false);
         self.inline_value_cache.enabled = false;
+        // A refresh still running would install debugger inlays after this returns.
+        self.inline_value_cache.refresh_task = Task::ready(None);
         let inlays = mem::take(&mut self.inline_value_cache.inlays);
         self.splice_inlays(&inlays, Vec::new(), cx);
+        self.clear_row_highlights::<ActiveDebugLine>();
         cx.notify();
     }
 

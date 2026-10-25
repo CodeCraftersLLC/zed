@@ -1,7 +1,8 @@
 use std::ops::Range;
 
 use gpui::{
-    App, FontStyle, FontWeight, StrikethroughStyle, TextAlign, TextStyleRefinement, UnderlineStyle,
+    App, FontStyle, FontWeight, Role, StrikethroughStyle, TextAlign, TextStyleRefinement,
+    UnderlineStyle,
 };
 use pulldown_cmark::Alignment;
 use ui::prelude::*;
@@ -160,6 +161,9 @@ impl MarkdownElement {
         builder.push_div(
             h_flex()
                 .id(("html-details", region.0 * 64 + region.1))
+                .role(Role::DisclosureTriangle)
+                .aria_expanded(is_open)
+                .tab_index(0)
                 .gap_1()
                 .items_start()
                 .mb_2()

@@ -915,6 +915,7 @@ impl Markdown {
             };
             self.active_root_block = None;
             self.images_by_source_offset.clear();
+            self.details_toggled.clear();
             self.mermaid_state.clear();
             cx.notify();
             cx.refresh_windows();
@@ -1178,7 +1179,7 @@ pub struct ParsedMarkdown {
     pub(crate) html_blocks: BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
     pub(crate) metadata_blocks: BTreeMap<usize, ParsedMetadataBlock>,
     pub(crate) mermaid_diagrams: BTreeMap<usize, ParsedMarkdownMermaidDiagram>,
-    pub(crate) details_spans: BTreeMap<usize, DetailsSpan>,
+    pub(crate) details_spans: BTreeMap<(usize, usize), DetailsSpan>,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
 }
@@ -2212,7 +2213,7 @@ impl Element for MarkdownElement {
                         | MarkdownTagEnd::Image
                 )
             {
-                builder.close_all_inline_tags();
+                builder.close_all_inline_tags(range.end);
             }
 
             match event {
@@ -2418,16 +2419,26 @@ impl Element for MarkdownElement {
                             if let Some(block) = parsed_markdown.html_blocks.get(&range.start) {
                                 self.render_html_block(block, &mut builder, markdown_end, cx);
                                 handled_html_block = true;
-                                if let Some(details) = block.open_ended_details()
-                                    && let Some(span) =
-                                        parsed_markdown.details_spans.get(&range.start)
-                                    && !self.markdown.read(cx).is_details_open(
-                                        (range.start, details.ordinal),
-                                        details.open,
-                                    )
-                                {
-                                    hidden_events = span.hidden_events.clone();
-                                }
+                                // Regions one block opens together nest, so the collapsed one that
+                                // reaches furthest hides the others' bodies too.
+                                let markdown = self.markdown.read(cx);
+                                hidden_events = block
+                                    .open_ended_details()
+                                    .into_iter()
+                                    .filter(|details| {
+                                        !markdown.is_details_open(
+                                            (range.start, details.ordinal),
+                                            details.open,
+                                        )
+                                    })
+                                    .filter_map(|details| {
+                                        parsed_markdown
+                                            .details_spans
+                                            .get(&(range.start, details.ordinal))
+                                    })
+                                    .map(|span| span.hidden_events.clone())
+                                    .max_by_key(|hidden| hidden.end)
+                                    .unwrap_or(0..0);
                             }
                         }
                         MarkdownTag::List(bullet_index) => {
@@ -3282,14 +3293,13 @@ impl MarkdownElementBuilder {
         }
     }
 
-    /// Closes every open tag; HTML tags do not carry over to the next block.
-    fn close_all_inline_tags(&mut self) {
-        let link_count = self
-            .open_inline_tags
-            .drain(..)
-            .filter(|tag| tag.link.is_some())
-            .count();
-        self.link_depth = self.link_depth.saturating_sub(link_count);
+    /// Closes every open tag at `source_end`, the end of the block; HTML tags do not carry over to
+    /// the next block. A link left open runs to there, as a browser draws it.
+    fn close_all_inline_tags(&mut self, source_end: usize) {
+        for link in self.open_inline_tags.drain(..).filter_map(|tag| tag.link) {
+            self.rendered_links[link].source_range.end = source_end;
+            self.link_depth = self.link_depth.saturating_sub(1);
+        }
     }
 
     fn pop_text_style(&mut self) {

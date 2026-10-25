@@ -4802,7 +4802,10 @@ impl Workspace {
 
         if let Ok(url) = Url::parse(url_or_path) {
             match url.scheme() {
-                "file" => open_abs_path(self, PathBuf::from(url.path()), cx),
+                "file" => match url.to_file_path() {
+                    Ok(path) => open_abs_path(self, path, cx),
+                    Err(()) => log::warn!("not opening {url_or_path:?}: it is not a local file"),
+                },
                 scheme if util::markdown::is_os_openable_scheme(scheme) => cx.open_url(url_or_path),
                 scheme => log::warn!(
                     "not opening a link with the {scheme:?} scheme: only http, https, mailto and file links are followed"
@@ -15540,6 +15543,9 @@ mod tests {
         // Model
         struct TestPngItem {}
 
+        /// The paths a PNG item was asked to open, newest last.
+        static PNG_PATHS_TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
         impl project::ProjectItem for TestPngItem {
             fn try_open(
                 _project: &Entity<Project>,
@@ -15547,6 +15553,10 @@ mod tests {
                 cx: &mut App,
             ) -> Option<Task<anyhow::Result<Entity<Self>>>> {
                 if path.path.extension().unwrap() == "png" {
+                    PNG_PATHS_TRIED
+                        .lock()
+                        .unwrap()
+                        .push(path.path.as_unix_str().to_string());
                     Some(cx.spawn(async move |cx| Ok(cx.new(|_| TestPngItem {}))))
                 } else {
                     None
@@ -15792,6 +15802,32 @@ mod tests {
                 })
                 .await;
             assert!(handle.is_err());
+        }
+
+        #[cfg(unix)]
+        #[gpui::test]
+        async fn test_open_url_or_file_opens_a_file_url_by_the_path_it_names(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            cx.update(|cx| register_project_item::<TestPngItemView>(cx));
+
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree("/root1", json!({ "my picture.png": "BINARYDATAHERE" }))
+                .await;
+            let project = Project::test(fs, ["/root1".as_ref()], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_url_or_file("file:///root1/my%20picture.png", None, window, cx);
+            });
+            cx.run_until_parked();
+
+            // The percent-escape is decoded: the file is "my picture.png", not "my%20picture.png".
+            let tried = PNG_PATHS_TRIED.lock().unwrap().clone();
+            assert!(tried.contains(&"my picture.png".to_string()), "{tried:?}");
+            assert!(!tried.iter().any(|path| path.contains("%20")), "{tried:?}");
         }
 
         #[gpui::test]

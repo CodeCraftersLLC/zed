@@ -24,12 +24,38 @@ pub(crate) struct ParsedHtmlBlock {
 }
 
 impl ParsedHtmlBlock {
-    /// The `<details>` this block opens but does not close, whose body is in the blocks after it.
-    pub(crate) fn open_ended_details(&self) -> Option<&ParsedHtmlDetails> {
-        self.children.iter().find_map(|child| match child {
-            ParsedHtmlElement::Details(details) if !details.closed => Some(details),
-            _ => None,
-        })
+    /// The `<details>` this block opens but does not close, outermost first. Their bodies are in
+    /// the blocks after it.
+    pub(crate) fn open_ended_details(&self) -> Vec<&ParsedHtmlDetails> {
+        let mut found = Vec::new();
+        collect_open_ended_details(&self.children, &mut found);
+        found
+    }
+}
+
+#[stacksafe]
+fn collect_open_ended_details<'a>(
+    elements: &'a [ParsedHtmlElement],
+    found: &mut Vec<&'a ParsedHtmlDetails>,
+) {
+    for element in elements {
+        match element {
+            ParsedHtmlElement::Details(details) => {
+                if !details.closed {
+                    found.push(details);
+                }
+                collect_open_ended_details(&details.body, found);
+            }
+            ParsedHtmlElement::List(list) => {
+                for item in &list.items {
+                    collect_open_ended_details(&item.content, found);
+                }
+            }
+            ParsedHtmlElement::BlockQuote(quote) => {
+                collect_open_ended_details(&quote.children, found);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -212,23 +238,16 @@ impl HtmlImage {
     }
 }
 
-#[derive(Debug)]
-struct ParseHtmlNodeContext {
+/// What parsing one node needs to know about the HTML block around it. Lists and block quotes
+/// change the depth and keep the rest, so `<details>` inside them number and close as the
+/// block-wide count does.
+#[derive(Clone, Copy, Debug)]
+struct ParseHtmlNodeContext<'a> {
     list_item_depth: u16,
     /// Which `<details>` of the block, in the order they open, the block does not close.
-    unclosed_details: Vec<usize>,
+    unclosed_details: &'a [usize],
     /// How many `<details>` elements have been parsed in the block so far.
-    details_seen: Cell<usize>,
-}
-
-impl Default for ParseHtmlNodeContext {
-    fn default() -> Self {
-        Self {
-            list_item_depth: 1,
-            unclosed_details: Vec::new(),
-            details_seen: Cell::new(0),
-        }
-    }
+    details_seen: &'a Cell<usize>,
 }
 
 pub(crate) fn parse_html_block(
@@ -243,13 +262,16 @@ pub(crate) fn parse_html_block(
         .ok()?;
 
     let mut children = Vec::new();
+    let unclosed_details = details_balance(source).unclosed;
+    let details_seen = Cell::new(0);
     parse_html_node(
         source_range.clone(),
         &dom.document,
         &mut children,
         &ParseHtmlNodeContext {
-            unclosed_details: details_balance(source).unclosed,
-            ..Default::default()
+            list_item_depth: 1,
+            unclosed_details: &unclosed_details,
+            details_seen: &details_seen,
         },
     );
 
@@ -282,7 +304,7 @@ fn parse_html_node(
     source_range: Range<usize>,
     node: &Node,
     elements: &mut Vec<ParsedHtmlElement>,
-    context: &ParseHtmlNodeContext,
+    context: &ParseHtmlNodeContext<'_>,
 ) {
     match &node.data {
         NodeData::Document => {
@@ -364,16 +386,13 @@ fn parse_html_node(
                     }));
                 }
             } else if name.local == local_name!("ul") || name.local == local_name!("ol") {
-                if let Some(list) = extract_html_list(
-                    node,
-                    name.local == local_name!("ol"),
-                    context.list_item_depth,
-                    source_range,
-                ) {
+                if let Some(list) =
+                    extract_html_list(node, name.local == local_name!("ol"), context, source_range)
+                {
                     elements.push(ParsedHtmlElement::List(list));
                 }
             } else if name.local == local_name!("blockquote") {
-                if let Some(blockquote) = extract_html_blockquote(node, source_range) {
+                if let Some(blockquote) = extract_html_blockquote(node, context, source_range) {
                     elements.push(ParsedHtmlElement::BlockQuote(blockquote));
                 }
             } else if name.local == local_name!("table") {
@@ -587,7 +606,7 @@ fn extract_html_details(
     node: &Node,
     attrs: &RefCell<Vec<Attribute>>,
     source_range: Range<usize>,
-    context: &ParseHtmlNodeContext,
+    context: &ParseHtmlNodeContext<'_>,
 ) -> ParsedHtmlDetails {
     let ordinal = context.details_seen.get();
     context.details_seen.set(ordinal + 1);
@@ -626,7 +645,7 @@ fn consume_children(
     source_range: Range<usize>,
     node: &Node,
     elements: &mut Vec<ParsedHtmlElement>,
-    context: &ParseHtmlNodeContext,
+    context: &ParseHtmlNodeContext<'_>,
 ) {
     for child in node.children.borrow().iter() {
         parse_html_node(source_range.clone(), child, elements, context);
@@ -763,9 +782,10 @@ fn extract_image(source_range: Range<usize>, attrs: &RefCell<Vec<Attribute>>) ->
 fn extract_html_list(
     node: &Node,
     ordered: bool,
-    depth: u16,
+    context: &ParseHtmlNodeContext<'_>,
     source_range: Range<usize>,
 ) -> Option<ParsedHtmlList> {
+    let depth = context.list_item_depth;
     let mut items = Vec::with_capacity(node.children.borrow().len());
 
     for (index, child) in node.children.borrow().iter().enumerate() {
@@ -781,7 +801,7 @@ fn extract_html_list(
                 &mut content,
                 &ParseHtmlNodeContext {
                     list_item_depth: depth + 1,
-                    ..Default::default()
+                    ..*context
                 },
             );
 
@@ -829,6 +849,7 @@ fn parse_html_element_dimension(value: &str) -> Option<DefiniteLength> {
 
 fn extract_html_blockquote(
     node: &Node,
+    context: &ParseHtmlNodeContext<'_>,
     source_range: Range<usize>,
 ) -> Option<ParsedHtmlBlockQuote> {
     let mut children = Vec::new();
@@ -836,7 +857,10 @@ fn extract_html_blockquote(
         source_range.clone(),
         node,
         &mut children,
-        &ParseHtmlNodeContext::default(),
+        &ParseHtmlNodeContext {
+            list_item_depth: 1,
+            ..*context
+        },
     );
 
     if children.is_empty() {

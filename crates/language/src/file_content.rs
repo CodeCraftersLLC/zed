@@ -58,7 +58,8 @@ pub fn analyze_byte_content(bytes: &[u8]) -> ByteContent {
 
     // A lone NUL in a short file is stray data, not the high bytes of UTF-16 text: with integer
     // division `limit / 16` is 0 or 1 for any sample under 32 bytes, so one NUL used to qualify.
-    let has_significant_nulls = total_null_count >= 2 && total_null_count * 16 >= limit;
+    // Past two, the threshold stays the rounded-down one: text that is mostly non-Latin has few NULs.
+    let has_significant_nulls = total_null_count >= 2 && total_null_count >= limit / 16;
     let nulls_skew_to_even = even_null_count > odd_null_count * 4;
     let nulls_skew_to_odd = odd_null_count > even_null_count * 4;
 
@@ -199,6 +200,18 @@ mod tests {
             .encode_utf16()
             .flat_map(u16::to_be_bytes)
             .collect();
+        assert_eq!(analyze_byte_content(&utf16be), ByteContent::Utf16Be);
+    }
+
+    #[test]
+    fn utf16_text_with_few_ascii_characters_is_still_utf16() {
+        // Two NULs in 40 bytes: "AB" followed by eighteen Cyrillic letters, which have none.
+        let text = format!("AB{}", "\u{416}".repeat(18));
+        let utf16le: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(utf16le.len(), 40);
+        assert_eq!(utf16le.iter().filter(|byte| **byte == 0).count(), 2);
+        assert_eq!(analyze_byte_content(&utf16le), ByteContent::Utf16Le);
+        let utf16be: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
         assert_eq!(analyze_byte_content(&utf16be), ByteContent::Utf16Be);
     }
 
