@@ -12589,6 +12589,41 @@ async fn test_file_status(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_first_scan_of_clean_repository_emits_statuses_changed(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(path!("/root"), json!({ "repo": { "a.txt": "a" } }))
+        .await;
+
+    let project = Project::test(fs.clone(), [path!("/root/repo").as_ref()], cx).await;
+    let statuses_changed = Arc::new(Mutex::new(0usize));
+    project.update(cx, |project, cx| {
+        let statuses_changed = statuses_changed.clone();
+        cx.subscribe(project.git_store(), move |_, _, e, _| {
+            if let GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged, _) = e {
+                *statuses_changed.lock() += 1;
+            }
+        })
+        .detach();
+    });
+    fs.create_dir(path!("/root/repo/.git").as_ref())
+        .await
+        .unwrap();
+    fs.set_head_and_index_for_repo(path!("/root/repo/.git").as_ref(), &[("a.txt", "a".into())]);
+    cx.run_until_parked();
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    cx.run_until_parked();
+
+    assert!(
+        *statuses_changed.lock() >= 1,
+        "first full status scan of a clean repository must emit StatusesChanged"
+    );
+}
+
+#[gpui::test]
 #[ignore]
 async fn test_ignored_dirs_events(cx: &mut gpui::TestAppContext) {
     init_test(cx);
