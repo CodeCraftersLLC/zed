@@ -37,9 +37,6 @@ fn details_tags(html: &str) -> Vec<DetailsTag> {
             ix = start + "<!--".len() + comment.find("-->").map_or(comment.len(), |end| end + 3);
             continue;
         }
-        let tag_end = start + tag_len(rest);
-        ix = tag_end;
-
         let (closing, after_bracket) = match rest[1..].strip_prefix('/') {
             Some(after_slash) => (true, after_slash),
             None => (false, &rest[1..]),
@@ -47,6 +44,13 @@ fn details_tags(html: &str) -> Vec<DetailsTag> {
         let name_len = after_bracket
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
             .unwrap_or(after_bracket.len());
+        if name_len == 0 {
+            // A `<` that starts no tag, as in `1 < 2`, is text: it does not swallow what follows.
+            ix = start + 1;
+            continue;
+        }
+        let tag_end = start + tag_len(rest);
+        ix = tag_end;
         match (&after_bracket[..name_len], closing) {
             ("details", false) => tags.push(DetailsTag::Open),
             ("details", true) => tags.push(DetailsTag::Close),
@@ -260,6 +264,15 @@ mod tests {
         let (outer, inner) = (&spans[&(0, 0)], &spans[&(0, 1)]);
         assert_eq!(outer.hidden_events.start, inner.hidden_events.start);
         assert!(inner.hidden_events.end < outer.hidden_events.end);
+    }
+
+    #[test]
+    fn a_bare_angle_bracket_does_not_hide_the_tags_after_it() {
+        assert_eq!(details_balance("1 < 2 <details>x"), balance(&[0], 0));
+        assert_eq!(details_balance("a </ b <details>"), balance(&[0], 0));
+        assert_eq!(details_balance("<!x <details>"), balance(&[0], 0));
+        // `<b <details>` is a `b` tag with an attribute named `<details`, as html5ever reads it.
+        assert_eq!(details_balance("<b <details>x"), balance(&[], 0));
     }
 
     #[test]
