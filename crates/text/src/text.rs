@@ -2220,7 +2220,11 @@ impl BufferSnapshot {
 
     /// The ending of the first line. Use [`Self::line_endings`] when the text mixes endings.
     pub fn line_ending(&self) -> LineEnding {
-        self.line_ending
+        if self.line_ending_changes.is_empty() {
+            self.line_ending
+        } else {
+            self.line_endings().first
+        }
     }
 
     /// The text as it is saved to disk: each line with the ending it was loaded with. [`Self::text`]
@@ -3717,6 +3721,11 @@ impl LineEndings {
     /// overrides the earlier one, and a change to the ending already in force is dropped, so equal
     /// layouts compare equal.
     fn push_change(&mut self, offset: usize, ending: LineEnding) {
+        if offset == 0 {
+            self.first = ending;
+            self.changes.clear();
+            return;
+        }
         while self.changes.last().is_some_and(|(last, _)| *last == offset) {
             self.changes.pop();
         }

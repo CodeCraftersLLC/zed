@@ -1309,6 +1309,28 @@ fn test_deleting_a_region_drops_its_ending() {
 }
 
 #[test]
+fn test_deleting_the_start_of_a_buffer_gives_its_first_line_the_ending_that_reached_it() {
+    let mut buffer = mixed_buffer();
+    buffer.edit([(0..4, "")]);
+    assert_eq!(buffer.text(), "two\nthree\nfour\n");
+    assert_eq!(
+        buffer.line_endings(),
+        LineEndings {
+            first: LineEnding::Unix,
+            changes: vec![(4, LineEnding::Windows), (10, LineEnding::Unix)],
+        }
+    );
+    assert_eq!(buffer.line_ending(), LineEnding::Unix);
+    assert_eq!(buffer.text_with_line_endings(), "two\nthree\r\nfour\n");
+
+    buffer.edit([(0..10, "")]);
+    assert_eq!(
+        buffer.line_endings(),
+        LineEndings::uniform(LineEnding::Unix)
+    );
+}
+
+#[test]
 fn test_set_line_ending_makes_every_line_use_it() {
     let mut buffer = mixed_buffer();
     buffer.set_line_ending(LineEnding::Unix);
