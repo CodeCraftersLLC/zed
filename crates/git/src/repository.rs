@@ -1139,7 +1139,7 @@ pub struct RealGitRepository {
     pub system_git_binary_path: Option<PathBuf>,
     pub any_git_binary_path: PathBuf,
     any_git_binary_help_output: Arc<Mutex<Option<SharedString>>>,
-    show_untracked_files: Arc<Mutex<Option<(Vec<Option<SystemTime>>, String)>>>,
+    show_untracked_files: Arc<Mutex<Option<ShowUntrackedFiles>>>,
     executor: BackgroundExecutor,
     is_trusted: Arc<AtomicBool>,
 }
@@ -1805,25 +1805,13 @@ impl GitRepository for RealGitRepository {
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>> {
         let git = self.git_binary_in_worktree();
         let path_prefixes = path_prefixes.to_vec();
-        let config_files = git_config_files(&self.common_dir);
+        let config_candidates = git_config_candidates(&self.git_dir, &self.common_dir);
         let cache = self.show_untracked_files.clone();
         log::debug!("Checking for git status in {path_prefixes:?}");
         self.executor.spawn(async move {
             let git = git?;
-            let stamp = config_stamp(&config_files);
-            let cached = cache
-                .lock()
-                .as_ref()
-                .filter(|(cached_stamp, _)| *cached_stamp == stamp)
-                .map(|(_, value)| value.clone());
-            let show_untracked_files = match cached {
-                Some(value) => value,
-                None => {
-                    let value = git_config_show_untracked_files(&git).await?;
-                    *cache.lock() = Some((stamp, value.clone()));
-                    value
-                }
-            };
+            let show_untracked_files =
+                cached_show_untracked_files(&git, config_candidates, &cache).await?;
             let args = git_status_args(&path_prefixes, &show_untracked_files);
             let output = git.build_command(&args).output().await?;
             if output.status.success() {
@@ -3423,17 +3411,31 @@ fn parse_initial_graph_output<'a>(
         .collect()
 }
 
-/// The files git reads `status.showUntrackedFiles` from, other than `include`d ones.
-fn git_config_files(common_dir: &Path) -> Vec<PathBuf> {
+/// `status.showUntrackedFiles` as it was last read, the config files that value came from and
+/// their modification times at that moment.
+struct ShowUntrackedFiles {
+    value: String,
+    files: Vec<PathBuf>,
+    stamp: Vec<Option<SystemTime>>,
+}
+
+/// The files git may read `status.showUntrackedFiles` from, whether or not they exist yet: the
+/// repository's config, the linked worktree's own (`$GIT_DIR/config.worktree`, which for a main
+/// worktree is the repository's) and the system, global and XDG ones. The files git reports
+/// having read, `include`d ones among them, are added when the value is read.
+fn git_config_candidates(git_dir: &Path, common_dir: &Path) -> Vec<PathBuf> {
     let home = std::env::home_dir();
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|home| home.join(".config")));
+    let system = std::env::var_os("GIT_CONFIG_SYSTEM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/gitconfig"));
     let global = std::env::var_os("GIT_CONFIG_GLOBAL").map(PathBuf::from);
     let mut files = vec![
         common_dir.join("config"),
-        common_dir.join("config.worktree"),
-        PathBuf::from("/etc/gitconfig"),
+        git_dir.join("config.worktree"),
+        system,
     ];
     files.extend(global);
     files.extend(home.map(|home| home.join(".gitconfig")));
@@ -3441,9 +3443,8 @@ fn git_config_files(common_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Modification times of `files` (`None` = missing). A change in any of them is the only
-/// signal that a cached `status.showUntrackedFiles` may be stale; an `include`d file that
-/// changes alone is not noticed until one of these is touched or the repository is reopened.
+/// Modification times of `files` (`None` = missing). A change in any of them is the signal that
+/// a cached `status.showUntrackedFiles` may be stale.
 fn config_stamp(files: &[PathBuf]) -> Vec<Option<SystemTime>> {
     files
         .iter()
@@ -3455,20 +3456,71 @@ fn config_stamp(files: &[PathBuf]) -> Vec<Option<SystemTime>> {
         .collect()
 }
 
-/// `git config --get` exits 1 when the key is unset; any other failure is a real error.
-async fn git_config_show_untracked_files(git: &GitBinary) -> Result<String> {
+/// `status.showUntrackedFiles`, from the cache while none of the config files it was read from has
+/// changed, else read through git, which knows which files it reads: includes, a system config
+/// elsewhere than `/etc/gitconfig`, a linked worktree's own config.
+async fn cached_show_untracked_files(
+    git: &GitBinary,
+    candidates: Vec<PathBuf>,
+    cache: &Mutex<Option<ShowUntrackedFiles>>,
+) -> Result<String> {
+    if let Some(cached) = cache
+        .lock()
+        .as_ref()
+        .filter(|cached| config_stamp(&cached.files) == cached.stamp)
+    {
+        return Ok(cached.value.clone());
+    }
+
+    let read_at = SystemTime::now();
     let output = git
-        .build_command(&["config", "--get", "status.showUntrackedFiles"])
+        .build_command(&["config", "--list", "--show-origin", "-z"])
         .output()
         .await?;
-    match output.status.code() {
-        Some(0) => Ok(String::from_utf8_lossy(&output.stdout).trim().to_string()),
-        Some(1) => Ok(String::new()),
-        _ => anyhow::bail!(
-            "git config failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ),
+    anyhow::ensure!(
+        output.status.success(),
+        "git config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (value, mut files) = parse_config_list(&output.stdout, &git.working_directory);
+    for candidate in candidates {
+        if !files.contains(&candidate) {
+            files.push(candidate);
+        }
     }
+    let stamp = config_stamp(&files);
+    // A file touched since the read began may have changed under it: read again next time.
+    if !stamp.iter().flatten().any(|modified| *modified >= read_at) {
+        *cache.lock() = Some(ShowUntrackedFiles {
+            value: value.clone(),
+            files,
+            stamp,
+        });
+    }
+    Ok(value)
+}
+
+/// The value of `status.showUntrackedFiles` (empty when unset) and the config files in the output
+/// of `git config --list --show-origin -z`, which is `origin NUL key NL value NUL` for each entry.
+/// Relative origins are relative to `working_directory`, where git ran.
+fn parse_config_list(output: &[u8], working_directory: &Path) -> (String, Vec<PathBuf>) {
+    let mut value = String::new();
+    let mut files = Vec::new();
+    let mut fields = output.split(|byte| *byte == 0);
+    while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
+        if let Some(file) = origin.strip_prefix(b"file:") {
+            let file = working_directory.join(String::from_utf8_lossy(file).as_ref());
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+        let entry = String::from_utf8_lossy(entry);
+        let (key, entry_value) = entry.split_once('\n').unwrap_or((&entry, ""));
+        if key.eq_ignore_ascii_case("status.showuntrackedfiles") {
+            value = entry_value.to_string();
+        }
+    }
+    (value, files)
 }
 
 /// Untracked files are listed one by one (`all`) because the diff pane opens each as a file,
@@ -4071,6 +4123,120 @@ mod tests {
             repo.status(&[]).await.unwrap().entries.len(),
             0,
             "a changed config is re-read"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_value_and_the_files_come_out_of_git_config_list() {
+        let output = b"file:/etc/gitconfig\0core.editor\nvim\0\
+            file:.git/config\0status.showuntrackedfiles\nall\0\
+            command line:\0core.fsmonitor\nfalse\0\
+            file:/mnt/custom/included\0status.showuntrackedfiles\nno\0\
+            file:.git/config\0user.name\nA\0";
+        let (value, files) = parse_config_list(output, Path::new("/work"));
+        assert_eq!(value, "no", "the last entry wins");
+        assert_eq!(
+            files,
+            [
+                PathBuf::from("/etc/gitconfig"),
+                PathBuf::from("/work/.git/config"),
+                PathBuf::from("/mnt/custom/included"),
+            ],
+            "each file once, relative ones from where git ran, command-line entries skipped"
+        );
+        assert_eq!(
+            parse_config_list(b"", Path::new("/work")),
+            (String::new(), vec![])
+        );
+        assert_eq!(
+            parse_config_list(b"file:a\0status.showuntrackedfiles\0", Path::new("/work")).0,
+            "",
+            "a key with no value is not a value"
+        );
+    }
+
+    #[gpui::test]
+    async fn status_rereads_when_an_included_config_file_changes(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        git_init_repo(dir.path());
+        fs::write(dir.path().join("draft.md"), "x").unwrap();
+        // Outside the repository, so it is not itself an untracked file.
+        let outside = tempfile::tempdir().unwrap();
+        let included = outside.path().join("included.cfg");
+        fs::write(&included, "[status]\n\tshowUntrackedFiles = no\n").unwrap();
+        git_command(
+            dir.path(),
+            ["config", "include.path", included.to_str().unwrap()],
+        );
+        let repo = RealGitRepository::new(
+            &dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        assert_eq!(
+            repo.status(&[]).await.unwrap().entries.len(),
+            0,
+            "the included file hides untracked files"
+        );
+
+        fs::write(&included, "[status]\n\tshowUntrackedFiles = all\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&included)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            repo.status(&[]).await.unwrap().entries.len(),
+            1,
+            "the repository's own config was not touched, the included one was"
+        );
+    }
+
+    #[gpui::test]
+    async fn status_rereads_when_a_linked_worktrees_own_config_changes(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        let linked = dir.path().join("linked");
+        git_init_repo(&main);
+        git_command(&main, ["commit", "--allow-empty", "-m", "init"]);
+        git_command(&main, ["config", "extensions.worktreeConfig", "true"]);
+        git_command(
+            &main,
+            ["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        fs::write(linked.join("draft.md"), "x").unwrap();
+        let repo = RealGitRepository::new(
+            &linked.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        assert_ne!(repo.git_dir, repo.common_dir, "a linked worktree");
+        assert_eq!(repo.status(&[]).await.unwrap().entries.len(), 1);
+
+        git_command(
+            &linked,
+            ["config", "--worktree", "status.showUntrackedFiles", "no"],
+        );
+        fs::File::options()
+            .write(true)
+            .open(repo.git_dir.join("config.worktree"))
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            repo.status(&[]).await.unwrap().entries.len(),
+            0,
+            "the worktree's own config hides them"
         );
     }
 
