@@ -1,8 +1,8 @@
 use std::ops::Range;
 
 use gpui::{
-    App, FontStyle, FontWeight, Role, StrikethroughStyle, TextAlign, TextStyleRefinement,
-    UnderlineStyle,
+    App, ElementId, FontStyle, FontWeight, Role, StrikethroughStyle, TextAlign,
+    TextStyleRefinement, UnderlineStyle,
 };
 use pulldown_cmark::Alignment;
 use ui::prelude::*;
@@ -13,6 +13,12 @@ use crate::html::html_parser::{
     ParsedHtmlTableRow, ParsedHtmlText,
 };
 use crate::{MarkdownElement, MarkdownElementBuilder};
+
+/// The element id of a `<details>` region, `(block offset, ordinal)`. The two numbers stay apart,
+/// so no two regions share an id however many `<details>` one block opens.
+fn details_element_id((start, ordinal): (usize, usize)) -> ElementId {
+    ElementId::named_usize(format!("html-details-{ordinal}"), start)
+}
 
 pub(crate) struct HtmlSourceAllocator {
     source_range: Range<usize>,
@@ -163,7 +169,7 @@ impl MarkdownElement {
 
         builder.push_div(
             h_flex()
-                .id(("html-details", region.0 * 64 + region.1))
+                .id(details_element_id(region))
                 .role(Role::DisclosureTriangle)
                 .aria_expanded(is_open)
                 .tab_index(0)
@@ -633,6 +639,19 @@ mod tests {
         CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownOptions,
         MarkdownStyle,
     };
+
+    #[test]
+    fn details_regions_never_share_an_element_id() {
+        // Under `start * 64 + ordinal` these two were the same number.
+        assert_ne!(
+            super::details_element_id((0, 64)),
+            super::details_element_id((1, 0))
+        );
+        assert_eq!(
+            super::details_element_id((7, 2)),
+            super::details_element_id((7, 2))
+        );
+    }
 
     fn ensure_theme_initialized(cx: &mut TestAppContext) {
         cx.update(|cx| {
