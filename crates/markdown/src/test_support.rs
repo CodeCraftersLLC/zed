@@ -568,6 +568,27 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_details_closed_at_another_container_depth_still_renders_a_balanced_tree(
+        cx: &mut TestAppContext,
+    ) {
+        for source in [
+            // Opened inside a quote, closed outside it.
+            "> <details>\n> <summary>S</summary>\n>\n> inside\n\n</details>\n\nafter",
+            // Opened outside, closed inside a quote.
+            "<details>\n<summary>S</summary>\n\nbody\n\n> </details>\n\nafter",
+            // Opened in a list item, closed outside it.
+            "- <details>\n  <summary>S</summary>\n\n  inside\n\n</details>\n\nafter",
+        ] {
+            let (markdown, cx) = markdown_view(source, cx);
+            let text = rendered_plain_text(&markdown, cx);
+            assert!(text.contains("after"), "{source:?}: {text:?}");
+            markdown.update(cx, |markdown, _| markdown.toggle_details((0, 0)));
+            let text = rendered_plain_text(&markdown, cx);
+            assert!(text.contains("after"), "{source:?}: {text:?}");
+        }
+    }
+
+    #[gpui::test]
     fn each_details_of_one_block_toggles_its_own_body(cx: &mut TestAppContext) {
         // One HTML block holds a complete `<details>` and one whose body follows in later blocks.
         let source = "<details><summary>First</summary>inline</details>\n<details>\n<summary>Second</summary>\n\nsecond body\n\n</details>\n\nafter";

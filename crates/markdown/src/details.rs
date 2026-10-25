@@ -179,7 +179,12 @@ pub(crate) fn extract_details_spans(
 
         let balance = details_balance(&source[range.clone()]);
         for close in 0..balance.closes_earlier {
-            if let Some((start, ordinal, opener_end)) = open.pop() {
+            // A region whose opening and closing blocks sit in different containers, such as an
+            // opener in a quote and a closer after it, cannot be hidden without cutting the
+            // containers' events in two, so it stays shown.
+            if let Some((start, ordinal, opener_end)) = open.pop()
+                && is_balanced(&events[opener_end + 1..index])
+            {
                 spans.insert(
                     (start, ordinal),
                     DetailsSpan {
@@ -196,6 +201,24 @@ pub(crate) fn extract_details_spans(
     }
 
     spans
+}
+
+/// Whether every `Start` in `events` has its `End` among them, and no `End` comes before its start.
+fn is_balanced(events: &[(Range<usize>, MarkdownEvent)]) -> bool {
+    let mut depth = 0usize;
+    for (_, event) in events {
+        match event {
+            MarkdownEvent::Start(_) => depth += 1,
+            MarkdownEvent::End(_) => {
+                let Some(shallower) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = shallower;
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 #[cfg(test)]
@@ -309,6 +332,20 @@ mod tests {
         let spans = spans(source);
         assert_eq!(spans[&(0, 1)].close, 0);
         assert_eq!(spans[&(0, 0)].close, 1);
+    }
+
+    #[test]
+    fn a_region_opened_and_closed_in_different_containers_has_no_span() {
+        for source in [
+            "> <details>\n> <summary>S</summary>\n>\n> inside\n\n</details>\n",
+            "<details>\n<summary>S</summary>\n\nbody\n\n> </details>\n",
+            "- <details>\n  <summary>S</summary>\n\n  inside\n\n</details>\n",
+        ] {
+            assert!(spans(source).is_empty(), "{source:?}");
+        }
+        // The same container on both ends pairs as before.
+        let quoted = "> <details>\n> <summary>S</summary>\n>\n> inside\n>\n> </details>\n";
+        assert_eq!(spans(quoted).len(), 1, "{quoted:?}");
     }
 
     #[test]
