@@ -255,7 +255,8 @@ impl SvgRenderer {
         anyhow::ensure!(!params.size.is_zero(), "can't render at a zero size");
 
         let render_pixmap = |bytes| {
-            let pixmap = self.render_pixmap(bytes, SvgSize::Size(params.size), None)?;
+            let pixmap =
+                self.render_pixmap(bytes, SvgSize::Size(params.size), Some(MAX_RASTER_SIDE))?;
 
             // Convert the pixmap's pixels into an alpha mask.
             let size = Size::new(
@@ -471,6 +472,31 @@ mod tests {
             renderer.render_single_frame_bounded(b"not svg", 1.0, MAX_RASTER_SIDE),
             Err(SvgRenderError::Svg(_))
         ));
+    }
+
+    #[test]
+    fn a_painted_svg_is_refused_before_allocating_a_raster_the_atlas_cannot_hold() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let params = |width: i32| RenderSvgParams {
+            path: "tall.svg".into(),
+            size: crate::size(DevicePixels(width), DevicePixels(width)),
+        };
+
+        // Drawn 100 px wide, this SVG is 15,000,000 px tall.
+        let tall = plain_svg(1, 150_000);
+        assert!(
+            renderer
+                .render_alpha_mask(&params(100), Some(tall.as_bytes()))
+                .is_err()
+        );
+
+        let small = plain_svg(10, 10);
+        let (size, mask) = renderer
+            .render_alpha_mask(&params(20), Some(small.as_bytes()))
+            .unwrap()
+            .expect("a small SVG renders");
+        assert_eq!(size, crate::size(DevicePixels(20), DevicePixels(20)));
+        assert_eq!(mask.len(), 400);
     }
 
     #[test]
