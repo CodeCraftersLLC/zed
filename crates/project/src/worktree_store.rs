@@ -1412,13 +1412,22 @@ impl WorktreeHandle {
 fn path_for_message(path: &Path) -> String {
     let mut shown = String::new();
     for c in path.display().to_string().chars() {
-        if c.is_control() {
+        if c.is_control() || is_invisible_format_or_separator(c) {
             shown.extend(c.escape_default());
         } else {
             shown.push(c);
         }
     }
     shown
+}
+
+/// Characters that draw nothing or reorder what is around them: zero-width and bidi marks and
+/// overrides, invisible operators, the BOM, and the line and paragraph separators. No crate in the
+/// workspace exposes the Unicode `Cf` category, so they are listed.
+fn is_invisible_format_or_separator(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{61c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{feff}')
 }
 
 #[cfg(test)]
