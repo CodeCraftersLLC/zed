@@ -168,6 +168,10 @@ impl MarkdownElement {
                 .gap_1()
                 .items_start()
                 .mb_2()
+                .rounded_sm()
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .focus_visible(|style| style.border_color(cx.theme().colors().border_focused))
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     markdown.update(cx, |markdown, cx| {
