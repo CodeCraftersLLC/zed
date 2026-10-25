@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use gpui::{EventEmitter, FocusHandle, Focusable};
+use gpui::{EventEmitter, FocusHandle, Focusable, Task};
 use ui::{
     App, Button, ButtonCommon, ButtonStyle, Clickable, Context, FluentBuilder, InteractiveElement,
     KeyBinding, Label, LabelCommon, LabelSize, ParentElement, Render, SharedString, Styled as _,
@@ -8,7 +8,7 @@ use ui::{
 };
 use zed_actions::workspace::OpenWithSystem;
 
-use crate::Item;
+use crate::{Item, Workspace};
 
 /// A view to display when a certain buffer/image/other item fails to open.
 #[derive(Debug)]
@@ -17,7 +17,11 @@ pub struct InvalidItemView {
     pub abs_path: Arc<Path>,
     /// An error message, happened when opening the item.
     pub error: SharedString,
+    is_local: bool,
+    /// Whether the default handler would show the file rather than run it. Not offered until the
+    /// path has been inspected, off the UI thread, by [`Self::classify_in_background`].
     offers_system_open: bool,
+    classification: Option<Task<()>>,
     focus_handle: FocusHandle,
 }
 
@@ -44,6 +48,9 @@ const PROGRAM_OR_SHORTCUT_EXTENSIONS: &[&str] = &[
     "wsf",
     "wsh",
     "hta",
+    "py",
+    "pyw",
+    "pyc",
     "cpl",
     "jar",
     "reg",
@@ -57,11 +64,18 @@ const PROGRAM_OR_SHORTCUT_EXTENSIONS: &[&str] = &[
 ];
 
 fn has_program_extension(path: &Path) -> bool {
-    // Windows ignores trailing dots and spaces, so `tool.exe.` still launches `tool.exe`.
     let name = path.file_name().map(|name| name.to_string_lossy());
     let Some(extension) = name
         .as_deref()
-        .map(|name| name.trim_end_matches(['.', ' ']))
+        // Windows ignores trailing dots and spaces, so `tool.exe.` still launches `tool.exe`.
+        // Elsewhere they are part of the name.
+        .map(|name| {
+            if cfg!(windows) {
+                name.trim_end_matches(['.', ' '])
+            } else {
+                name
+            }
+        })
         .and_then(|name| Path::new(name).extension())
     else {
         return false;
@@ -102,11 +116,33 @@ impl InvalidItemView {
         cx: &mut App,
     ) -> Self {
         Self {
-            offers_system_open: is_local && !is_program_or_shortcut(abs_path),
+            is_local,
+            offers_system_open: false,
+            classification: None,
             abs_path: Arc::from(abs_path),
             error: format!("{}", e.root_cause()).into(),
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Looks at the path, which can block on a slow or unreachable file system, and offers the
+    /// default app once it is known not to run a program.
+    fn classify_in_background(&mut self, cx: &mut Context<Self>) {
+        if !self.is_local || self.classification.is_some() {
+            return;
+        }
+        let abs_path = self.abs_path.clone();
+        self.classification = Some(cx.spawn(async move |this, cx| {
+            let is_program = cx
+                .background_executor()
+                .spawn(async move { is_program_or_shortcut(&abs_path) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.offers_system_open = !is_program;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 }
 
@@ -136,6 +172,15 @@ impl Item for InvalidItemView {
         };
 
         SharedString::new(path.to_string_lossy())
+    }
+
+    fn added_to_workspace(
+        &mut self,
+        _workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.classify_in_background(cx);
     }
 }
 
@@ -216,11 +261,20 @@ mod tests {
             "x.cpl",
             "x.scr",
             "x.pif",
-            "tool.exe.",
-            "tool.exe  ",
+            "x.py",
+            "x.pyw",
+            "x.pyc",
             "dir/sub/tool.cmd",
         ] {
             assert!(has_program_extension(Path::new(name)), "{name}");
+        }
+        // Windows ignores trailing dots and spaces in a name; other systems keep them.
+        for name in ["tool.exe.", "tool.exe  ", "tool.exe. ."] {
+            assert_eq!(
+                has_program_extension(Path::new(name)),
+                cfg!(windows),
+                "{name:?}"
+            );
         }
         for name in [
             "notes.txt",
@@ -264,6 +318,13 @@ mod tests {
         let mut offers = |path: &Path, is_local: bool| {
             let view = cx
                 .add_window(|window, cx| InvalidItemView::new(path, is_local, &error, window, cx));
+            view.read_with(cx, |view, _| {
+                assert!(!view.offers_system_open, "before it is looked at")
+            })
+            .unwrap();
+            view.update(cx, |view, _, cx| view.classify_in_background(cx))
+                .unwrap();
+            cx.run_until_parked();
             view.read_with(cx, |view, _| view.offers_system_open)
                 .unwrap()
         };
