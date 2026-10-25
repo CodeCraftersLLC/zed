@@ -4517,6 +4517,19 @@ async fn test_create_new_is_refused_for_a_rejected_name(cx: &mut TestAppContext)
         );
     });
 
+    // The split actions open the same new buffer, so they refuse the name too.
+    for _ in 0..2 {
+        cx.dispatch_action(pane::SplitRight::default());
+        cx.run_until_parked();
+    }
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace.active_item_as::<Editor>(cx).is_none(),
+            "a split opened no buffer for the reserved name"
+        );
+        assert_eq!(workspace.panes().len(), 1, "and made no split");
+    });
+
     // A name the validator accepts is still created.
     cx.dispatch_action(Cancel);
     open_file_picker(&workspace, cx);

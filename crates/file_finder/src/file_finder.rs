@@ -297,7 +297,13 @@ impl FileFinder {
                         }
                     }
                     Match::Search(m) => project_path_for_search_match(&delegate.project, &m.0, cx),
-                    Match::CreateNew(p) => p.clone(),
+                    Match::CreateNew(p) => {
+                        if let Some(problem) = delegate.new_name_problem(p, cx) {
+                            workspace.update(cx, |workspace, cx| workspace.show_error(problem, cx));
+                            return;
+                        }
+                        p.clone()
+                    }
                     Match::Channel { .. } => return,
                 };
                 let open_task = workspace.update(cx, move |workspace, cx| {
