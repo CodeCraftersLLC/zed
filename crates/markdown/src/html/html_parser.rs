@@ -926,6 +926,19 @@ mod tests {
     use gpui::TextAlign;
 
     #[test]
+    fn a_details_inside_a_tag_s_attributes_is_not_a_details_element() {
+        let has_details = |html: &str| {
+            let parsed = parse_html_block(html, 0..html.len()).unwrap();
+            let mut found = Vec::new();
+            collect_open_ended_details(&parsed.children, &mut found);
+            !found.is_empty()
+                || matches!(parsed.children.first(), Some(ParsedHtmlElement::Details(_)))
+        };
+        assert!(has_details("1 < 2 <details><summary>S</summary>"));
+        assert!(!has_details("<b <details><summary>S</summary>"));
+    }
+
+    #[test]
     fn parses_html_styled_text() {
         let parsed = parse_html_block(
             "<p>Some text <strong>strong</strong> <a href=\"https://example.com\">link</a></p>",
