@@ -41,13 +41,14 @@ impl MarkdownElement {
     pub(crate) fn render_html_block(
         &self,
         block: &ParsedHtmlBlock,
+        closed_through: Option<usize>,
         builder: &mut MarkdownElementBuilder,
         markdown_end: usize,
         cx: &mut App,
     ) {
         let mut source_allocator = HtmlSourceAllocator::new(block.source_range.clone());
         self.render_html_elements(
-            &block.children,
+            block.elements(closed_through),
             &mut source_allocator,
             builder,
             markdown_end,
