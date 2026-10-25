@@ -3416,7 +3416,7 @@ fn parse_initial_graph_output<'a>(
 struct ShowUntrackedFiles {
     value: String,
     files: Vec<PathBuf>,
-    stamp: Vec<Option<SystemTime>>,
+    stamp: Vec<Option<(SystemTime, u64)>>,
 }
 
 /// The files git may read `status.showUntrackedFiles` from, whether or not they exist yet: the
@@ -3446,15 +3446,15 @@ fn git_config_candidates(git_dir: &Path, common_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Modification times of `files` (`None` = missing). A change in any of them is the signal that
-/// a cached `status.showUntrackedFiles` may be stale.
-fn config_stamp(files: &[PathBuf]) -> Vec<Option<SystemTime>> {
+/// Modification time and length of `files` (`None` = missing). A change in any of them is the
+/// signal that a cached `status.showUntrackedFiles` may be stale. The length catches a rewrite
+/// that lands inside a coarse filesystem's timestamp tick.
+fn config_stamp(files: &[PathBuf]) -> Vec<Option<(SystemTime, u64)>> {
     files
         .iter()
         .map(|file| {
-            std::fs::metadata(file)
-                .and_then(|meta| meta.modified())
-                .ok()
+            let meta = std::fs::metadata(file).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
         })
         .collect()
 }
@@ -3493,7 +3493,11 @@ async fn cached_show_untracked_files(
     }
     let stamp = config_stamp(&files);
     // A file touched since the read began may have changed under it: read again next time.
-    if !stamp.iter().flatten().any(|modified| *modified >= read_at) {
+    if !stamp
+        .iter()
+        .flatten()
+        .any(|(modified, _)| *modified >= read_at)
+    {
         *cache.lock() = Some(ShowUntrackedFiles {
             value: value.clone(),
             files,
@@ -4129,6 +4133,28 @@ mod tests {
         assert_ne!(config_stamp(&files), with_global);
     }
 
+    #[test]
+    fn config_stamp_changes_when_a_file_is_rewritten_within_the_same_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let files = vec![config.clone()];
+        let pinned = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let write_at_pinned_time = |contents: &str| {
+            fs::write(&config, contents).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&config)
+                .unwrap()
+                .set_modified(pinned)
+                .unwrap();
+        };
+
+        write_at_pinned_time("[status]\n\tshowUntrackedFiles = all\n");
+        let before = config_stamp(&files);
+        write_at_pinned_time("[status]\n\tshowUntrackedFiles = no\n");
+        assert_ne!(config_stamp(&files), before);
+    }
+
     #[gpui::test]
     async fn status_rereads_show_untracked_files_only_when_a_config_file_changes(
         cx: &mut TestAppContext,
@@ -4138,6 +4164,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         git_init_repo(dir.path());
         fs::write(dir.path().join("draft.md"), "x").unwrap();
+        // "on" and "no" are the same length, so the rewrite below changes neither size nor time.
+        git_command(dir.path(), ["config", "status.showUntrackedFiles", "on"]);
         let repo = RealGitRepository::new(
             &dir.path().join(".git"),
             None,
@@ -4163,7 +4191,7 @@ mod tests {
         assert_eq!(
             repo.status(&[]).await.unwrap().entries.len(),
             1,
-            "an untouched config is served from the cache"
+            "a config whose size and time are unchanged is served from the cache"
         );
 
         set_mtime(before + std::time::Duration::from_secs(60));
