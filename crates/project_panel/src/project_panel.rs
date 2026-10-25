@@ -1813,7 +1813,7 @@ impl ProjectPanel {
             // first: it names what is wrong, where a path-syntax complaint would
             // not (a folder named `..` is not "whitespace").
             if let Some(message) =
-                Self::name_rejection(self.name_validator.as_ref(), trimmed_filename, path_style)
+                Self::name_rejection(self.name_validator.as_ref(), &filename, path_style)
             {
                 edit_state.validation_state = ValidationState::Error(message);
                 cx.notify();

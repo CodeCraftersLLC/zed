@@ -1998,6 +1998,20 @@ async fn test_dot_dot_name_shows_the_host_reason_while_typing(cx: &mut gpui::Tes
     );
     assert!(matches!(typed(" spaced", cx), ValidationState::Warning(_)));
     assert!(matches!(typed("fine.txt", cx), ValidationState::None));
+
+    // The host sees what Enter will show it, whitespace included.
+    let no_leading_space: NameValidator = std::sync::Arc::new(|typed: &str| {
+        typed
+            .starts_with(' ')
+            .then(|| "A name cannot start with a space.".to_string())
+    });
+    panel.update(cx, |panel, cx| {
+        panel.set_name_validator(Some(no_leading_space), cx)
+    });
+    assert!(
+        matches!(typed(" spaced", cx), ValidationState::Error(message) if message == "A name cannot start with a space."),
+    );
+    assert!(matches!(typed("spaced ", cx), ValidationState::Warning(_)));
 }
 
 #[gpui::test]
