@@ -590,8 +590,8 @@ impl WorktreeStore {
                         .with_context(|| {
                             format!(
                                 "renaming {} into {}",
-                                old_path.display(),
-                                new_path.display()
+                                path_for_message(old_path),
+                                path_for_message(new_path)
                             )
                         })
                     };
@@ -1404,5 +1404,38 @@ impl WorktreeHandle {
             WorktreeHandle::Strong(handle) => Some(handle.clone()),
             WorktreeHandle::Weak(handle) => handle.upgrade(),
         }
+    }
+}
+
+/// A path as an error message shows it. Control characters, a newline in a file name for one,
+/// are escaped so that a name cannot rewrite the message around it.
+fn path_for_message(path: &Path) -> String {
+    let mut shown = String::new();
+    for c in path.display().to_string().chars() {
+        if c.is_control() {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_for_message;
+    use std::path::Path;
+
+    #[test]
+    fn a_path_in_a_message_cannot_break_the_line() {
+        assert_eq!(path_for_message(Path::new("a/b.txt")), "a/b.txt");
+        assert_eq!(
+            path_for_message(Path::new("dir/two\nlines\t\u{7}.txt")),
+            "dir/two\\nlines\\t\\u{7}.txt"
+        );
+        assert_eq!(
+            path_for_message(Path::new("caf\u{e9}/\u{65e5}\u{672c}")),
+            "caf\u{e9}/\u{65e5}\u{672c}"
+        );
     }
 }
