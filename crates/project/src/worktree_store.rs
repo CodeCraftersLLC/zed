@@ -1443,6 +1443,12 @@ mod tests {
             "dir/two\\nlines\\t\\u{7}.txt"
         );
         assert_eq!(
+            path_for_message(Path::new(
+                "a\u{202e}txt.exe\u{2066}\u{200f}\u{2028}\u{2029}b"
+            )),
+            "a\\u{202e}txt.exe\\u{2066}\\u{200f}\\u{2028}\\u{2029}b"
+        );
+        assert_eq!(
             path_for_message(Path::new("caf\u{e9}/\u{65e5}\u{672c}")),
             "caf\u{e9}/\u{65e5}\u{672c}"
         );
