@@ -576,10 +576,12 @@ pub(crate) fn parse_markdown_with_options(
                         let mut link_end_in_source = range.source_range.end;
                         let mut link_events = Vec::new();
 
-                        while ranges
-                            .peek()
-                            .is_some_and(|range| range.merged_range.end <= link_end_in_merged)
-                        {
+                        // A tag right after the link is not part of it.
+                        while ranges.peek().is_some_and(|range| {
+                            range.merged_range.end <= link_end_in_merged
+                                && !(range.is_inline_html
+                                    && range.merged_range.start >= link_end_in_merged)
+                        }) {
                             let range = ranges.next().unwrap();
                             link_end_in_source = range.source_range.end;
                             link_events.push(event_for_range(text, range));
@@ -947,6 +949,29 @@ mod tests {
                 ("see <b>bold</b> here", End(MarkdownTagEnd::Paragraph)),
             ]
         );
+    }
+
+    #[test]
+    fn a_tag_right_after_an_autolink_is_not_part_of_it() {
+        let source = "see https://example.com<b> bold</b>";
+        let events: Vec<_> = parse_markdown_with_options(source, true, false, false)
+            .events
+            .into_iter()
+            .map(|(range, event)| (&source[range], event))
+            .filter(|(_, event)| !matches!(event, RootStart | RootEnd(_)))
+            .collect();
+        let link = |events: &[(&str, MarkdownEvent)]| {
+            events
+                .iter()
+                .find(|(_, event)| matches!(event, Start(Link { .. })))
+                .map(|(text, _)| text.to_string())
+        };
+        assert_eq!(link(&events).as_deref(), Some("https://example.com"));
+        let end_of_link = events
+            .iter()
+            .position(|(_, event)| matches!(event, End(MarkdownTagEnd::Link)))
+            .unwrap();
+        assert_eq!(events[end_of_link + 1], ("<b>", InlineHtml));
     }
 
     #[test]
