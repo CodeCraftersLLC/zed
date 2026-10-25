@@ -896,6 +896,7 @@ impl Database {
                         branch_list_error: None,
                         scan_id: db_repository_entry.scan_id as u64,
                         is_last_update: true,
+                        statuses_scanned: None,
                         merge_message: db_repository_entry.merge_message,
                         stash_entries: Vec::new(),
                         remote_upstream_url: db_repository_entry.remote_upstream_url.clone(),
