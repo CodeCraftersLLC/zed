@@ -46,7 +46,9 @@ impl MarkdownElement {
         markdown_end: usize,
         cx: &mut App,
     ) {
-        let mut source_allocator = HtmlSourceAllocator::new(block.source_range.clone());
+        let shown_from = block.elements_source_start(closed_through);
+        let mut source_allocator =
+            HtmlSourceAllocator::new(shown_from..block.source_range.end.max(shown_from));
         self.render_html_elements(
             block.elements(closed_through),
             &mut source_allocator,

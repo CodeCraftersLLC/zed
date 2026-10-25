@@ -24,7 +24,16 @@ pub(crate) struct ParsedHtmlBlock {
     /// For each `</details>` of the block that closes a region an earlier block opened, the
     /// content after it, or `None` when nothing but whitespace comes before the tag. A collapsed
     /// region hides the content before its closing tag, so it shows this in place of `children`.
-    pub closing_tails: Vec<Option<Vec<ParsedHtmlElement>>>,
+    pub closing_tails: Vec<Option<ParsedClosingTail>>,
+}
+
+/// The content after a closing `</details>`, and where in the block it starts.
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) struct ParsedClosingTail {
+    /// The byte offset in the block at which the content starts.
+    pub start: usize,
+    pub elements: Vec<ParsedHtmlElement>,
 }
 
 impl ParsedHtmlBlock {
@@ -43,10 +52,22 @@ impl ParsedHtmlBlock {
     /// an earlier block's region) of a collapsed region that ends in this block: what comes
     /// before that tag is hidden with the rest of the region.
     pub(crate) fn elements(&self, closed_through: Option<usize>) -> &[ParsedHtmlElement] {
+        self.closing_tail(closed_through)
+            .map_or(&self.children, |tail| &tail.elements)
+    }
+
+    /// The source offset in the document at which what `elements` shows starts.
+    pub(crate) fn elements_source_start(&self, closed_through: Option<usize>) -> usize {
+        self.source_range.start
+            + self
+                .closing_tail(closed_through)
+                .map_or(0, |tail| tail.start)
+    }
+
+    fn closing_tail(&self, closed_through: Option<usize>) -> Option<&ParsedClosingTail> {
         closed_through
             .and_then(|close| self.closing_tails.get(close))
             .and_then(Option::as_ref)
-            .unwrap_or(&self.children)
     }
 }
 
@@ -276,7 +297,12 @@ pub(crate) fn parse_html_block(
         .into_iter()
         .map(|tail| {
             tail.and_then(|tail| {
-                parse_html_children(source, tail.start, tail.opened_before, &source_range)
+                let elements =
+                    parse_html_children(source, tail.start, tail.opened_before, &source_range)?;
+                Some(ParsedClosingTail {
+                    start: tail.start,
+                    elements,
+                })
             })
         })
         .collect();
@@ -1001,6 +1027,15 @@ mod tests {
         assert_eq!(paragraph_text(&tail[0]), "shown");
         // Without a collapsed region closing here, the block shows all of it.
         assert_eq!(parsed.elements(None).len(), 2);
+    }
+
+    #[test]
+    fn the_content_after_a_closing_tag_is_sourced_from_where_it_starts() {
+        let html = "<p>hidden</p>\n</details>\n<p>shown</p>";
+        let parsed = parse_html_block(html, 10..10 + html.len()).unwrap();
+        let tail_start = html.find("</details>").unwrap() + "</details>".len();
+        assert_eq!(parsed.elements_source_start(Some(0)), 10 + tail_start);
+        assert_eq!(parsed.elements_source_start(None), 10);
     }
 
     #[test]
