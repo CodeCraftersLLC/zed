@@ -87,11 +87,12 @@ fn has_program_extension(path: &Path) -> bool {
 
 /// Only extension-less files are judged by the execute bit: exFAT, NTFS, SMB and WSL mounts
 /// report every file as executable, and a name with an extension is already covered by
-/// `PROGRAM_OR_SHORTCUT_EXTENSIONS`.
+/// `PROGRAM_OR_SHORTCUT_EXTENSIONS`. A trailing dot (`tool.`) names no extension.
 #[cfg(unix)]
 fn has_execute_bit(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    path.extension().is_none()
+    path.extension()
+        .is_none_or(|extension| extension.is_empty())
         && std::fs::metadata(path)
             .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
@@ -374,6 +375,17 @@ mod tests {
 
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!is_program_or_shortcut(&binary));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_trailing_dot_names_no_extension_so_the_execute_bit_still_counts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tool.");
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_program_or_shortcut(&binary));
     }
 
     #[cfg(unix)]
