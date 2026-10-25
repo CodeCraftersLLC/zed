@@ -376,6 +376,11 @@ impl TestAppContext {
         self.test_platform.opened_url.borrow().clone()
     }
 
+    /// The paths that have been opened with cx.open_with_system() during this test, oldest first.
+    pub fn opened_with_system(&self) -> Vec<std::path::PathBuf> {
+        self.test_platform.opened_with_system.borrow().clone()
+    }
+
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_window_resize(&self, window_handle: AnyWindowHandle, size: Size<Pixels>) {
         self.test_window(window_handle).simulate_resize(size);

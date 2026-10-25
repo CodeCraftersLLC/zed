@@ -102,13 +102,21 @@ fn has_execute_bit(_path: &Path) -> bool {
 }
 
 /// True when the default handler would run `path` rather than show it. A link is judged
-/// by its target as well as its own name, so `notes.txt -> tool.exe` is a program too.
+/// by its target as well as its own name, so `notes.txt -> tool.exe` is a program too, and a
+/// link is judged by the extension of its target when it reads the execute bit.
+///
+/// Looks at the file system, which can block on a slow mount: not for the UI thread. Use
+/// [`is_named_like_program_or_shortcut`] there.
 pub fn is_program_or_shortcut(path: &Path) -> bool {
     let target = std::fs::canonicalize(path).ok();
-    [Some(path), target.as_deref()]
-        .into_iter()
-        .flatten()
-        .any(|path| has_program_extension(path) || has_execute_bit(path))
+    let resolved = target.as_deref().unwrap_or(path);
+    has_program_extension(path) || has_program_extension(resolved) || has_execute_bit(resolved)
+}
+
+/// True when `path`, or `link_target` when it is known, is named like a program or shortcut.
+/// Reads no file: it only sees names.
+pub fn is_named_like_program_or_shortcut(path: &Path, link_target: Option<&Path>) -> bool {
+    has_program_extension(path) || link_target.is_some_and(has_program_extension)
 }
 
 impl InvalidItemView {
@@ -382,6 +390,40 @@ mod tests {
                 "{name} on a mount that reports every file as executable"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_named_document_is_not_a_program_whatever_its_own_name() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let document = dir.path().join("report.pdf");
+        std::fs::write(&document, "x").unwrap();
+        // A mount that reports every file as executable.
+        std::fs::set_permissions(&document, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = dir.path().join("report");
+        symlink(&document, &link).unwrap();
+        assert!(!is_program_or_shortcut(&link));
+    }
+
+    #[test]
+    fn names_alone_mark_a_program_without_reading_the_file_system() {
+        assert!(is_named_like_program_or_shortcut(
+            Path::new("/gone/tool.exe"),
+            None
+        ));
+        assert!(is_named_like_program_or_shortcut(
+            Path::new("/gone/notes.txt"),
+            Some(Path::new("/gone/payload.bat"))
+        ));
+        assert!(!is_named_like_program_or_shortcut(
+            Path::new("/gone/notes.txt"),
+            Some(Path::new("/gone/other.txt"))
+        ));
+        assert!(!is_named_like_program_or_shortcut(
+            Path::new("/gone/tool"),
+            None
+        ));
     }
 
     #[cfg(unix)]

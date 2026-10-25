@@ -33,6 +33,8 @@ pub(crate) struct TestPlatform {
     pub(crate) prompts: RefCell<TestPrompts>,
     screen_capture_sources: RefCell<Vec<TestScreenCaptureSource>>,
     pub opened_url: RefCell<Option<String>>,
+    /// The paths handed to `open_with_system`, oldest first.
+    pub opened_with_system: RefCell<Vec<std::path::PathBuf>>,
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
@@ -135,6 +137,7 @@ impl TestPlatform {
             current_find_pasteboard_item: Mutex::new(None),
             weak: weak.clone(),
             opened_url: Default::default(),
+            opened_with_system: Default::default(),
             text_system,
             headless_renderer_factory,
         })
@@ -498,8 +501,10 @@ impl Platform for TestPlatform {
         unimplemented!()
     }
 
-    fn open_with_system(&self, _path: &Path) {
-        unimplemented!()
+    fn open_with_system(&self, path: &Path) {
+        self.opened_with_system
+            .borrow_mut()
+            .push(path.to_path_buf());
     }
 }
 

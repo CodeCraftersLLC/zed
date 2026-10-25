@@ -72,7 +72,7 @@ use util::{
     paths::{PathStyle, compare_paths},
     rel_path::{RelPath, RelPathBuf},
 };
-use workspace::invalid_item_view::is_program_or_shortcut;
+use workspace::invalid_item_view::{is_named_like_program_or_shortcut, is_program_or_shortcut};
 use workspace::{
     DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
     SelectedEntry, SplitDirection, Workspace,
@@ -694,7 +694,8 @@ fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
 }
 
 /// Whether `new_path` would land on a sibling other than `own_id`: exactly, or, on a
-/// case-insensitive filesystem, by name ignoring case (`M.RS` collides with `m.rs`).
+/// case-insensitive filesystem, by name ignoring case (`M.RS` collides with `m.rs`), in a
+/// directory ignoring case too (`foo/M.rs` collides with `Foo/m.rs`).
 fn sibling_exists(worktree: &Worktree, new_path: &RelPath, own_id: Option<ProjectEntryId>) -> bool {
     if worktree
         .entry_for_path(new_path)
@@ -708,16 +709,31 @@ fn sibling_exists(worktree: &Worktree, new_path: &RelPath, own_id: Option<Projec
     let (Some(parent), Some(name)) = (new_path.parent(), new_path.file_name()) else {
         return false;
     };
-    case_insensitive && {
-        let lowered = name.to_lowercase();
-        worktree.child_entries(parent).any(|sibling| {
-            Some(sibling.id) != own_id
-                && sibling
-                    .path
-                    .file_name()
-                    .is_some_and(|sibling_name| sibling_name.to_lowercase() == lowered)
-        })
+    if !case_insensitive {
+        return false;
     }
+    let matches_ignoring_case = |entry: &worktree::Entry, lowered: &str| {
+        entry
+            .path
+            .file_name()
+            .is_some_and(|entry_name| entry_name.to_lowercase() == lowered)
+    };
+    let mut directory = RelPath::empty_arc();
+    for component in parent.components() {
+        let lowered = component.to_lowercase();
+        let Some(next) = worktree
+            .child_entries(&directory)
+            .find(|entry| matches_ignoring_case(entry, &lowered))
+            .map(|entry| entry.path.clone())
+        else {
+            return false;
+        };
+        directory = next;
+    }
+    let lowered = name.to_lowercase();
+    worktree
+        .child_entries(&directory)
+        .any(|sibling| Some(sibling.id) != own_id && matches_ignoring_case(sibling, &lowered))
 }
 
 impl ProjectPanel {
@@ -1187,8 +1203,12 @@ impl ProjectPanel {
             let is_remote = project.is_remote();
             let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
-            let offers_default_app =
-                is_local && !is_program_or_shortcut(&worktree.absolutize(&entry.path));
+            // Names only: the menu is built on the UI thread. The action checks the file itself.
+            let offers_default_app = is_local
+                && !is_named_like_program_or_shortcut(
+                    &worktree.absolutize(&entry.path),
+                    entry.canonical_path.as_deref(),
+                );
 
             let settings = ProjectPanelSettings::get_global(cx);
             let visible_worktrees_count = project.visible_worktrees(cx).count();
@@ -3814,10 +3834,20 @@ impl ProjectPanel {
     fn open_system(&mut self, _: &OpenWithSystem, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((worktree, entry)) = self.selected_entry(cx) {
             let abs_path = worktree.absolutize(&entry.path);
-            if is_program_or_shortcut(&abs_path) {
-                return;
-            }
-            cx.open_with_system(&abs_path);
+            // Looking at the file can block on a slow mount, so it is not done on this thread.
+            cx.spawn(async move |_, cx| {
+                let is_program = cx
+                    .background_executor()
+                    .spawn({
+                        let abs_path = abs_path.clone();
+                        async move { is_program_or_shortcut(&abs_path) }
+                    })
+                    .await;
+                if !is_program {
+                    cx.update(|cx| cx.open_with_system(&abs_path));
+                }
+            })
+            .detach();
         }
     }
 

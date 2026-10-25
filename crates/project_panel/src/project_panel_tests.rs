@@ -11502,6 +11502,65 @@ async fn test_names_differing_only_by_case_clash_on_a_case_insensitive_filesyste
 }
 
 #[gpui::test]
+async fn test_a_directory_spelled_differently_still_holds_the_clashing_name(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.set_case_insensitive(true);
+    fs.insert_tree("/root", json!({ "Foo": { "Bar": { "m.rs": "" } } }))
+        .await;
+    let (panel, mut cx) = panel_for(&fs, cx).await;
+
+    select_path(&panel, "root", &mut cx);
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.new_file(&NewFile, window, cx)
+    });
+    cx.run_until_parked();
+    for clashing in ["foo/bar/M.rs", "FOO/Bar/m.rs", "foo/BAR/m.RS"] {
+        let state = typed_name_state(&panel, clashing, &mut cx).await;
+        assert!(
+            matches!(&state, ValidationState::Error(message) if message.contains("already exists")),
+            "{clashing}: {state:?}"
+        );
+    }
+    for fine in ["foo/bar/other.rs", "foo/baz/M.rs", "elsewhere/M.rs"] {
+        assert!(
+            matches!(
+                typed_name_state(&panel, fine, &mut cx).await,
+                ValidationState::None
+            ),
+            "{fine}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_open_in_default_app_runs_only_for_files_that_are_not_programs(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "notes.txt": "", "tools.bat": "" }))
+        .await;
+    let (panel, mut cx) = panel_for(&fs, cx).await;
+
+    for name in ["tools.bat", "notes.txt"] {
+        select_path(&panel, &format!("root/{name}"), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_system(&OpenWithSystem, window, cx)
+        });
+        cx.run_until_parked();
+    }
+    let opened: Vec<_> = cx
+        .opened_with_system()
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(opened, ["notes.txt"], "the batch file was not run");
+}
+
+#[gpui::test]
 async fn test_names_differing_only_by_case_are_distinct_on_a_case_sensitive_filesystem(
     cx: &mut gpui::TestAppContext,
 ) {
