@@ -255,7 +255,9 @@ fn stream_png_thumbnail(
     }
 
     // The chunks after the last row are part of the file: damage there is damage, as it is when
-    // the picture is decoded whole.
+    // the picture is decoded whole. They are as long as the file, not counted in pixels, so the
+    // stream is asked again before it reads them.
+    checkpoint()?;
     reader.finish().map_err(png_error)?;
 
     let mut thumbnail = RgbaImage::new(thumbnail_width as u32, thumbnail_height);
@@ -1655,7 +1657,23 @@ mod tests {
         let (bytes, pixels) = long_stream();
         let (result, asked) = stream_counting_checkpoints(&bytes, |_| Ok(()));
         result.unwrap();
-        assert_eq!(asked as u64, 1 + (pixels - 1) / PIXELS_BETWEEN_CHECKS);
+        // One look per million pixels, and one more before the chunks after the last row.
+        assert_eq!(asked as u64, 2 + (pixels - 1) / PIXELS_BETWEEN_CHECKS);
+    }
+
+    #[test]
+    fn a_stream_cancelled_after_its_last_row_stops_before_reading_the_chunks_behind_it() {
+        let (bytes, pixels) = long_stream();
+        let in_rows = (1 + (pixels - 1) / PIXELS_BETWEEN_CHECKS) as usize;
+        let (result, asked) = stream_counting_checkpoints(&bytes, |asked| {
+            if asked > in_rows {
+                Err(ThumbnailError::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(ThumbnailError::Cancelled)));
+        assert_eq!(asked, in_rows + 1);
     }
 
     #[test]
