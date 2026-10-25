@@ -44,9 +44,14 @@ fn details_tags(html: &str) -> Vec<(DetailsTag, Range<usize>)> {
             Some(after_slash) => (true, after_slash),
             None => (false, &rest[1..]),
         };
-        let name_len = after_bracket
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-            .unwrap_or(after_bracket.len());
+        // A tag name starts with a letter and runs to whitespace, `/` or `>`, as html5ever reads it.
+        let name_len = if after_bracket.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            after_bracket
+                .find(|c: char| c.is_ascii_whitespace() || matches!(c, '/' | '>'))
+                .unwrap_or(after_bracket.len())
+        } else {
+            0
+        };
         if name_len == 0 {
             // A `<` that starts no tag, as in `1 < 2`, is text: it does not swallow what follows.
             ix = start + 1;
@@ -245,6 +250,11 @@ mod tests {
             details_balance("<DETAILS open>x</Details>"),
             balance(&[], 0)
         );
+        // A namespaced or dotted element is not a `<details>`.
+        assert_eq!(details_balance("<details:widget>"), balance(&[], 0));
+        assert_eq!(details_balance("</details:widget>"), balance(&[], 0));
+        assert_eq!(details_balance("<details.x><details_y>"), balance(&[], 0));
+        assert_eq!(details_balance("<details/>"), balance(&[0], 0));
     }
 
     #[test]
