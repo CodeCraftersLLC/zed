@@ -61,6 +61,7 @@ const PROGRAM_OR_SHORTCUT_EXTENSIONS: &[&str] = &[
     "dmg",
     "pkg",
     "desktop",
+    "appimage",
 ];
 
 fn has_program_extension(path: &Path) -> bool {
@@ -271,6 +272,7 @@ mod tests {
             "x.dmg",
             "x.pkg",
             "x.desktop",
+            "Tool.AppImage",
             "x.cpl",
             "x.scr",
             "x.pif",
