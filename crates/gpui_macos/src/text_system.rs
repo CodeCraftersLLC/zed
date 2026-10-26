@@ -789,8 +789,10 @@ mod tests {
         assert_eq!(layout.runs[0].glyphs[1].id, GlyphId(69u32)); // b
     }
 
-    /// CoreText joins and reorders right-to-left text itself, even across a font-run boundary
-    /// (the `break_ligature` size change), so the macOS shaper needs no bidi handling.
+    /// CoreText joins and reorders right-to-left text itself, so the macOS shaper needs no bidi
+    /// handling. A font-run boundary between two letters that join does break the join, because
+    /// the `break_ligature` size change makes them separate attribute runs; a boundary where no
+    /// join is made (after REH, which does not join forward) changes nothing.
     #[test]
     fn test_layout_line_arabic_is_joined_and_in_visual_order() {
         let fonts = MacTextSystem::new();
@@ -835,6 +837,7 @@ mod tests {
             "the word-initial letter takes its joined form, not the isolated one"
         );
 
+        // REH joins only to the letter before it, so no join is made at this boundary.
         let split_at = "\u{645}\u{631}".len();
         let split = glyphs(
             word,
@@ -865,8 +868,8 @@ mod tests {
                 .iter()
                 .map(|(id, index, _)| (*id, *index))
                 .collect::<Vec<_>>(),
-            "a font-run boundary inside a word must not change how its letters join, or which \
-             letter each glyph stands for"
+            "a font-run boundary where no join is made must not change how the letters join, or \
+             which letter each glyph stands for"
         );
     }
 
