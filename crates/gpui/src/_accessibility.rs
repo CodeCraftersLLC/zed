@@ -218,7 +218,12 @@
 //!
 //! Note that some common actions are automatically registered. For example,
 //! [`.on_click()`][StatefulInteractiveElement::on_click] adds an
-//! [`AccessibleAction::Click`] handler that calls the click handler.
+//! [`AccessibleAction::Click`] handler that calls the click handler directly,
+//! with a keyboard [`ClickEvent`], while accessibility is active. Nothing is
+//! hit-tested, so the control is pressed even when it is scrolled out of its
+//! container or covered by another element. Register your own
+//! [`AccessibleAction::Click`] handler to replace this. Without any click handler,
+//! a press on the node is sent as a mouse press at the centre of its bounds.
 //!
 //! ## Synthetic children
 //!

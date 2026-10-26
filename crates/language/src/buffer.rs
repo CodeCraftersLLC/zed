@@ -560,11 +560,21 @@ pub struct Chunk<'a> {
     pub underline: bool,
 }
 
+/// An edit of a [`Diff`] that [`Buffer::apply_diff`] applied.
+struct AppliedEdit {
+    /// The range it replaced, in the buffer as it was before the diff.
+    range: Range<usize>,
+    new_text: Arc<str>,
+    /// Where `new_text` sits in the text the diff leads to.
+    loaded_start: usize,
+}
+
 /// A set of edits to a given version of a buffer, computed asynchronously.
 #[derive(Debug, Clone)]
 pub struct Diff {
     pub base_version: clock::Global,
-    pub line_ending: LineEnding,
+    /// The line endings of the text the edits lead to, or `None` when the edits keep the buffer's.
+    pub line_endings: Option<LineEndings>,
     pub edits: Vec<(Range<usize>, Arc<str>)>,
 }
 
@@ -1695,7 +1705,9 @@ impl Buffer {
         self.saved_version = version;
         self.has_unsaved_edits
             .set((self.saved_version.clone(), false));
-        self.text.set_line_ending(line_ending);
+        if self.text.line_ending() != line_ending {
+            self.text.set_line_ending(line_ending);
+        }
         self.saved_mtime = mtime;
         cx.emit(BufferEvent::Reloaded);
         cx.notify();
@@ -2268,12 +2280,11 @@ impl Buffer {
         cx.background_spawn(async move {
             let old_text = old_text.to_string();
             let mut new_text = new_text.as_ref().to_owned();
-            let line_ending = LineEnding::detect(&new_text);
-            LineEnding::normalize(&mut new_text);
+            let line_endings = LineEnding::normalize_with_endings(&mut new_text);
             let edits = text_diff(&old_text, &new_text);
             Diff {
                 base_version,
-                line_ending,
+                line_endings: Some(line_endings),
                 edits,
             }
         })
@@ -2283,14 +2294,13 @@ impl Buffer {
     /// at the ends of a lines, and returns a `Diff` that removes that whitespace.
     pub fn remove_trailing_whitespace(&self, cx: &App) -> Task<Diff> {
         let old_text = self.as_rope().clone();
-        let line_ending = self.line_ending();
         let base_version = self.version();
         cx.background_spawn(async move {
             let ranges = trailing_whitespace_ranges(&old_text);
             let empty = Arc::<str>::from("");
             Diff {
                 base_version,
-                line_ending,
+                line_endings: None,
                 edits: ranges
                     .into_iter()
                     .map(|range| (range, empty.clone()))
@@ -2329,8 +2339,19 @@ impl Buffer {
     pub fn apply_diff(&mut self, diff: Diff, cx: &mut Context<Self>) -> Option<TransactionId> {
         let snapshot = self.snapshot();
         let mut edits_since = snapshot.edits_since::<usize>(&diff.base_version).peekable();
+        // Only when nothing changed since the diff was made does the buffer end up as the text its
+        // line endings were measured on.
+        let applies_exactly = edits_since.peek().is_none();
         let mut delta = 0;
-        let adjusted_edits = diff.edits.into_iter().filter_map(|(range, new_text)| {
+        // How far the edits applied and dropped so far move the text that follows them in the text
+        // the diff leads to.
+        let mut loaded_delta = 0;
+        let mut applied_edits = Vec::new();
+        for (range, new_text) in diff.edits {
+            let loaded_start = (range.start as i64 + loaded_delta) as usize;
+            loaded_delta += new_text.len() as i64 - range.len() as i64;
+
+            let mut conflicts = false;
             while let Some(edit_since) = edits_since.peek() {
                 // If the edit occurs after a diff hunk, then it does not
                 // affect that hunk.
@@ -2345,19 +2366,68 @@ impl Buffer {
                 }
                 // If the edit intersects a diff hunk, then discard that hunk.
                 else {
-                    return None;
+                    conflicts = true;
+                    break;
                 }
+            }
+            if conflicts {
+                continue;
             }
 
             let start = (range.start as i64 + delta) as usize;
             let end = (range.end as i64 + delta) as usize;
-            Some((start..end, new_text))
-        });
+            applied_edits.push(AppliedEdit {
+                range: start..end,
+                new_text,
+                loaded_start,
+            });
+        }
 
         self.start_transaction();
-        self.text.set_line_ending(diff.line_ending);
-        self.edit(adjusted_edits, None, cx);
+        self.edit(
+            applied_edits
+                .iter()
+                .map(|edit| (edit.range.clone(), edit.new_text.clone())),
+            None,
+            cx,
+        );
+        if let Some(line_endings) = diff.line_endings {
+            if applies_exactly {
+                self.text.set_line_endings(line_endings);
+            } else {
+                self.adopt_loaded_line_endings(&line_endings, &applied_edits);
+            }
+        }
         self.end_transaction(cx)
+    }
+
+    /// Gives the lines whose terminator an applied edit wrote the ending the loaded text has for
+    /// it. The offsets of `loaded` index text the buffer no longer equals, so the other lines keep
+    /// the ending they had.
+    fn adopt_loaded_line_endings(&mut self, loaded: &LineEndings, applied_edits: &[AppliedEdit]) {
+        let mut shift = 0;
+        let mut written_lines = Vec::new();
+        for edit in applied_edits {
+            let written_at = (edit.range.start as i64 + shift) as usize;
+            shift += edit.new_text.len() as i64 - edit.range.len() as i64;
+            for (offset_in_edit, _) in edit.new_text.match_indices('\n') {
+                let terminator = written_at + offset_in_edit;
+                let line_start = self
+                    .text
+                    .point_to_offset(Point::new(self.text.offset_to_point(terminator).row, 0));
+                written_lines.push((
+                    line_start..terminator + 1,
+                    loaded.ending_at(edit.loaded_start + offset_in_edit),
+                ));
+            }
+        }
+        if !written_lines.is_empty() {
+            let line_endings = self
+                .text
+                .line_endings()
+                .with_lines_overridden(&written_lines, self.text.len());
+            self.text.set_line_endings(line_endings);
+        }
     }
 
     pub fn has_unsaved_edits(&self) -> bool {

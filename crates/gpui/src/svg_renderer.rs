@@ -77,8 +77,42 @@ fn select_emoji_font(
     None
 }
 
+/// An SVG is untrusted input: it may name `/etc/passwd`, a UNC share, a `file:` or
+/// `http:` URL in an `<image href>`. Only inline `data:` images decode; every other
+/// href resolves to nothing instead of being read from disk or the network.
+fn inline_only_image_href_resolver() -> usvg::ImageHrefResolver<'static> {
+    usvg::ImageHrefResolver {
+        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_string: Box::new(|_, _| None),
+    }
+}
+
 /// When rendering SVGs, we render them at twice the size to get a higher-quality result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
+
+/// The longest side, in pixels, of an SVG raster. The GPU atlas cannot hold an image larger than
+/// this, so anything bigger would be painted as nothing.
+pub const MAX_RASTER_SIDE: u32 = 16_384;
+
+/// The most memory a raster may take; an image within `MAX_RASTER_SIDE` on both sides can still be
+/// gigabytes.
+pub(crate) const MAX_RASTER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Why an SVG could not be rasterised.
+#[derive(Debug, thiserror::Error)]
+pub enum SvgRenderError {
+    /// The SVG could not be parsed or has no drawable size.
+    #[error(transparent)]
+    Svg(#[from] usvg::Error),
+    /// The raster would exceed the size limit.
+    #[error("{width} × {height} px is too large to draw")]
+    TooLarge {
+        /// The width the raster would have had.
+        width: u32,
+        /// The height the raster would have had.
+        height: u32,
+    },
+}
 
 #[derive(Clone, PartialEq, Hash, Eq)]
 #[expect(missing_docs)]
@@ -161,6 +195,7 @@ impl SvgRenderer {
                 select_font: font_resolver,
                 select_fallback: fallback_selection,
             },
+            image_href_resolver: inline_only_image_href_resolver(),
             ..Default::default()
         };
         Self {
@@ -169,15 +204,33 @@ impl SvgRenderer {
         }
     }
 
-    /// Renders the given bytes into an image buffer.
+    /// Renders the given bytes into an image buffer. A raster larger than [`MAX_RASTER_SIDE`]
+    /// is refused as [`usvg::Error::InvalidSize`]; use [`Self::render_single_frame_bounded`] to
+    /// tell that apart from an unparsable SVG.
     pub fn render_single_frame(
         &self,
         bytes: &[u8],
         scale_factor: f32,
     ) -> Result<Arc<RenderImage>, usvg::Error> {
+        self.render_single_frame_bounded(bytes, scale_factor, MAX_RASTER_SIDE)
+            .map_err(|error| match error {
+                SvgRenderError::Svg(error) => error,
+                SvgRenderError::TooLarge { .. } => usvg::Error::InvalidSize,
+            })
+    }
+
+    /// Renders the given bytes into an image buffer, refusing, before allocating anything, a raster
+    /// with a side longer than `max_side` or more than 256 MiB of pixels.
+    pub fn render_single_frame_bounded(
+        &self,
+        bytes: &[u8],
+        scale_factor: f32,
+        max_side: u32,
+    ) -> Result<Arc<RenderImage>, SvgRenderError> {
         self.render_pixmap(
             bytes,
             SvgSize::ScaleFactor(scale_factor * SMOOTH_SVG_SCALE_FACTOR),
+            Some(max_side),
         )
         .map(|pixmap| {
             let mut buffer =
@@ -202,7 +255,8 @@ impl SvgRenderer {
         anyhow::ensure!(!params.size.is_zero(), "can't render at a zero size");
 
         let render_pixmap = |bytes| {
-            let pixmap = self.render_pixmap(bytes, SvgSize::Size(params.size))?;
+            let pixmap =
+                self.render_pixmap(bytes, SvgSize::Size(params.size), Some(MAX_RASTER_SIDE))?;
 
             // Convert the pixmap's pixels into an alpha mask.
             let size = Size::new(
@@ -227,20 +281,34 @@ impl SvgRenderer {
         }
     }
 
-    fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
+    fn render_pixmap(
+        &self,
+        bytes: &[u8],
+        size: SvgSize,
+        max_side: Option<u32>,
+    ) -> Result<Pixmap, SvgRenderError> {
         let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
         let svg_size = tree.size();
         let scale = match size {
             SvgSize::Size(size) => size.width.0 as f32 / svg_size.width(),
             SvgSize::ScaleFactor(scale) => scale,
         };
+        let width = (svg_size.width() * scale) as u32;
+        let height = (svg_size.height() * scale) as u32;
+        if let Some(max_side) = max_side
+            && (width > max_side
+                || height > max_side
+                || u64::from(width)
+                    .checked_mul(u64::from(height))
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .is_none_or(|bytes| bytes > MAX_RASTER_BYTES))
+        {
+            return Err(SvgRenderError::TooLarge { width, height });
+        }
 
         // Render the SVG to a pixmap with the specified width and height.
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(
-            (svg_size.width() * scale) as u32,
-            (svg_size.height() * scale) as u32,
-        )
-        .ok_or(usvg::Error::InvalidSize)?;
+        let mut pixmap =
+            resvg::tiny_skia::Pixmap::new(width, height).ok_or(usvg::Error::InvalidSize)?;
 
         let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
 
@@ -305,6 +373,159 @@ mod tests {
     const IBM_PLEX_REGULAR: &[u8] =
         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
     const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+
+    /// Removes the files it created, even when an assertion unwinds.
+    struct TempFiles(Vec<std::path::PathBuf>);
+
+    impl Drop for TempFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                std::fs::remove_file(path).ok();
+            }
+        }
+    }
+
+    fn solid_red_png() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("PNG encodes");
+        bytes.into_inner()
+    }
+
+    fn opaque_pixel_count(href: &str) -> usize {
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><image href="{href}" width="8" height="8"/></svg>"#
+        );
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let pixmap = renderer
+            .render_pixmap(svg.as_bytes(), SvgSize::ScaleFactor(1.), None)
+            .expect("the SVG itself is valid");
+        pixmap.pixels().iter().filter(|p| p.alpha() > 0).count()
+    }
+
+    #[test]
+    fn svg_image_href_never_reads_the_filesystem() {
+        let unique = format!("{}-{:?}", std::process::id(), std::thread::current().id())
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+        let png = solid_red_png();
+        let absolute = std::env::temp_dir().join(format!("gpui-svg-href-{unique}.png"));
+        let relative = std::path::PathBuf::from(format!("gpui-svg-href-{unique}.png"));
+        std::fs::write(&absolute, &png).expect("write absolute fixture");
+        std::fs::write(&relative, &png).expect("write relative fixture");
+        let _cleanup = TempFiles(vec![absolute.clone(), relative.clone()]);
+
+        for href in [
+            absolute.to_string_lossy().into_owned(),
+            relative.to_string_lossy().into_owned(),
+            format!("file://{}", absolute.to_string_lossy()),
+            format!("http://127.0.0.1/{unique}.png"),
+        ] {
+            assert_eq!(opaque_pixel_count(&href), 0, "{href} must not be loaded");
+        }
+    }
+
+    fn plain_svg(width: u32, height: u32) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="{width}" height="{height}" fill="red"/></svg>"#
+        )
+    }
+
+    #[test]
+    fn an_overflowing_size_is_refused_not_wrapped() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let svg = plain_svg(100, 100);
+        for scale in [1e20, f32::INFINITY] {
+            assert!(
+                matches!(
+                    renderer.render_single_frame_bounded(svg.as_bytes(), scale, u32::MAX),
+                    Err(SvgRenderError::TooLarge { .. })
+                ),
+                "scale {scale} must be refused as too large"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_render_refuses_before_allocating() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+
+        // 150,000 px tall: tiny-skia would allocate it happily and the GPU atlas could never hold it.
+        let tall = plain_svg(100, 150_000);
+        let Err(SvgRenderError::TooLarge { width, height }) =
+            renderer.render_single_frame_bounded(tall.as_bytes(), 1.0, MAX_RASTER_SIDE)
+        else {
+            panic!("a 150,000 px tall SVG must be refused as too large");
+        };
+        assert_eq!((width, height), (200, 300_000));
+        assert!(matches!(
+            renderer.render_single_frame(tall.as_bytes(), 1.0),
+            Err(usvg::Error::InvalidSize)
+        ));
+
+        // Within the side limit but over the memory limit: 12,000 x 12,000 x 4 bytes.
+        let wide_and_tall = plain_svg(6_000, 6_000);
+        assert!(matches!(
+            renderer.render_single_frame_bounded(wide_and_tall.as_bytes(), 1.0, MAX_RASTER_SIDE),
+            Err(SvgRenderError::TooLarge { .. })
+        ));
+
+        let small = plain_svg(10, 10);
+        let image = renderer
+            .render_single_frame_bounded(small.as_bytes(), 1.0, MAX_RASTER_SIDE)
+            .expect("a small SVG renders");
+        assert_eq!(
+            image.size(0),
+            crate::size(DevicePixels(20), DevicePixels(20))
+        );
+        assert!(matches!(
+            renderer.render_single_frame_bounded(small.as_bytes(), 1.0, 10),
+            Err(SvgRenderError::TooLarge {
+                width: 20,
+                height: 20
+            })
+        ));
+        assert!(matches!(
+            renderer.render_single_frame_bounded(b"not svg", 1.0, MAX_RASTER_SIDE),
+            Err(SvgRenderError::Svg(_))
+        ));
+    }
+
+    #[test]
+    fn a_painted_svg_is_refused_before_allocating_a_raster_the_atlas_cannot_hold() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let params = |width: i32| RenderSvgParams {
+            path: "tall.svg".into(),
+            size: crate::size(DevicePixels(width), DevicePixels(width)),
+        };
+
+        // Drawn 100 px wide, this SVG is 15,000,000 px tall.
+        let tall = plain_svg(1, 150_000);
+        assert!(
+            renderer
+                .render_alpha_mask(&params(100), Some(tall.as_bytes()))
+                .is_err()
+        );
+
+        let small = plain_svg(10, 10);
+        let (size, mask) = renderer
+            .render_alpha_mask(&params(20), Some(small.as_bytes()))
+            .unwrap()
+            .expect("a small SVG renders");
+        assert_eq!(size, crate::size(DevicePixels(20), DevicePixels(20)));
+        assert_eq!(mask.len(), 400);
+    }
+
+    #[test]
+    fn svg_image_href_still_decodes_inline_data_uris() {
+        let encoded: String = solid_red_png()
+            .iter()
+            .map(|b| format!("%{b:02x}"))
+            .collect();
+        let href = format!("data:image/png,{encoded}");
+        assert_eq!(opaque_pixel_count(&href), 64);
+    }
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();

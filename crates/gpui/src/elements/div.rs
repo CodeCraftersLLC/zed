@@ -2304,6 +2304,7 @@ impl Interactivity {
                                             }
 
                                             self.paint_mouse_listeners(
+                                                global_id,
                                                 hitbox,
                                                 element_state.as_mut(),
                                                 window,
@@ -2474,6 +2475,7 @@ impl Interactivity {
 
     fn paint_mouse_listeners(
         &mut self,
+        global_id: Option<&GlobalElementId>,
         hitbox: &Hitbox,
         element_state: Option<&mut InteractiveElementState>,
         window: &mut Window,
@@ -2602,6 +2604,36 @@ impl Interactivity {
         let click_listeners = mem::take(&mut self.click_listeners);
         let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
         let can_drop_predicate = mem::take(&mut self.can_drop_predicate);
+
+        // A screen reader's press runs the click handlers itself. The mouse press the
+        // window would otherwise synthesise at the node's centre is hit-tested, so it
+        // lands on whatever is drawn there: nothing for a control scrolled out of its
+        // container, or another control entirely. An explicit Click listener decides
+        // for itself, so the handlers are not also run through this one.
+        if window.a11y.is_active()
+            && !click_listeners.is_empty()
+            && !self
+                .a11y_action_listeners
+                .iter()
+                .any(|(action, _)| *action == accesskit::Action::Click)
+            && let Some(global_id) = global_id
+        {
+            let click_listeners = click_listeners.clone();
+            let bounds = hitbox.bounds;
+            window.on_a11y_action(
+                global_id.accesskit_node_id(),
+                accesskit::Action::Click,
+                move |_, window, cx| {
+                    let event = ClickEvent::Keyboard(KeyboardClickEvent {
+                        button: KeyboardButton::Enter,
+                        bounds,
+                    });
+                    for listener in &click_listeners {
+                        listener(&event, window, cx);
+                    }
+                },
+            );
+        }
 
         if !drop_listeners.is_empty() {
             let hitbox = hitbox.clone();

@@ -127,9 +127,19 @@ pub trait BlameRenderer {
         _: &mut Window,
         _: &mut App,
     );
+
+    /// Whether this renderer draws blame at all. The editor offers blame (its gutter column, its
+    /// inline text and the menu entry that opens them) only when it does.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 impl BlameRenderer for () {
+    fn is_available(&self) -> bool {
+        false
+    }
+
     fn max_author_length(&self) -> usize {
         0
     }

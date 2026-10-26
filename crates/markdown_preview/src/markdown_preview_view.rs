@@ -12,7 +12,7 @@ use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
     InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
-    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point,
+    ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, point,
 };
 use language::LanguageRegistry;
 use markdown::{
@@ -27,10 +27,13 @@ use theme_settings::ThemeSettings;
 use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu};
 use util::markdown::split_local_url_fragment;
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem};
+use workspace::notifications::NotificationId;
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
-use workspace::{ItemId, Pane, Workspace, WorkspaceId, delete_unloaded_items};
+use workspace::{
+    ItemId, MarkdownImageResolver, Pane, Toast, Workspace, WorkspaceId, delete_unloaded_items,
+};
 
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
 use crate::{
@@ -343,6 +346,26 @@ impl MarkdownPreviewView {
             return language.name() == "Markdown";
         }
         false
+    }
+
+    /// The Markdown this preview shows, for a host test that reads what it drew.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn markdown(&self) -> &Entity<Markdown> {
+        &self.markdown
+    }
+
+    /// What a click on a link to `url` does in this preview, for a host test that
+    /// cannot aim a pointer at a link.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn follow_link(&self, url: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        handle_url_click(
+            url,
+            &cx.entity().downgrade(),
+            self.base_directory.clone(),
+            &self.workspace,
+            window,
+            cx,
+        );
     }
 
     fn set_editor(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
@@ -727,11 +750,18 @@ impl MarkdownPreviewView {
             .map(|state| state.editor.clone());
 
         let mut workspace_directory = None;
+        let mut host_image_resolver = None;
         if let Some(workspace_entity) = self.workspace.upgrade() {
-            let project = workspace_entity.read(cx).project();
-            if let Some(tree) = project.read(cx).worktrees(cx).next() {
-                workspace_directory = Some(tree.read(cx).abs_path().to_path_buf());
-            }
+            let workspace = workspace_entity.read(cx);
+            host_image_resolver = workspace.markdown_image_resolver();
+            workspace_directory = document_worktree_directory(
+                workspace
+                    .project()
+                    .read(cx)
+                    .worktrees(cx)
+                    .map(|tree| tree.read(cx).abs_path().to_path_buf()),
+                self.base_directory.as_deref(),
+            );
         }
 
         let markdown_style = if let Some(theme) = preview_theme {
@@ -757,7 +787,8 @@ impl MarkdownPreviewView {
             .image_resolver({
                 let base_directory = self.base_directory.clone();
                 move |dest_url| {
-                    resolve_preview_image(
+                    resolve_image_source(
+                        host_image_resolver.as_ref(),
                         dest_url,
                         base_directory.as_deref(),
                         workspace_directory.as_deref(),
@@ -864,6 +895,7 @@ fn handle_url_click(
     if path_part.is_empty() {
         if let Some(fragment) = fragment {
             let view = view.clone();
+            let workspace = workspace.clone();
             let slug = SharedString::from(fragment.to_string());
             window.defer(cx, move |window, cx| {
                 if let Some(view) = view.upgrade() {
@@ -886,6 +918,23 @@ fn handle_url_click(
                                 cx,
                             );
                         }
+                    } else if !markdown.read(cx).is_parsing() {
+                        // While an edit is being parsed the heading may only be missing from the
+                        // page as it was.
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.show_toast(
+                                    Toast::new(
+                                        NotificationId::composite::<MarkdownPreviewView>(
+                                            slug.clone(),
+                                        ),
+                                        Markdown::missing_heading_message(&slug),
+                                    )
+                                    .autohide(),
+                                    cx,
+                                );
+                            })
+                            .ok();
                     }
                 }
             });
@@ -918,7 +967,7 @@ fn open_preview_url(
             workspace.open_url_or_file(&decoded_path, base_directory.as_deref(), window, cx);
         });
     } else {
-        cx.open_url(url.as_ref());
+        markdown::open_allowlisted_link(url.as_ref(), cx);
     }
 }
 
@@ -929,49 +978,69 @@ fn split_preview_url(url: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The host's resolver, when one is installed, decides alone; the built-in resolver is only
+/// the default for an embedder that installed none.
+fn resolve_image_source(
+    host_resolver: Option<&MarkdownImageResolver>,
+    dest_url: &str,
+    base_directory: Option<&Path>,
+    workspace_directory: Option<&Path>,
+) -> Option<ImageSource> {
+    match host_resolver {
+        Some(resolve) => resolve(dest_url, base_directory),
+        None => resolve_preview_image(dest_url, base_directory, workspace_directory),
+    }
+}
+
+/// The worktree root a document's images are confined to: the innermost root that contains the
+/// document's directory, or the first root when the document lies in none of them.
+fn document_worktree_directory(
+    roots: impl IntoIterator<Item = PathBuf>,
+    base_directory: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut roots = roots.into_iter();
+    let first = roots.next()?;
+    let Some(base_directory) = base_directory else {
+        return Some(first);
+    };
+    std::iter::once(first.clone())
+        .chain(roots)
+        .filter(|root| base_directory.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .or(Some(first))
+}
+
+/// Resolves a preview image to a file inside the document's worktree. Remote URLs, `data:` and
+/// every other scheme are refused, and so is any path that leaves the worktree, whether
+/// through `..`, an absolute path or a symlink. A leading `/` or `\` means the worktree root.
 fn resolve_preview_image(
     dest_url: &str,
     base_directory: Option<&Path>,
     workspace_directory: Option<&Path>,
 ) -> Option<ImageSource> {
-    if dest_url.starts_with("data:") {
-        return None;
-    }
-
-    if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
-        return Some(ImageSource::Resource(Resource::Uri(SharedUri::from(
-            dest_url.to_string(),
-        ))));
-    }
-
     let decoded = urlencoding::decode(dest_url)
         .map(|decoded| decoded.into_owned())
         .unwrap_or_else(|_| dest_url.to_string());
 
-    if let Some(stripped) = ['/', '\\']
-        .iter()
-        .find_map(|prefix| decoded.strip_prefix(*prefix))
+    if util::markdown::has_uri_scheme(&decoded)
+        || decoded.starts_with("//")
+        || decoded.starts_with("\\\\")
     {
-        if let Some(root) = workspace_directory {
-            let absolute_path = root.join(stripped);
-            if absolute_path.exists() {
-                return Some(ImageSource::Resource(Resource::Path(Arc::from(
-                    absolute_path.as_path(),
-                ))));
-            } else {
-                return None;
-            }
-        }
+        return None;
     }
 
-    let path = if Path::new(&decoded).is_absolute() {
-        PathBuf::from(decoded)
-    } else {
-        base_directory?.join(decoded)
+    let workspace_directory = workspace_directory?;
+    let candidate = match decoded.strip_prefix(['/', '\\']) {
+        Some(root_relative) => workspace_directory.join(root_relative),
+        None => base_directory?.join(&decoded),
     };
 
-    path.exists()
-        .then(|| ImageSource::Resource(Resource::Path(Arc::from(path.as_path()))))
+    // The image is loaded from the path that was checked, so a symlink swapped in afterwards
+    // cannot lead out of the worktree.
+    let resolved = candidate.canonicalize().ok()?;
+    resolved
+        .starts_with(workspace_directory.canonicalize().ok()?)
+        .then(|| ImageSource::Resource(Resource::Path(Arc::from(resolved.as_path()))))
 }
 
 impl Focusable for MarkdownPreviewView {
@@ -1475,12 +1544,15 @@ mod persistence {
 mod tests {
     use crate::markdown_preview_view::ImageSource;
     use crate::markdown_preview_view::Resource;
-    use crate::markdown_preview_view::resolve_preview_image;
+    use crate::markdown_preview_view::{
+        document_worktree_directory, resolve_image_source, resolve_preview_image,
+    };
     use buffer_diff::BufferDiff;
     use editor::Editor;
     use gpui::{AppContext as _, Entity, TestAppContext};
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::time::Duration;
     use util::path;
@@ -1488,10 +1560,13 @@ mod tests {
     use util::test::TempTree;
     use workspace::item::SerializableItem;
     use workspace::{
-        AppState, ItemId, MultiWorkspace, SaveIntent, Workspace, WorkspaceId, open_paths,
+        AppState, ItemId, MarkdownImageResolver, MultiWorkspace, SaveIntent, Workspace,
+        WorkspaceId, open_paths,
     };
 
     use super::MarkdownPreviewView;
+    use markdown::Markdown;
+    use workspace::notifications::NotificationId;
 
     #[test]
     fn resolves_workspace_absolute_preview_image_path_and_rejects_missing() {
@@ -1518,6 +1593,131 @@ mod tests {
             Some(workspace_directory),
         );
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn images_are_confined_to_the_worktree_that_holds_the_document() {
+        let roots = || {
+            [
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/b/inner"),
+            ]
+        };
+        let pick = |base: &str| document_worktree_directory(roots(), Some(Path::new(base)));
+        assert_eq!(pick("/a/docs"), Some(PathBuf::from("/a")));
+        assert_eq!(pick("/b/docs"), Some(PathBuf::from("/b")));
+        assert_eq!(pick("/b/inner/docs"), Some(PathBuf::from("/b/inner")));
+        assert_eq!(pick("/elsewhere"), Some(PathBuf::from("/a")));
+        assert_eq!(
+            document_worktree_directory(roots(), None),
+            Some(PathBuf::from("/a"))
+        );
+        assert_eq!(document_worktree_directory([], Some(Path::new("/a"))), None);
+    }
+
+    #[test]
+    fn remote_and_out_of_worktree_images_are_not_resolved() {
+        let tree = TempTree::new(json!({
+            "worktree": {
+                "docs": { "pic.png": "mock data" },
+                "root.png": "mock data",
+            },
+            "outside.png": "mock data",
+        }));
+        let worktree = tree.path().join("worktree");
+        let docs = worktree.join("docs");
+        let outside = tree.path().join("outside.png");
+        let resolve =
+            |dest_url: &str| resolve_preview_image(dest_url, Some(&docs), Some(&worktree));
+
+        for refused in [
+            "https://a/b.png",
+            "HTTP://a/b.png",
+            "%68ttp://a/b.png",
+            "//host/share/x.png",
+            "\\\\host\\share\\x.png",
+            "data:image/png;base64,AAAA",
+            "file:///etc/hosts",
+            "../../outside.png",
+            "..%2F..%2Foutside.png",
+            "/../outside.png",
+            outside.to_str().expect("temp path is utf-8"),
+        ] {
+            assert!(resolve(refused).is_none(), "{refused:?} resolved");
+        }
+
+        assert_resolved_preview_image_path(resolve("pic.png"), &docs.join("pic.png"));
+        assert_resolved_preview_image_path(resolve("/docs/pic.png"), &docs.join("pic.png"));
+        assert_resolved_preview_image_path(resolve("../root.png"), &docs.join("../root.png"));
+    }
+
+    #[test]
+    fn an_installed_image_resolver_replaces_the_built_in_one() {
+        let tree = TempTree::new(json!({ "docs": { "pic.png": "mock data" } }));
+        let docs = tree.path().join("docs");
+        let host_image = PathBuf::from("/host/image.png");
+        let host_resolver: MarkdownImageResolver = Rc::new({
+            let host_image = host_image.clone();
+            move |dest_url, base_directory| {
+                (dest_url != "refused.png" && base_directory.is_some())
+                    .then(|| ImageSource::Resource(Resource::Path(Arc::from(host_image.as_path()))))
+            }
+        });
+        let resolve = |host: Option<&MarkdownImageResolver>, dest_url: &str| {
+            resolve_image_source(host, dest_url, Some(&docs), Some(tree.path()))
+        };
+
+        assert_resolved_preview_image_path(
+            resolve(Some(&host_resolver), "https://a/b.png"),
+            &host_image,
+        );
+        assert!(
+            resolve(Some(&host_resolver), "refused.png").is_none(),
+            "the built-in resolver must not run behind the host's"
+        );
+        assert!(
+            resolve(Some(&host_resolver), "pic.png").is_some(),
+            "the host's answer wins even for a file the built-in resolver would find"
+        );
+        assert_resolved_preview_image_path(resolve(None, "pic.png"), &docs.join("pic.png"));
+        assert!(resolve(None, "https://a/b.png").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_worktree_is_not_resolved() {
+        let tree = TempTree::new(json!({
+            "worktree": { "docs": {} },
+            "outside.png": "mock data",
+        }));
+        let worktree = tree.path().join("worktree");
+        let docs = worktree.join("docs");
+        std::os::unix::fs::symlink(tree.path().join("outside.png"), docs.join("link.png"))
+            .expect("create symlink");
+
+        assert!(resolve_preview_image("link.png", Some(&docs), Some(&worktree)).is_none());
+        assert!(resolve_preview_image("/docs/link.png", Some(&docs), Some(&worktree)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_worktree_resolves_to_what_it_points_at() {
+        let tree = TempTree::new(json!({ "worktree": { "docs": {}, "real.png": "mock data" } }));
+        let worktree = tree.path().join("worktree");
+        let docs = worktree.join("docs");
+        std::os::unix::fs::symlink(worktree.join("real.png"), docs.join("alias.png"))
+            .expect("create symlink");
+
+        let Some(ImageSource::Resource(Resource::Path(path))) =
+            resolve_preview_image("alias.png", Some(&docs), Some(&worktree))
+        else {
+            panic!("the alias did not resolve");
+        };
+        assert_eq!(
+            path.as_ref(),
+            worktree.join("real.png").canonicalize().unwrap()
+        );
     }
 
     #[gpui::test]
@@ -1598,6 +1798,149 @@ mod tests {
                 .await
                 .unwrap(),
             "- [x] Finish work\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_a_missing_heading_link_shows_a_toast(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/dir"),
+                json!({ "doc.md": "# Intro\n\n[there](#intro) [missing](#nope)\n" }),
+            )
+            .await;
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/dir/doc.md"))],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let (workspace, preview) = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let editor: Entity<Editor> = workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<Editor>(cx))
+                    .unwrap();
+                let preview = workspace.update(cx, |workspace, cx| {
+                    let preview = MarkdownPreviewView::create_markdown_view(
+                        workspace,
+                        editor.clone(),
+                        window,
+                        cx,
+                    );
+                    workspace.active_pane().update(cx, |pane, cx| {
+                        pane.add_item(Box::new(preview.clone()), true, true, None, window, cx)
+                    });
+                    preview
+                });
+                (workspace, preview)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let click = |url: &'static str, cx: &mut TestAppContext| {
+            multi_workspace
+                .update(cx, |_, window, cx| {
+                    super::handle_url_click(
+                        url.into(),
+                        &preview.downgrade(),
+                        None,
+                        &workspace.downgrade(),
+                        window,
+                        cx,
+                    );
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let toasts = |cx: &mut TestAppContext| {
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids())
+        };
+
+        click("#intro", cx);
+        assert!(
+            toasts(cx).is_empty(),
+            "a link to a heading that exists says nothing"
+        );
+
+        click("#nope", cx);
+        assert_eq!(
+            toasts(cx),
+            [NotificationId::composite::<MarkdownPreviewView>("nope")]
+        );
+        assert_eq!(
+            Markdown::missing_heading_message("nope"),
+            "There is no heading “nope” on this page"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_link_to_a_heading_being_parsed_does_not_say_it_is_missing(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/dir"), json!({ "doc.md": "# Intro\n" }))
+            .await;
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/dir/doc.md"))],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let (workspace, preview) = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let editor: Entity<Editor> = workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<Editor>(cx))
+                    .unwrap();
+                let preview = workspace.update(cx, |workspace, cx| {
+                    MarkdownPreviewView::create_markdown_view(workspace, editor, window, cx)
+                });
+                (workspace, preview)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let markdown = preview.read_with(cx, |preview, _| preview.markdown.clone());
+        markdown.update(cx, |markdown, cx| markdown.append("\n# Fresh\n", cx));
+        assert!(markdown.read_with(cx, |markdown, _| markdown.is_parsing()));
+
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                super::handle_url_click(
+                    "#fresh".into(),
+                    &preview.downgrade(),
+                    None,
+                    &workspace.downgrade(),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        assert!(
+            workspace
+                .read_with(cx, |workspace, _| workspace.notification_ids())
+                .is_empty()
         );
     }
 
@@ -2164,6 +2507,10 @@ mod tests {
     ) {
         match resolved {
             Some(ImageSource::Resource(Resource::Path(path))) => {
+                // A resolved path is the real one, with every symlink followed.
+                let expected_path = expected_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| expected_path.to_path_buf());
                 assert_eq!(path.as_ref(), expected_path);
             }
             _ => panic!("Expected preview image to resolve to a local path"),

@@ -107,7 +107,7 @@ pub use outline::*;
 pub use syntax_map::{
     OwnedSyntaxLayer, SyntaxLayer, SyntaxMapMatches, ToTreeSitterPoint, TreeSitterOptions,
 };
-pub use text::{AnchorRangeExt, LineEnding};
+pub use text::{AnchorRangeExt, LineEnding, LineEndings};
 pub use tree_sitter::{Node, Parser, QueryCapture, Tree, TreeCursor};
 
 pub(crate) fn to_settings_soft_wrap(value: language_core::SoftWrap) -> settings::SoftWrap {

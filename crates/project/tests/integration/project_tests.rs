@@ -341,6 +341,148 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
     assert_eq!(Some(settings_readme.tab_size), NonZeroU32::new(8));
 }
 
+/// Saves `a.txt` of a cloned repository after typing "X" at its start, the way an embedder
+/// that never rewrites files does. Returns the bytes that reached the disk and whether the
+/// external formatter the repository asked for ran.
+#[cfg(unix)]
+async fn save_in_cloned_repo(
+    cx: &mut gpui::TestAppContext,
+    repo_files: impl FnOnce(&Path) -> serde_json::Value,
+    ignore_local_settings: bool,
+) -> (String, bool) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "format_on_save": "off",
+                        "remove_trailing_whitespace_on_save": false,
+                        "ensure_final_newline_on_save": false
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+            store.set_ignore_local_settings(ignore_local_settings, cx);
+        });
+    });
+
+    let marker_dir = TempTree::new(json!({}));
+    let marker = marker_dir.path().join("formatter-ran");
+    let mut files = repo_files(&marker);
+    files["a.txt"] = json!("one  \ntwo  ");
+    let repo = TempTree::new(files);
+    let project = Project::test(
+        Arc::new(RealFs::new(None, cx.executor())),
+        [repo.path()],
+        cx,
+    )
+    .await;
+    cx.executor().run_until_parked();
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("a.txt")), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "X")], None, cx));
+    project
+        .update(cx, |project, cx| {
+            project.format(
+                HashSet::from_iter([buffer.clone()]),
+                project::lsp_store::LspFormatTarget::Buffers,
+                false,
+                project::lsp_store::FormatTrigger::Save,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    project
+        .update(cx, |project, cx| project.save_buffer(buffer, cx))
+        .await
+        .unwrap();
+
+    let saved = std::fs::read_to_string(repo.path().join("a.txt")).unwrap();
+    (saved, marker.exists())
+}
+
+#[cfg(unix)]
+fn zed_settings_asking_for_an_external_formatter(marker: &Path) -> serde_json::Value {
+    json!({
+        ".zed": {
+            "settings.json": json!({
+                "format_on_save": "on",
+                "remove_trailing_whitespace_on_save": true,
+                "ensure_final_newline_on_save": true,
+                "formatter": {
+                    "external": {
+                        "command": "sh",
+                        "arguments": ["-c", "touch \"$0\"; cat", marker],
+                    }
+                },
+            }).to_string(),
+        },
+    })
+}
+
+#[cfg(unix)]
+const EDITORCONFIG_THAT_REWRITES_ON_SAVE: &str =
+    "root = true\n[*]\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n";
+
+#[cfg(unix)]
+#[gpui::test]
+async fn test_a_repository_s_zed_settings_can_rewrite_a_save_unless_local_settings_are_ignored(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (saved, formatter_ran) =
+        save_in_cloned_repo(cx, zed_settings_asking_for_an_external_formatter, false).await;
+    assert!(
+        formatter_ran,
+        "the fixture must reach the external formatter"
+    );
+    assert_eq!(saved, "Xone\ntwo\n");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+async fn test_ignored_local_settings_stop_a_repository_s_zed_settings_from_running_a_formatter_on_save(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (saved, formatter_ran) =
+        save_in_cloned_repo(cx, zed_settings_asking_for_an_external_formatter, true).await;
+    assert!(
+        !formatter_ran,
+        "an external formatter from the repository ran"
+    );
+    assert_eq!(saved, "Xone  \ntwo  ");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+async fn test_a_repository_s_editorconfig_can_rewrite_a_save_unless_local_settings_are_ignored(
+    cx: &mut gpui::TestAppContext,
+) {
+    let editorconfig = |_: &Path| json!({ ".editorconfig": EDITORCONFIG_THAT_REWRITES_ON_SAVE });
+    let (saved, _) = save_in_cloned_repo(cx, editorconfig, false).await;
+    assert_eq!(saved, "Xone\ntwo\n");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+async fn test_ignored_local_settings_stop_a_repository_s_editorconfig_from_rewriting_a_save(
+    cx: &mut gpui::TestAppContext,
+) {
+    let editorconfig = |_: &Path| json!({ ".editorconfig": EDITORCONFIG_THAT_REWRITES_ON_SAVE });
+    let (saved, _) = save_in_cloned_repo(cx, editorconfig, true).await;
+    assert_eq!(saved, "Xone  \ntwo  ");
+}
+
 #[gpui::test]
 async fn test_external_editorconfig_support(cx: &mut gpui::TestAppContext) {
     init_test(cx);
@@ -6904,6 +7046,66 @@ async fn test_line_ending_editorconfig_on_format_and_save(cx: &mut gpui::TestApp
 }
 
 #[gpui::test]
+async fn test_an_enforced_line_ending_reaches_every_line_of_a_mixed_file(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    for (end_of_line, mixed, expected) in [
+        ("lf", "one\ntwo\r\nthree\n", "one\ntwo\nthree\n"),
+        ("crlf", "one\r\ntwo\nthree\r\n", "one\r\ntwo\r\nthree\r\n"),
+    ] {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                ".editorconfig": format!("root = true\n[*.rs]\nend_of_line = {end_of_line}\n"),
+                "mixed.rs": mixed,
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(rust_lang());
+        cx.executor().run_until_parked();
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("mixed.rs")), cx)
+            })
+            .await
+            .unwrap();
+        buffer.read_with(cx, |buffer, _| {
+            assert!(!buffer.line_endings().is_uniform(), "{end_of_line}");
+        });
+
+        project
+            .update(cx, |project, cx| {
+                project.format(
+                    HashSet::from_iter([buffer.clone()]),
+                    project::lsp_store::LspFormatTarget::Buffers,
+                    false,
+                    project::lsp_store::FormatTrigger::Save,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer, cx))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.load(path!("/dir/mixed.rs").as_ref()).await.unwrap(),
+            expected,
+            "end_of_line = {end_of_line}"
+        );
+    }
+}
+
+#[gpui::test]
 async fn test_line_ending_initialization_for_new_buffers(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
@@ -13312,6 +13514,213 @@ async fn test_undo_encoding_change(cx: &mut gpui::TestAppContext) {
         assert_ne!(buffer.text(), "Hi");
         assert!(!buffer.is_dirty());
     });
+}
+
+#[gpui::test]
+async fn test_renaming_an_entry_reports_where_it_came_from(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({ "side.txt": "", "dir": { "inner.txt": "" } }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let renames = Rc::new(RefCell::new(Vec::new()));
+    let _subscription = cx.update(|cx| {
+        let renames = renames.clone();
+        cx.subscribe(&project, move |_, event, _| {
+            if let Event::EntryRenamed {
+                old_path, new_path, ..
+            } = event
+            {
+                renames.borrow_mut().push((
+                    old_path.path.as_unix_str().to_string(),
+                    new_path.path.as_unix_str().to_string(),
+                ));
+            }
+        })
+    });
+
+    let (worktree_id, file_id, dir_id) = project.read_with(cx, |project, cx| {
+        let worktree = project.worktrees(cx).next().unwrap().read(cx);
+        (
+            worktree.id(),
+            worktree.entry_for_path(rel_path("side.txt")).unwrap().id,
+            worktree.entry_for_path(rel_path("dir")).unwrap().id,
+        )
+    });
+    for (entry_id, to) in [(file_id, "SIDE.txt"), (dir_id, "DIR")] {
+        project
+            .update(cx, |project, cx| {
+                project.rename_entry(entry_id, (worktree_id, rel_path(to)).into(), cx)
+            })
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        *renames.borrow(),
+        [
+            ("side.txt".to_string(), "SIDE.txt".to_string()),
+            ("dir".to_string(), "DIR".to_string()),
+        ]
+    );
+}
+
+/// Opening a file, typing one character at its start or end and saving must change that
+/// character and nothing else: not the line endings, the encoding or the byte-order mark.
+#[gpui::test]
+async fn test_saving_changes_only_the_typed_character(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    fn utf16(text: &str, little_endian: bool, bom: bool) -> Vec<u8> {
+        let mut bytes = if bom {
+            if little_endian {
+                vec![0xFF, 0xFE]
+            } else {
+                vec![0xFE, 0xFF]
+            }
+        } else {
+            vec![]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend(if little_endian {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        bytes
+    }
+
+    struct Case {
+        name: &'static str,
+        bytes: Vec<u8>,
+        /// Where the file's text starts, after any byte-order mark.
+        text_start: usize,
+        /// How the typed `X` is stored in this file.
+        typed: Vec<u8>,
+    }
+    let ascii = |name, bytes: &[u8]| Case {
+        name,
+        bytes: bytes.to_vec(),
+        text_start: 0,
+        typed: b"X".to_vec(),
+    };
+    let long_line = "x".repeat(1500);
+    let cases = vec![
+        ascii("lf", b"one\ntwo\n"),
+        ascii("crlf", b"one\r\ntwo\r\n"),
+        ascii("cr", b"one\rtwo\rthree"),
+        ascii("mixed", b"one\r\ntwo\nthree\r\nfour\n"),
+        ascii("lf with one crlf line", b"one\ntwo\r\nthree\n"),
+        ascii("no newline", b"one two"),
+        ascii("one nul byte", b"text before\0text after"),
+        Case {
+            name: "lf behind a 1500 byte first line",
+            bytes: format!("{long_line}\nsecond\n").into_bytes(),
+            text_start: 0,
+            typed: b"X".to_vec(),
+        },
+        Case {
+            name: "crlf behind a 1500 byte first line",
+            bytes: format!("{long_line}\r\nsecond\r\n").into_bytes(),
+            text_start: 0,
+            typed: b"X".to_vec(),
+        },
+        Case {
+            name: "latin-1",
+            bytes: b"Le caf\xe9 na\xeff de l'h\xf4tel sert un r\xe9sum\xe9 d\xe9taill\xe9."
+                .to_vec(),
+            text_start: 0,
+            typed: b"X".to_vec(),
+        },
+        Case {
+            name: "windows-1252",
+            bytes: b"The \x93smart\x94 quotes \x96 and the euro sign \x80 cost \x805 each."
+                .to_vec(),
+            text_start: 0,
+            typed: b"X".to_vec(),
+        },
+        Case {
+            name: "shift-jis",
+            bytes: vec![
+                0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea, 0x0d, 0x0a, 0x93, 0xfa, 0x96, 0x7b,
+            ],
+            text_start: 0,
+            typed: b"X".to_vec(),
+        },
+        Case {
+            name: "utf-8 with a byte-order mark",
+            bytes: [&[0xEF, 0xBB, 0xBF][..], "héllo wörld\r\nsecond".as_bytes()].concat(),
+            text_start: 3,
+            typed: b"X".to_vec(),
+        },
+        Case {
+            name: "utf-16le with a byte-order mark",
+            bytes: utf16("héllo wörld\r\nsecond", true, true),
+            text_start: 2,
+            typed: utf16("X", true, false),
+        },
+        Case {
+            name: "utf-16be with a byte-order mark",
+            bytes: utf16("héllo wörld\r\nsecond", false, true),
+            text_start: 2,
+            typed: utf16("X", false, false),
+        },
+        Case {
+            name: "utf-16le without a byte-order mark",
+            bytes: utf16("héllo wörld\nsecond", true, false),
+            text_start: 0,
+            typed: utf16("X", true, false),
+        },
+    ];
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({})).await;
+    for (ix, case) in cases.iter().enumerate() {
+        fs.insert_file(
+            format!("{}/file{ix}.txt", path!("/dir")),
+            case.bytes.clone(),
+        )
+        .await;
+    }
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+
+    for (ix, case) in cases.into_iter().enumerate() {
+        for at_start in [true, false] {
+            let path = format!("{}/file{ix}.txt", path!("/dir"));
+            fs.insert_file(&path, case.bytes.clone()).await;
+            let buffer = project
+                .update(cx, |project, cx| project.open_local_buffer(&path, cx))
+                .await
+                .unwrap();
+            buffer.update(cx, |buffer, cx| {
+                let offset = if at_start { 0 } else { buffer.len() };
+                buffer.edit([(offset..offset, "X")], None, cx);
+            });
+            project
+                .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+                .await
+                .unwrap();
+
+            let mut expected = case.bytes.clone();
+            let insert_at = if at_start {
+                case.text_start
+            } else {
+                expected.len()
+            };
+            expected.splice(insert_at..insert_at, case.typed.clone());
+            assert_eq!(
+                fs.load_bytes(Path::new(&path)).await.unwrap(),
+                expected,
+                "{} (typed at the {})",
+                case.name,
+                if at_start { "start" } else { "end" }
+            );
+        }
+    }
 }
 
 #[gpui::test]

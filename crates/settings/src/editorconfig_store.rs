@@ -139,6 +139,15 @@ impl EditorconfigStore {
         Ok(())
     }
 
+    /// Every worktree this store holds, or is still looking for, configs of.
+    pub(crate) fn worktree_ids(&self) -> Vec<WorktreeId> {
+        self.worktree_state
+            .keys()
+            .chain(self.local_external_config_discovery_tasks.keys())
+            .copied()
+            .collect()
+    }
+
     pub(crate) fn remove_for_worktree(&mut self, root_id: WorktreeId) {
         self.local_external_config_discovery_tasks.remove(&root_id);
         let Some(removed) = self.worktree_state.remove(&root_id) else {

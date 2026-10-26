@@ -1,7 +1,11 @@
+mod details;
 pub mod html;
+mod inline_html;
 mod mermaid;
 pub mod parser;
 mod path_range;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 use base64::Engine as _;
 use futures::FutureExt as _;
@@ -10,6 +14,8 @@ use gpui::HitboxBehavior;
 use gpui::UnderlineStyle;
 use language::LanguageName;
 
+use details::{DetailsSpan, extract_details_spans};
+use inline_html::{InlineTag, InlineTagKind};
 use log::Level;
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
@@ -388,6 +394,9 @@ pub struct Markdown {
     mermaid_state: MermaidState,
     _mermaid_theme_subscription: Option<Subscription>,
     mermaid_showing_code: HashSet<usize>,
+    /// The `<details>` regions whose state differs from the one their `open` attribute sets, by
+    /// the source offset of their HTML block and their position within it.
+    details_toggled: HashSet<(usize, usize)>,
     copied_code_blocks: HashSet<ElementId>,
     wrapped_code_blocks: HashSet<usize>,
     code_block_scroll_handles: BTreeMap<usize, ScrollHandle>,
@@ -580,6 +589,7 @@ impl Markdown {
             mermaid_state: MermaidState::default(),
             _mermaid_theme_subscription: theme_subscription,
             mermaid_showing_code: HashSet::default(),
+            details_toggled: HashSet::default(),
             copied_code_blocks: HashSet::default(),
             wrapped_code_blocks: HashSet::default(),
             code_block_scroll_handles: BTreeMap::default(),
@@ -650,6 +660,16 @@ impl Markdown {
         }
     }
 
+    pub(crate) fn is_details_open(&self, region: (usize, usize), open_by_default: bool) -> bool {
+        open_by_default != self.details_toggled.contains(&region)
+    }
+
+    pub(crate) fn toggle_details(&mut self, region: (usize, usize)) {
+        if !self.details_toggled.remove(&region) {
+            self.details_toggled.insert(region);
+        }
+    }
+
     fn clear_code_block_scroll_handles(&mut self) {
         self.code_block_scroll_handles.clear();
     }
@@ -682,6 +702,11 @@ impl Markdown {
 
     pub fn is_parsing(&self) -> bool {
         self.pending_parse.is_some()
+    }
+
+    /// What to tell the user when a `#slug` link names no heading on the page.
+    pub fn missing_heading_message(slug: &str) -> String {
+        format!("There is no heading “{slug}” on this page")
     }
 
     pub fn scroll_to_heading(&mut self, slug: &str, cx: &mut Context<Self>) -> Option<usize> {
@@ -890,6 +915,7 @@ impl Markdown {
             };
             self.active_root_block = None;
             self.images_by_source_offset.clear();
+            self.details_toggled.clear();
             self.mermaid_state.clear();
             cx.notify();
             cx.refresh_windows();
@@ -926,6 +952,7 @@ impl Markdown {
                         html_blocks: BTreeMap::default(),
                         metadata_blocks: BTreeMap::default(),
                         mermaid_diagrams: BTreeMap::default(),
+                        details_spans: BTreeMap::default(),
                         heading_slugs: HashMap::default(),
                         footnote_definitions: HashMap::default(),
                     },
@@ -949,6 +976,11 @@ impl Markdown {
             let footnote_definitions = parsed.footnote_definitions;
             let mermaid_diagrams = if should_render_mermaid_diagrams {
                 extract_mermaid_diagrams(&source, &events)
+            } else {
+                BTreeMap::default()
+            };
+            let details_spans = if should_parse_html {
+                extract_details_spans(&source, &events)
             } else {
                 BTreeMap::default()
             };
@@ -1014,6 +1046,7 @@ impl Markdown {
                     html_blocks,
                     metadata_blocks,
                     mermaid_diagrams,
+                    details_spans,
                     heading_slugs,
                     footnote_definitions,
                 },
@@ -1032,6 +1065,9 @@ impl Markdown {
                 }) {
                     this.active_root_block = None;
                 }
+                this.details_toggled.retain(|(block_start, _)| {
+                    this.parsed_markdown.html_blocks.contains_key(block_start)
+                });
                 if this.options.render_mermaid_diagrams {
                     let parsed_markdown = this.parsed_markdown.clone();
                     this.mermaid_state.update(&parsed_markdown, cx);
@@ -1133,6 +1169,27 @@ impl Selection {
     }
 }
 
+/// What the collapsed `<details>` an HTML block opens hide, and where the furthest-reaching one is
+/// closed. Regions one block opens together nest, so that one hides the others' bodies too.
+fn collapsed_details(
+    open_ended: Vec<&html::html_parser::ParsedHtmlDetails>,
+    block_start: usize,
+    spans: &BTreeMap<(usize, usize), DetailsSpan>,
+    is_open: impl Fn((usize, usize), bool) -> bool,
+) -> (Range<usize>, Option<(usize, usize)>) {
+    open_ended
+        .into_iter()
+        .filter(|details| !is_open((block_start, details.ordinal), details.open))
+        .filter_map(|details| spans.get(&(block_start, details.ordinal)))
+        .max_by_key(|span| (span.hidden_events.end, span.close))
+        .map_or((0..0, None), |span| {
+            (
+                span.hidden_events.clone(),
+                Some((span.hidden_events.end, span.close)),
+            )
+        })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ParsedMarkdown {
     pub source: SharedString,
@@ -1143,6 +1200,7 @@ pub struct ParsedMarkdown {
     pub(crate) html_blocks: BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
     pub(crate) metadata_blocks: BTreeMap<usize, ParsedMetadataBlock>,
     pub(crate) mermaid_diagrams: BTreeMap<usize, ParsedMarkdownMermaidDiagram>,
+    pub(crate) details_spans: BTreeMap<(usize, usize), DetailsSpan>,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
 }
@@ -1179,6 +1237,17 @@ pub enum AutoscrollBehavior {
     Propagate,
     /// Directly control a specific scroll handle.
     Controlled(ScrollHandle),
+}
+
+/// Hands `url` to the operating system only when its scheme is on the link allowlist
+/// (`http`, `https`, `mailto`). Everything else, including bare names such as `calc.exe`,
+/// is logged and dropped, because the OS opener would otherwise execute or resolve it.
+pub fn open_allowlisted_link(url: &str, cx: &mut App) {
+    if util::markdown::is_os_openable_link(url) {
+        cx.open_url(url);
+    } else {
+        log::warn!("not opening link {url:?}: only http, https and mailto links reach the OS");
+    }
 }
 
 pub struct MarkdownElement {
@@ -1356,6 +1425,106 @@ impl MarkdownElement {
         );
 
         builder.push_image_child(image_element);
+    }
+
+    fn push_inline_html(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        html: &str,
+        range: &Range<usize>,
+        render_inline_html: bool,
+        cx: &mut App,
+    ) {
+        if let Some(code) = html
+            .strip_prefix("<code>")
+            .and_then(|html| html.strip_suffix("</code>"))
+        {
+            let code_start = range.start + "<code>".len();
+            self.push_markdown_code_span(builder, code, code_start..code_start + code.len(), cx);
+        } else if render_inline_html {
+            self.render_inline_html_tag(builder, html, range, cx);
+        } else if html.starts_with("<code>") {
+            builder.push_text_style(self.style.inline_code.clone());
+        } else if html.trim_end().starts_with("</code>") {
+            builder.pop_text_style();
+        } else {
+            builder.push_text(html, range.clone());
+        }
+    }
+
+    fn render_inline_html_tag(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        html: &str,
+        range: &Range<usize>,
+        cx: &mut App,
+    ) {
+        match InlineTag::parse(html) {
+            InlineTag::Open {
+                kind: InlineTagKind::LineBreak,
+                ..
+            } => builder.push_text("\n", range.clone()),
+            InlineTag::Open {
+                kind: InlineTagKind::Link,
+                href: Some(href),
+            } if builder.code_block_stack.is_empty() => {
+                let dest_url = SharedString::from(href);
+                builder.link_depth += 1;
+                builder.push_link(dest_url.clone(), range.clone());
+                let link = builder.rendered_links.len() - 1;
+                let style = self
+                    .style
+                    .link_callback
+                    .as_ref()
+                    .and_then(|callback| callback(&dest_url, cx))
+                    .unwrap_or_else(|| self.style.link.clone());
+                builder.open_inline_tag(InlineTagKind::Link, style, Some(link));
+            }
+            InlineTag::Open { kind, .. } => {
+                builder.open_inline_tag(kind, self.inline_tag_style(kind, cx), None)
+            }
+            InlineTag::Close(kind) => builder.close_inline_tag(kind, range.end),
+            InlineTag::Ignored => {}
+        }
+    }
+
+    fn inline_tag_style(&self, kind: InlineTagKind, cx: &App) -> TextStyleRefinement {
+        match kind {
+            InlineTagKind::Bold => TextStyleRefinement {
+                font_weight: Some(FontWeight::BOLD),
+                color: Some(cx.theme().colors().text),
+                ..Default::default()
+            },
+            InlineTagKind::Italic => TextStyleRefinement {
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            },
+            InlineTagKind::Underline => TextStyleRefinement {
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: None,
+                    wavy: false,
+                }),
+                ..Default::default()
+            },
+            InlineTagKind::Strikethrough => TextStyleRefinement {
+                strikethrough: Some(StrikethroughStyle {
+                    thickness: px(1.),
+                    color: None,
+                }),
+                ..Default::default()
+            },
+            InlineTagKind::Code => self.style.inline_code.clone(),
+            InlineTagKind::Subscript | InlineTagKind::Superscript => TextStyleRefinement {
+                font_size: Some(rems(0.75).into()),
+                ..Default::default()
+            },
+            InlineTagKind::Mark => TextStyleRefinement {
+                background_color: Some(cx.theme().status().warning_background),
+                ..Default::default()
+            },
+            InlineTagKind::Link | InlineTagKind::LineBreak => TextStyleRefinement::default(),
+        }
     }
 
     fn push_markdown_paragraph(
@@ -1875,7 +2044,7 @@ impl MarkdownElement {
                         if let Some(open_url) = on_open_url.as_ref() {
                             open_url(pressed_link.destination_url, window, cx);
                         } else {
-                            cx.open_url(&pressed_link.destination_url);
+                            open_allowlisted_link(&pressed_link.destination_url, cx);
                         }
                     }
                 } else if markdown.selection.pending {
@@ -1986,13 +2155,21 @@ impl Element for MarkdownElement {
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
         );
-        let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
+        let (
+            parsed_markdown,
+            images,
+            active_root_block,
+            render_mermaid_diagrams,
+            render_inline_html,
+            mermaid_state,
+        ) = {
             let markdown = self.markdown.read(cx);
             (
                 markdown.parsed_markdown.clone(),
                 markdown.images_by_source_offset.clone(),
                 markdown.active_root_block,
                 markdown.options.render_mermaid_diagrams,
+                markdown.options.parse_html,
                 markdown.mermaid_state.clone(),
             )
         };
@@ -2005,6 +2182,11 @@ impl Element for MarkdownElement {
 
         let mut current_img_block_range: Option<Range<usize>> = None;
         let mut handled_html_block = false;
+        // The events a collapsed `<details>` hides.
+        let mut hidden_events = 0..0;
+        // Where the collapsed `<details>` ends: the closing block's event index and which of its
+        // `</details>` tags it is.
+        let mut closing_region: Option<(usize, usize)> = None;
         let mut rendered_mermaid_block = false;
         let mut rendered_metadata_block = false;
         for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
@@ -2023,6 +2205,12 @@ impl Element for MarkdownElement {
                 }
             }
 
+            if hidden_events.contains(&index)
+                && !matches!(event, MarkdownEvent::RootStart | MarkdownEvent::RootEnd(_))
+            {
+                continue;
+            }
+
             if rendered_mermaid_block {
                 if matches!(event, MarkdownEvent::End(MarkdownTagEnd::CodeBlock)) {
                     rendered_mermaid_block = false;
@@ -2035,6 +2223,21 @@ impl Element for MarkdownElement {
                     rendered_metadata_block = false;
                 }
                 continue;
+            }
+
+            if let MarkdownEvent::End(tag) = event
+                && !matches!(
+                    tag,
+                    MarkdownTagEnd::Emphasis
+                        | MarkdownTagEnd::Strong
+                        | MarkdownTagEnd::Strikethrough
+                        | MarkdownTagEnd::Superscript
+                        | MarkdownTagEnd::Subscript
+                        | MarkdownTagEnd::Link
+                        | MarkdownTagEnd::Image
+                )
+            {
+                builder.close_all_inline_tags(range.end);
             }
 
             match event {
@@ -2238,8 +2441,24 @@ impl Element for MarkdownElement {
                         MarkdownTag::HtmlBlock => {
                             builder.push_div(div(), range, markdown_end);
                             if let Some(block) = parsed_markdown.html_blocks.get(&range.start) {
-                                self.render_html_block(block, &mut builder, markdown_end, cx);
+                                let closed_through = closing_region
+                                    .take_if(|(closing_index, _)| *closing_index == index)
+                                    .map(|(_, close)| close);
+                                self.render_html_block(
+                                    block,
+                                    closed_through,
+                                    &mut builder,
+                                    markdown_end,
+                                    cx,
+                                );
                                 handled_html_block = true;
+                                let markdown = self.markdown.read(cx);
+                                (hidden_events, closing_region) = collapsed_details(
+                                    block.open_ended_details(closed_through),
+                                    range.start,
+                                    &parsed_markdown.details_spans,
+                                    |region, open| markdown.is_details_open(region, open),
+                                );
                             }
                         }
                         MarkdownTag::List(bullet_index) => {
@@ -2613,28 +2832,7 @@ impl Element for MarkdownElement {
                 }
                 MarkdownEvent::InlineHtml => {
                     let html = &parsed_markdown.source[range.clone()];
-                    if let Some(code) = html
-                        .strip_prefix("<code>")
-                        .and_then(|html| html.strip_suffix("</code>"))
-                    {
-                        let code_start = range.start + "<code>".len();
-                        self.push_markdown_code_span(
-                            &mut builder,
-                            code,
-                            code_start..code_start + code.len(),
-                            cx,
-                        );
-                        continue;
-                    }
-                    if html.starts_with("<code>") {
-                        builder.push_text_style(self.style.inline_code.clone());
-                        continue;
-                    }
-                    if html.trim_end().starts_with("</code>") {
-                        builder.pop_text_style();
-                        continue;
-                    }
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                    self.push_inline_html(&mut builder, html, range, render_inline_html, cx);
                 }
                 MarkdownEvent::Rule => {
                     builder.push_div(
@@ -2773,7 +2971,7 @@ fn image_fallback_element(dest_url: SharedString, alt_text: Option<SharedString>
         .tooltip(Tooltip::text(
             "Image failed to load. Open `zed: log` for more details.",
         ))
-        .on_click(move |_, _, cx| cx.open_url(&dest_url))
+        .on_click(move |_, _, cx| open_allowlisted_link(&dest_url, cx))
         .into_any_element()
 }
 
@@ -3013,11 +3211,21 @@ struct MarkdownElementBuilder {
     rendered_footnote_separator: bool,
     base_text_style: TextStyle,
     text_style_stack: Vec<TextStyleRefinement>,
+    /// The inline HTML tags (`<b>`, `<a href>`, ...) that are open. They are kept apart from
+    /// `text_style_stack` because HTML tags do not nest with Markdown's: `**<b>x**</b>` is legal.
+    open_inline_tags: Vec<OpenInlineTag>,
     code_block_stack: Vec<Option<Arc<Language>>>,
     link_depth: usize,
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
+}
+
+struct OpenInlineTag {
+    kind: InlineTagKind,
+    refinement: TextStyleRefinement,
+    /// For `<a href>`, the index in `rendered_links` of the link it opened.
+    link: Option<usize>,
 }
 
 #[derive(Default)]
@@ -3052,6 +3260,7 @@ impl MarkdownElementBuilder {
             rendered_footnote_separator: false,
             base_text_style,
             text_style_stack: Vec::new(),
+            open_inline_tags: Vec::new(),
             code_block_stack: Vec::new(),
             link_depth: 0,
             list_stack: Vec::new(),
@@ -3069,7 +3278,48 @@ impl MarkdownElementBuilder {
         for refinement in &self.text_style_stack {
             style.refine(refinement);
         }
+        for tag in &self.open_inline_tags {
+            style.refine(&tag.refinement);
+        }
         style
+    }
+
+    fn open_inline_tag(
+        &mut self,
+        kind: InlineTagKind,
+        refinement: TextStyleRefinement,
+        link: Option<usize>,
+    ) {
+        self.open_inline_tags.push(OpenInlineTag {
+            kind,
+            refinement,
+            link,
+        });
+    }
+
+    /// Closes the innermost open tag of `kind`; a closing tag that matches nothing is ignored.
+    fn close_inline_tag(&mut self, kind: InlineTagKind, source_end: usize) {
+        let Some(ix) = self
+            .open_inline_tags
+            .iter()
+            .rposition(|tag| tag.kind == kind)
+        else {
+            return;
+        };
+        let tag = self.open_inline_tags.remove(ix);
+        if let Some(link) = tag.link {
+            self.rendered_links[link].source_range.end = source_end;
+            self.link_depth = self.link_depth.saturating_sub(1);
+        }
+    }
+
+    /// Closes every open tag at `source_end`, the end of the block; HTML tags do not carry over to
+    /// the next block. A link left open runs to there, as a browser draws it.
+    fn close_all_inline_tags(&mut self, source_end: usize) {
+        for link in self.open_inline_tags.drain(..).filter_map(|tag| tag.link) {
+            self.rendered_links[link].source_range.end = source_end;
+            self.link_depth = self.link_depth.saturating_sub(1);
+        }
     }
 
     fn pop_text_style(&mut self) {
@@ -4856,6 +5106,26 @@ mod tests {
         cx.update(|_window, cx| {
             assert!(markdown.read(cx).context_menu_link().is_none());
         });
+    }
+
+    #[gpui::test]
+    fn links_without_a_handler_only_reach_the_os_when_allowlisted(cx: &mut TestAppContext) {
+        for refused in [
+            "calc.exe",
+            "ms-msdt:/id x",
+            "search-ms:query=a",
+            "vscode://x",
+            "file:///etc/hosts",
+            "javascript:alert(1)",
+        ] {
+            cx.update(|cx| open_allowlisted_link(refused, cx));
+            assert_eq!(cx.opened_url(), None, "{refused:?} reached the OS opener");
+        }
+
+        for allowed in ["https://example.com", "mailto:user@example.com"] {
+            cx.update(|cx| open_allowlisted_link(allowed, cx));
+            assert_eq!(cx.opened_url().as_deref(), Some(allowed));
+        }
     }
 
     #[track_caller]

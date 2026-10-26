@@ -1970,7 +1970,9 @@ impl BufferDiff {
                     }
                     let edited_base_text =
                         this.base_text_buffer.update(cx, |base_text_buffer, cx| {
-                            base_text_buffer.set_line_ending(base_text_diff.line_ending, cx);
+                            if let Some(line_endings) = &base_text_diff.line_endings {
+                                base_text_buffer.set_line_ending(line_endings.first, cx);
+                            }
                             assert!(base_text_buffer.version() == base_text_diff.base_version);
                             base_text_buffer.snapshot_with_edits(base_text_diff.edits, cx)
                         });

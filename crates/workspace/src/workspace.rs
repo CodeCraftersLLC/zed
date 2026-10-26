@@ -62,10 +62,11 @@ use futures::{
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis, Bounds,
     Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
-    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
-    SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds, WindowHandle,
-    WindowId, WindowOptions, actions, canvas, point, relative, size, transparent_black,
+    Focusable, Global, HitboxBehavior, Hsla, ImageSource, KeyContext, Keystroke, ManagedView,
+    MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
+    Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds,
+    WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
+    transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
@@ -149,7 +150,7 @@ use ui::{Window, prelude::*};
 use url::Url;
 use util::{
     ResultExt, TryFutureExt,
-    paths::{PathStyle, SanitizedPath},
+    paths::{PathStyle, SanitizedPath, UrlExt as _},
     rel_path::RelPath,
     serde::default_true,
 };
@@ -1341,6 +1342,15 @@ type PromptForOpenPath = Box<
     ) -> oneshot::Receiver<Option<Vec<PathBuf>>>,
 >;
 
+/// Host hook for links handed to [`Workspace::open_url_or_file`]: the link text, the folder
+/// relative links resolve against, and whether the host took the link. A host that returns
+/// `false` leaves the link to the default allowlisted handling.
+pub type UrlOpener = Rc<dyn Fn(&str, Option<&Path>, &mut Window, &mut Context<Workspace>) -> bool>;
+
+/// Host hook for Markdown preview images: the image destination and the folder of the
+/// previewed document. The previews never fall back to their own resolver once one is set.
+pub type MarkdownImageResolver = Rc<dyn Fn(&str, Option<&Path>) -> Option<ImageSource>>;
+
 #[derive(Default)]
 struct DispatchingKeystrokes {
     dispatched: HashSet<Vec<Keystroke>>,
@@ -1400,6 +1410,8 @@ pub struct Workspace {
     bounds_save_task_queued: Option<Task<()>>,
     on_prompt_for_new_path: Option<PromptForNewPath>,
     on_prompt_for_open_path: Option<PromptForOpenPath>,
+    url_opener: Option<UrlOpener>,
+    markdown_image_resolver: Option<MarkdownImageResolver>,
     terminal_provider: Option<Box<dyn TerminalProvider>>,
     debugger_provider: Option<Arc<dyn DebuggerProvider>>,
     serializable_items_tx: UnboundedSender<Box<dyn SerializableItemHandle>>,
@@ -1854,6 +1866,8 @@ impl Workspace {
             bounds_save_task_queued: None,
             on_prompt_for_new_path: None,
             on_prompt_for_open_path: None,
+            url_opener: None,
+            markdown_image_resolver: None,
             terminal_provider: None,
             debugger_provider: None,
             serializable_items_tx,
@@ -2961,6 +2975,24 @@ impl Workspace {
 
     pub fn set_prompt_for_open_path(&mut self, prompt: PromptForOpenPath) {
         self.on_prompt_for_open_path = Some(prompt)
+    }
+
+    pub fn set_url_opener(
+        &mut self,
+        opener: impl Fn(&str, Option<&Path>, &mut Window, &mut Context<Workspace>) -> bool + 'static,
+    ) {
+        self.url_opener = Some(Rc::new(opener));
+    }
+
+    pub fn set_markdown_image_resolver(
+        &mut self,
+        resolver: impl Fn(&str, Option<&Path>) -> Option<ImageSource> + 'static,
+    ) {
+        self.markdown_image_resolver = Some(Rc::new(resolver));
+    }
+
+    pub fn markdown_image_resolver(&self) -> Option<MarkdownImageResolver> {
+        self.markdown_image_resolver.clone()
     }
 
     pub fn set_terminal_provider(&mut self, provider: impl TerminalProvider + 'static) {
@@ -4712,13 +4744,16 @@ impl Workspace {
 
     /// Opens a URL or file path, intelligently routing to the appropriate handler:
     ///
-    /// - `http://` and `https://` URLs are opened in the system's default browser
+    /// - An installed [`UrlOpener`] sees the link first and may take it
+    /// - `http://`, `https://` and `mailto:` URLs are opened with the system's default handler
     /// - `file://` URIs are opened as files in the editor
     /// - Paths without a URL scheme are treated as file paths:
     ///   - Absolute paths are opened directly
     ///   - Relative paths are first resolved against `base_path` (if provided),
     ///     then against visible project worktrees
-    /// - Other URI schemes (e.g., `mailto:`, `vscode:`) are passed to the system handler
+    /// - Every other URI scheme, and every name that does not resolve to a project file,
+    ///   is logged and dropped. Nothing here hands an unresolved string to the OS, where
+    ///   it could be executed (`calc.exe`) or routed to a protocol handler (`ms-msdt:`).
     ///
     /// # Arguments
     /// * `url_or_path` - The URL or file path to open
@@ -4736,9 +4771,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut open_abs_path = |this: &mut Self, path, cx: &mut _| {
-            let url_or_path = url_or_path.to_owned();
-            let task = this.open_abs_path(
+        if let Some(opener) = self.url_opener.clone()
+            && opener(url_or_path, base_path, window, cx)
+        {
+            return;
+        }
+
+        let mut open_abs_path = |this: &mut Self, path: PathBuf, cx: &mut Context<Self>| {
+            this.open_abs_path(
                 path,
                 OpenOptions {
                     visible: Some(OpenVisible::None),
@@ -4746,32 +4786,31 @@ impl Workspace {
                 },
                 window,
                 cx,
-            );
-            (**cx)
-                .spawn(async move |cx| {
-                    if let Err(_) = task.await {
-                        cx.update(|cx| cx.open_url(&url_or_path));
-                    }
-                })
-                .detach();
+            )
+            .detach_and_log_err(cx);
         };
 
-        if let Ok(url) = Url::parse(url_or_path) {
-            match url.scheme() {
-                "http" | "https" => cx.open_url(url_or_path),
-                "file" => open_abs_path(self, PathBuf::from(url.path()), cx),
-                _ => cx.open_url(url_or_path),
-            }
-            return;
-        }
-
-        // Not a valid URL - treat as a file path
         let project = self.project();
         let path_style = project.read(cx).path_style(cx);
 
-        // If it's an absolute path, open it directly
+        // Checked before URL parsing: a Windows drive path such as `C:\a.md` parses as a URL
+        // whose scheme is `c`.
         if path_style.is_absolute(url_or_path) {
             open_abs_path(self, PathBuf::from(url_or_path), cx);
+            return;
+        }
+
+        if let Ok(url) = Url::parse(url_or_path) {
+            match url.scheme() {
+                "file" => match url.to_file_path_ext(path_style) {
+                    Ok(path) => open_abs_path(self, path, cx),
+                    Err(()) => log::warn!("not opening {url_or_path:?}: it is not a local file"),
+                },
+                scheme if util::markdown::is_os_openable_scheme(scheme) => cx.open_url(url_or_path),
+                scheme => log::warn!(
+                    "not opening a link with the {scheme:?} scheme: only http, https, mailto and file links are followed"
+                ),
+            }
             return;
         }
 
@@ -4795,21 +4834,14 @@ impl Workspace {
         if let Some(project_path) =
             project.update(cx, |project, cx| project.find_project_path(url_or_path, cx))
         {
-            let url_or_path = url_or_path.to_owned();
-            let task = self.open_path(project_path, None, true, window, cx);
-            (**cx)
-                .spawn(async move |cx| {
-                    if let Err(_) = task.await {
-                        cx.update(|cx| cx.open_url(&url_or_path));
-                    }
-                })
-                .detach();
+            self.open_path(project_path, None, true, window, cx)
+                .detach_and_log_err(cx);
             return;
         }
 
-        // Couldn't resolve as a file path - try opening as URL anyway
-        // (the OS might be able to handle it)
-        cx.open_url(url_or_path);
+        log::warn!(
+            "not opening {url_or_path:?}: it is not a project file or an http, https, mailto or file link"
+        );
     }
 
     pub fn split_path(
@@ -15511,6 +15543,9 @@ mod tests {
         // Model
         struct TestPngItem {}
 
+        /// The paths a PNG item was asked to open, newest last.
+        static PNG_PATHS_TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
         impl project::ProjectItem for TestPngItem {
             fn try_open(
                 _project: &Entity<Project>,
@@ -15518,6 +15553,10 @@ mod tests {
                 cx: &mut App,
             ) -> Option<Task<anyhow::Result<Entity<Self>>>> {
                 if path.path.extension().unwrap() == "png" {
+                    PNG_PATHS_TRIED
+                        .lock()
+                        .unwrap()
+                        .push(path.path.as_unix_str().to_string());
                     Some(cx.spawn(async move |cx| Ok(cx.new(|_| TestPngItem {}))))
                 } else {
                     None
@@ -15763,6 +15802,32 @@ mod tests {
                 })
                 .await;
             assert!(handle.is_err());
+        }
+
+        #[cfg(unix)]
+        #[gpui::test]
+        async fn test_open_url_or_file_opens_a_file_url_by_the_path_it_names(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            cx.update(|cx| register_project_item::<TestPngItemView>(cx));
+
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree("/root1", json!({ "my picture.png": "BINARYDATAHERE" }))
+                .await;
+            let project = Project::test(fs, ["/root1".as_ref()], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_url_or_file("file:///root1/my%20picture.png", None, window, cx);
+            });
+            cx.run_until_parked();
+
+            // The percent-escape is decoded: the file is "my picture.png", not "my%20picture.png".
+            let tried = PNG_PATHS_TRIED.lock().unwrap().clone();
+            assert!(tried.contains(&"my picture.png".to_string()), "{tried:?}");
+            assert!(!tried.iter().any(|path| path.contains("%20")), "{tried:?}");
         }
 
         #[gpui::test]
@@ -16399,7 +16464,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_open_url_or_file_routes_urls(cx: &mut TestAppContext) {
+    async fn open_url_or_file_never_reaches_the_os_for_unresolved_names_or_unlisted_schemes(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -16418,28 +16485,138 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        // Test opening an HTTPS URL - should go to open_url
+        for refused in [
+            "nonexistent.txt",
+            "calc.exe",
+            "ms-msdt:/id x",
+            "search-ms:query=a",
+            "vscode://x",
+            "ftp://h/x",
+            "javascript:alert(1)",
+            "file:///nope",
+        ] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_url_or_file(refused, None, window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.opened_url(), None, "{refused:?} reached the OS opener");
+        }
+
+        for listed in [
+            "https://example.com",
+            "http://example.com",
+            "mailto:test@example.com",
+        ] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_url_or_file(listed, None, window, cx);
+            });
+            assert_eq!(cx.opened_url(), Some(listed.to_string()));
+        }
+    }
+
+    #[gpui::test]
+    async fn open_url_or_file_hands_every_link_to_an_installed_opener(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "file.txt": "content" }))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        workspace.update(cx, |workspace, _| {
+            let seen = seen.clone();
+            workspace.set_url_opener(move |link, base, _, _| {
+                seen.borrow_mut()
+                    .push((link.to_string(), base.map(Path::to_path_buf)));
+                true
+            });
+        });
+
+        let base = PathBuf::from(path!("/root/docs"));
+        let links = [
+            "https://example.com",
+            "mailto:test@example.com",
+            "calc.exe",
+            "file.txt",
+            "file:///nope",
+        ];
+        for link in links {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_url_or_file(link, Some(&base), window, cx);
+            });
+        }
+        cx.run_until_parked();
+
+        assert_eq!(
+            *seen.borrow(),
+            links
+                .map(|link| (link.to_string(), Some(base.clone())))
+                .to_vec()
+        );
+        assert_eq!(cx.opened_url(), None);
+    }
+
+    #[gpui::test]
+    async fn open_url_or_file_falls_back_to_the_allowlist_when_the_opener_declines(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "file.txt": "content" }))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        workspace.update(cx, |workspace, _| {
+            workspace.set_url_opener(|_, _, _, _| false);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_url_or_file("calc.exe", None, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url(), None);
+
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.open_url_or_file("https://example.com", None, window, cx);
         });
         assert_eq!(cx.opened_url(), Some("https://example.com".to_string()));
+    }
 
-        // Test opening an HTTP URL - should go to open_url
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.open_url_or_file("http://example.com", None, window, cx);
-        });
-        assert_eq!(cx.opened_url(), Some("http://example.com".to_string()));
+    #[gpui::test]
+    async fn a_markdown_image_resolver_is_stored_and_shared(cx: &mut TestAppContext) {
+        init_test(cx);
 
-        // Test opening other URI schemes - should go to open_url
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.open_url_or_file("mailto:test@example.com", None, window, cx);
-        });
-        assert_eq!(cx.opened_url(), Some("mailto:test@example.com".to_string()));
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        // Test opening a path that doesn't exist and doesn't match project - should fallback to open_url
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.open_url_or_file("nonexistent.txt", None, window, cx);
+        assert!(workspace.read_with(cx, |workspace, _| {
+            workspace.markdown_image_resolver().is_none()
+        }));
+
+        let docs = PathBuf::from(path!("/root/docs"));
+        workspace.update(cx, |workspace, _| {
+            workspace.set_markdown_image_resolver(|dest_url, base| {
+                (dest_url == "pic.png" && base.is_some()).then(|| {
+                    ImageSource::Resource(gpui::Resource::Path(Arc::from(Path::new(
+                        "/host/pic.png",
+                    ))))
+                })
+            });
         });
-        assert_eq!(cx.opened_url(), Some("nonexistent.txt".to_string()));
+
+        let resolver = workspace
+            .read_with(cx, |workspace, _| workspace.markdown_image_resolver())
+            .expect("resolver is installed");
+        assert!(resolver("pic.png", Some(&docs)).is_some());
+        assert!(resolver("pic.png", None).is_none());
+        assert!(resolver("https://example.com/pic.png", Some(&docs)).is_none());
     }
 }

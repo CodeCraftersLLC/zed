@@ -15,10 +15,9 @@ use crate::{
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
-    transparent_black,
+    TextStyleRefinement, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -60,6 +59,7 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+mod frame_interval;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
@@ -1467,25 +1467,19 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
-                let thermal_state = handle
-                    .update(&mut cx, |_, _, cx| cx.thermal_state())
-                    .log_err();
-
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let min_frame_interval = if !request_frame_options.force_render
-                    && !request_frame_options.require_presentation
-                    && next_frame_callbacks.borrow().is_empty()
-                {
-                    None
-                } else if !active.get() {
-                    Some(Duration::from_micros(33333))
-                } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
-                    Some(Duration::from_micros(16667))
-                } else {
-                    None
-                };
+                let min_frame_interval = frame_interval::min_frame_interval(
+                    request_frame_options,
+                    !next_frame_callbacks.borrow().is_empty(),
+                    active.get(),
+                    || {
+                        handle
+                            .update(&mut cx, |_, _, cx| cx.thermal_state())
+                            .log_err()
+                    },
+                );
 
                 let now = Instant::now();
                 if let Some(min_interval) = min_frame_interval {
@@ -2352,6 +2346,14 @@ impl Window {
     /// Returns which window controls are currently visible (Wayland)
     pub fn window_controls(&self) -> WindowControls {
         self.platform_window.window_controls()
+    }
+
+    /// Makes `bounds` readable as [`crate::VisualTestContext::debug_bounds`]`(selector)`
+    /// once this frame is drawn, for elements that paint without a `Div` to put a
+    /// `debug_selector` on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_debug_bounds(&mut self, selector: impl Into<String>, bounds: Bounds<Pixels>) {
+        self.next_frame.debug_bounds.insert(selector.into(), bounds);
     }
 
     /// Updates the window's title at the platform level.

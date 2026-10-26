@@ -30,6 +30,12 @@ pub struct TabularDataPreviewFeatureFlag;
 impl FeatureFlag for TabularDataPreviewFeatureFlag {
     const NAME: &'static str = "tabular-data-preview";
     type Value = PresenceFlag;
+
+    /// A build with no flag store resolves a flag that is not enabled for all to "on" only in a
+    /// debug build, which left the preview button dead in release builds.
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 register_feature_flag!(TabularDataPreviewFeatureFlag);
 
@@ -329,5 +335,18 @@ impl ColumnWidths {
                 )
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flags resolve differently in debug and release builds when no flag store is installed, as
+    /// in an embedding that has no server to ask. A flag the embedding relies on must not depend
+    /// on that: it is enabled for all, in every profile.
+    #[test]
+    fn the_csv_preview_flag_is_enabled_for_all() {
+        assert!(<TabularDataPreviewFeatureFlag as FeatureFlag>::enabled_for_all());
     }
 }

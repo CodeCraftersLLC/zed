@@ -7,7 +7,7 @@ use futures::{AsyncWriteExt, try_join};
 use serde::{Deserialize, Serialize};
 use smol::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use std::ops::Range;
-use text::{LineEnding, Rope};
+use text::{LineEndings, Rope};
 use time::OffsetDateTime;
 use time::UtcOffset;
 use time::macros::format_description;
@@ -24,9 +24,9 @@ impl Blame {
         git: &GitBinary,
         path: &RepoPath,
         content: &Rope,
-        line_ending: LineEnding,
+        line_endings: &LineEndings,
     ) -> Result<Self> {
-        let mut entries = run_git_blame(git, path, content, line_ending).await?;
+        let mut entries = run_git_blame(git, path, content, line_endings).await?;
 
         let mut unique_shas = HashSet::default();
 
@@ -52,7 +52,7 @@ async fn run_git_blame(
     git: &GitBinary,
     path: &RepoPath,
     contents: &Rope,
-    line_ending: LineEnding,
+    line_endings: &LineEndings,
 ) -> Result<Vec<BlameEntry>> {
     let mut child = {
         let span = ztracing::debug_span!("spawning git-blame command", path = path.as_unix_str());
@@ -81,7 +81,7 @@ async fn run_git_blame(
         .context("failed to get stderr from git blame command")?;
 
     let write_stdin = async move {
-        for chunk in text::chunks_with_line_ending(contents, line_ending) {
+        for chunk in text::chunks_with_line_endings(contents, line_endings) {
             stdin.write_all(chunk.as_bytes()).await?;
         }
         stdin.flush().await.map_err(Into::into)

@@ -396,7 +396,7 @@ impl LocalBufferStore {
         let buffer = buffer_handle.read(cx);
 
         let text = buffer.as_rope().clone();
-        let line_ending = buffer.line_ending();
+        let line_endings = buffer.line_endings();
         let encoding = buffer.encoding();
         let has_bom = buffer.has_bom();
         let version = buffer.version();
@@ -410,7 +410,7 @@ impl LocalBufferStore {
         }
 
         let save = worktree.update(cx, |worktree, cx| {
-            worktree.write_file(path, text, line_ending, encoding, has_bom, cx)
+            worktree.write_file(path, text, line_endings, encoding, has_bom, cx)
         });
 
         cx.spawn(async move |this, cx| {

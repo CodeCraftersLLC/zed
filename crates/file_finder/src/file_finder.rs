@@ -64,6 +64,17 @@ actions!(
 
 impl ModalView for FileFinder {}
 
+/// Decides whether the name typed after "Create file" may be created, and says why when it may not.
+struct NewNameValidator(project_panel::NameValidator);
+
+impl gpui::Global for NewNameValidator {}
+
+/// Installs the check "Create file" runs on the typed path before it opens a new, unsaved buffer
+/// for it. The project panel's inline name check takes the same function.
+pub fn set_new_name_validator(validator: project_panel::NameValidator, cx: &mut App) {
+    cx.set_global(NewNameValidator(validator));
+}
+
 pub struct FileFinder {
     picker: Entity<Picker<FileFinderDelegate>>,
     picker_focus_handle: FocusHandle,
@@ -286,7 +297,13 @@ impl FileFinder {
                         }
                     }
                     Match::Search(m) => project_path_for_search_match(&delegate.project, &m.0, cx),
-                    Match::CreateNew(p) => p.clone(),
+                    Match::CreateNew(p) => {
+                        if let Some(problem) = delegate.new_name_problem(p, cx) {
+                            workspace.update(cx, |workspace, cx| workspace.show_error(problem, cx));
+                            return;
+                        }
+                        p.clone()
+                    }
                     Match::Channel { .. } => return,
                 };
                 let open_task = workspace.update(cx, move |workspace, cx| {
@@ -1444,6 +1461,12 @@ impl FileFinderDelegate {
         })
     }
 
+    /// Why `project_path` cannot be created as a new file, if it cannot.
+    fn new_name_problem(&self, project_path: &ProjectPath, cx: &App) -> Option<String> {
+        let validator = cx.try_global::<NewNameValidator>()?;
+        (validator.0)(project_path.path.as_unix_str())
+    }
+
     /// Skips first history match (that is displayed topmost) if it's currently opened.
     fn calculate_selected_index(&self, cx: &mut Context<Picker<Self>>) -> usize {
         if FileFinderSettings::get_global(cx).skip_focus_for_active_in_search
@@ -1490,6 +1513,14 @@ impl FileFinderDelegate {
             let finder = self.file_finder.clone();
             window.dispatch_action(OpenChannelNotesById { channel_id }.boxed_clone(), cx);
             finder.update(cx, |_, cx| cx.emit(DismissEvent)).log_err();
+            return;
+        }
+
+        // A name that cannot be created is refused here, not when the empty buffer is first saved.
+        if let Match::CreateNew(project_path) = &m
+            && let Some(problem) = self.new_name_problem(project_path, cx)
+        {
+            workspace.update(cx, |workspace, cx| workspace.show_error(problem, cx));
             return;
         }
 
@@ -1638,6 +1669,15 @@ impl PickerDelegate for FileFinderDelegate {
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search project files...".into()
+    }
+
+    fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
+        Some(if self.latest_search_query.is_none() {
+            // Nothing typed and nothing recently opened: an empty list is not a miss.
+            "Type to search the project's files".into()
+        } else {
+            "No matches".into()
+        })
     }
 
     fn searchbar_trailer(
@@ -1838,6 +1878,11 @@ impl PickerDelegate for FileFinderDelegate {
         let m = self.matches.get(self.selected_index)?;
         match m {
             Match::CreateNew(project_path) => {
+                if let Some(problem) = self.new_name_problem(project_path, cx) {
+                    let mut message = picker::HighlightedTextBuilder::default();
+                    message.push_plain(problem);
+                    return Some(picker::PreviewUpdate::message(message.build()));
+                }
                 let path_style = self.project.read(cx).path_style(cx);
                 let path_highlight = gpui::HighlightStyle {
                     color: Some(cx.theme().colors().text_accent),

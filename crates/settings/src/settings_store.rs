@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use collections::{BTreeMap, HashMap, TypeIdHashMap, btree_map, hash_map};
+use collections::{BTreeMap, BTreeSet, HashMap, TypeIdHashMap, btree_map, hash_map};
 use fs::Fs;
 use futures::{
     FutureExt, StreamExt,
@@ -158,6 +158,7 @@ pub struct SettingsStore {
     last_user_settings_content: Option<String>,
     last_global_settings_content: Option<String>,
     local_settings: BTreeMap<(WorktreeId, Arc<RelPath>), SettingsContent>,
+    ignore_local_settings: bool,
     pub editorconfig_store: Entity<EditorconfigStore>,
 
     _settings_files_watcher: Option<Task<()>>,
@@ -319,6 +320,7 @@ impl SettingsStore {
             last_user_settings_content: None,
             last_global_settings_content: None,
             local_settings: BTreeMap::default(),
+            ignore_local_settings: false,
             editorconfig_store: cx.new(|_| EditorconfigStore::default()),
             _settings_files_watcher: None,
             setting_file_updates_tx,
@@ -1030,6 +1032,39 @@ impl SettingsStore {
         self.language_semantic_token_rules.get(language)
     }
 
+    /// Whether files a project carries (`.zed/settings.json`, `.editorconfig`, tasks)
+    /// are kept out of this store. See [`Self::set_ignore_local_settings`].
+    pub fn ignore_local_settings(&self) -> bool {
+        self.ignore_local_settings
+    }
+
+    /// Makes the store disregard every settings source a project brings along:
+    /// `.zed/settings.json` and `.editorconfig` (including parent directories'),
+    /// whatever their origin. A repository can otherwise change how files are saved
+    /// and which formatters, language servers and binaries run, for an embedder
+    /// that has no trust prompt. Only user, global and default settings remain.
+    ///
+    /// The settings and editorconfig data already loaded are dropped. Turning this off again
+    /// does not restore them; the files are read again when they next change. The tasks and
+    /// debug scenarios a project carries are not held here: its settings observer stops reading
+    /// them, but ones it has already read stay in its task store. An embedder that ignores
+    /// local settings sets this before it opens a project.
+    pub fn set_ignore_local_settings(&mut self, ignore: bool, cx: &mut App) {
+        self.ignore_local_settings = ignore;
+        if !ignore {
+            return;
+        }
+        let worktree_ids: BTreeSet<WorktreeId> = self
+            .local_settings
+            .keys()
+            .map(|(worktree_id, _)| *worktree_id)
+            .chain(self.editorconfig_store.read(cx).worktree_ids())
+            .collect();
+        for worktree_id in worktree_ids {
+            self.clear_local_settings(worktree_id, cx).log_err();
+        }
+    }
+
     /// Add or remove a set of local settings via a JSON string.
     pub fn set_local_settings(
         &mut self,
@@ -1039,6 +1074,14 @@ impl SettingsStore {
         settings_content: Option<&str>,
         cx: &mut App,
     ) -> std::result::Result<(), InvalidSettingsError> {
+        if self.ignore_local_settings
+            && matches!(
+                kind,
+                LocalSettingsKind::Settings | LocalSettingsKind::Editorconfig
+            )
+        {
+            return Ok(());
+        }
         let content = settings_content
             .map(|content| content.trim())
             .filter(|content| !content.is_empty());
@@ -2752,6 +2795,121 @@ mod tests {
             store.get_value_from_file(SettingsFile::Project(local_1_child), get),
             (SettingsFile::Project(local_1), Some(&1))
         );
+    }
+
+    const PROJECT_LINE_LENGTH_SETTINGS: &str = r#"{"preferred_line_length": 3}"#;
+    const PROJECT_EDITORCONFIG: &str = "[*]\ntrim_trailing_whitespace = true\n";
+
+    fn project_line_length(store: &SettingsStore, worktree_id: WorktreeId) -> u32 {
+        store
+            .get::<DefaultLanguageSettings>(Some(SettingsLocation {
+                worktree_id,
+                path: RelPath::empty(),
+            }))
+            .preferred_line_length
+    }
+
+    fn load_project_files(
+        store: &mut SettingsStore,
+        worktree_id: WorktreeId,
+        cx: &mut App,
+    ) -> std::result::Result<(), InvalidSettingsError> {
+        store.set_local_settings(
+            worktree_id,
+            LocalSettingsPath::InWorktree(RelPath::empty_arc()),
+            LocalSettingsKind::Settings,
+            Some(PROJECT_LINE_LENGTH_SETTINGS),
+            cx,
+        )?;
+        store.set_local_settings(
+            worktree_id,
+            LocalSettingsPath::InWorktree(RelPath::empty_arc()),
+            LocalSettingsKind::Editorconfig,
+            Some(PROJECT_EDITORCONFIG),
+            cx,
+        )
+    }
+
+    fn editorconfig_worktrees(store: &SettingsStore, cx: &App) -> Vec<WorktreeId> {
+        store.editorconfig_store.read(cx).test_state().0
+    }
+
+    #[gpui::test]
+    fn test_project_files_apply_unless_local_settings_are_ignored(cx: &mut App) {
+        let worktree_id = WorktreeId::from_usize(0);
+        let mut store = SettingsStore::new(cx, &test_settings());
+        store.register_setting::<DefaultLanguageSettings>();
+        let default_line_length = project_line_length(&store, worktree_id);
+
+        load_project_files(&mut store, worktree_id, cx).unwrap();
+
+        assert_eq!(project_line_length(&store, worktree_id), 3);
+        assert_eq!(editorconfig_worktrees(&store, cx), vec![worktree_id]);
+        assert_ne!(default_line_length, 3);
+    }
+
+    #[gpui::test]
+    fn test_ignored_local_settings_keep_project_files_out_of_the_store(cx: &mut App) {
+        let worktree_id = WorktreeId::from_usize(0);
+        let mut store = SettingsStore::new(cx, &test_settings());
+        store.register_setting::<DefaultLanguageSettings>();
+        let default_line_length = project_line_length(&store, worktree_id);
+        store.set_ignore_local_settings(true, cx);
+
+        load_project_files(&mut store, worktree_id, cx).unwrap();
+
+        assert_eq!(
+            project_line_length(&store, worktree_id),
+            default_line_length
+        );
+        assert!(editorconfig_worktrees(&store, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn test_ignoring_local_settings_drops_what_was_already_loaded(cx: &mut App) {
+        let worktree_id = WorktreeId::from_usize(0);
+        let mut store = SettingsStore::new(cx, &test_settings());
+        store.register_setting::<DefaultLanguageSettings>();
+        let default_line_length = project_line_length(&store, worktree_id);
+        load_project_files(&mut store, worktree_id, cx).unwrap();
+        assert_eq!(project_line_length(&store, worktree_id), 3);
+
+        store.set_ignore_local_settings(true, cx);
+
+        assert_eq!(
+            project_line_length(&store, worktree_id),
+            default_line_length
+        );
+        assert!(editorconfig_worktrees(&store, cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_ignoring_local_settings_cancels_a_discovery_in_flight(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/repo"),
+            serde_json::json!({ ".editorconfig": "[*]\n", "sub": {} }),
+        )
+        .await;
+        let worktree_id = WorktreeId::from_usize(0);
+        let mut store = cx.update(|cx| SettingsStore::new(cx, &test_settings()));
+
+        cx.update(|cx| {
+            store.editorconfig_store.update(cx, |editorconfig, cx| {
+                editorconfig.discover_local_external_configs_chain(
+                    worktree_id,
+                    std::path::Path::new(util::path!("/repo/sub")).into(),
+                    fs.clone(),
+                    cx,
+                )
+            });
+            store.set_ignore_local_settings(true, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| assert!(editorconfig_worktrees(&store, cx).is_empty()));
     }
 
     #[gpui::test]

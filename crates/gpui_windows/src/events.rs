@@ -172,12 +172,16 @@ impl WindowsWindowInner {
     }
 
     fn handle_size_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        let kind = size_kind_name(wparam.0);
         // Don't resize the renderer when the window is minimized, but record that it was minimized so
         // that on restore the swap chain can be recreated via `update_drawable_size_even_if_unchanged`.
         if wparam.0 == SIZE_MINIMIZED as usize {
             self.state
                 .restore_from_minimized
                 .set(self.state.callbacks.request_frame.take());
+            log::info!(
+                "WM_SIZE kind={kind}: renderer resize deferred until the window is restored"
+            );
             return Some(0);
         }
 
@@ -196,6 +200,19 @@ impl WindowsWindowInner {
             should_resize_renderer = true;
         }
 
+        // A drag resize sends SIZE_RESTORED for every step, so only the rarer kinds
+        // are logged at info; `ZED_LOG=gpui_windows=debug` shows them all.
+        let level = if wparam.0 == SIZE_RESTORED as usize {
+            log::Level::Debug
+        } else {
+            log::Level::Info
+        };
+        log::log!(
+            level,
+            "WM_SIZE kind={kind} client={width}x{height} scale={scale_factor} \
+             renderer_resize={should_resize_renderer}"
+        );
+
         self.handle_size_change(new_size, scale_factor, should_resize_renderer);
         Some(0)
     }
@@ -212,7 +229,7 @@ impl WindowsWindowInner {
         if should_resize_renderer
             && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
         {
-            log::error!("Failed to resize renderer, invalidating devices: {}", e);
+            log::error!("Failed to resize renderer, invalidating devices: {e:#}");
             self.state
                 .invalidate_devices
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -1679,5 +1696,16 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+fn size_kind_name(wparam: usize) -> &'static str {
+    match wparam as u32 {
+        SIZE_RESTORED => "restored",
+        SIZE_MINIMIZED => "minimized",
+        SIZE_MAXIMIZED => "maximized",
+        SIZE_MAXSHOW => "maxshow",
+        SIZE_MAXHIDE => "maxhide",
+        _ => "unknown",
     }
 }

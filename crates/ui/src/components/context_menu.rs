@@ -476,6 +476,19 @@ impl ContextMenu {
         cx.notify();
     }
 
+    /// The labels of the entries and submenus, in order, for tests that check what a menu offers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn entry_labels(&self) -> Vec<SharedString> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                ContextMenuItem::Entry(entry) => Some(entry.label.clone()),
+                ContextMenuItem::Submenu { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn context(mut self, focus: FocusHandle) -> Self {
         self.action_context = Some(focus);
         self

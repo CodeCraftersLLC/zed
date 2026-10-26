@@ -1,17 +1,24 @@
 use std::ops::Range;
 
 use gpui::{
-    App, FontStyle, FontWeight, StrikethroughStyle, TextAlign, TextStyleRefinement, UnderlineStyle,
+    App, ElementId, FontStyle, FontWeight, Role, StrikethroughStyle, TextAlign,
+    TextStyleRefinement, UnderlineStyle,
 };
 use pulldown_cmark::Alignment;
 use ui::prelude::*;
 
 use crate::html::html_parser::{
     HtmlHighlightStyle, HtmlImage, HtmlParagraph, HtmlParagraphChunk, ParsedHtmlBlock,
-    ParsedHtmlElement, ParsedHtmlList, ParsedHtmlListItemType, ParsedHtmlTable, ParsedHtmlTableRow,
-    ParsedHtmlText,
+    ParsedHtmlDetails, ParsedHtmlElement, ParsedHtmlList, ParsedHtmlListItemType, ParsedHtmlTable,
+    ParsedHtmlTableRow, ParsedHtmlText,
 };
 use crate::{MarkdownElement, MarkdownElementBuilder};
+
+/// The element id of a `<details>` region, `(block offset, ordinal)`. The two numbers stay apart,
+/// so no two regions share an id however many `<details>` one block opens.
+fn details_element_id((start, ordinal): (usize, usize)) -> ElementId {
+    ElementId::named_usize(format!("html-details-{ordinal}"), start)
+}
 
 pub(crate) struct HtmlSourceAllocator {
     source_range: Range<usize>,
@@ -40,13 +47,16 @@ impl MarkdownElement {
     pub(crate) fn render_html_block(
         &self,
         block: &ParsedHtmlBlock,
+        closed_through: Option<usize>,
         builder: &mut MarkdownElementBuilder,
         markdown_end: usize,
         cx: &mut App,
     ) {
-        let mut source_allocator = HtmlSourceAllocator::new(block.source_range.clone());
+        let shown_from = block.elements_source_start(closed_through);
+        let mut source_allocator =
+            HtmlSourceAllocator::new(shown_from..block.source_range.end.max(shown_from));
         self.render_html_elements(
-            &block.children,
+            block.elements(closed_through),
             &mut source_allocator,
             builder,
             markdown_end,
@@ -138,6 +148,86 @@ impl MarkdownElement {
             ParsedHtmlElement::Image(image) => {
                 self.render_html_image(image, builder);
             }
+            ParsedHtmlElement::Details(details) => {
+                self.render_html_details(details, source_allocator, builder, markdown_end, cx);
+            }
+        }
+    }
+
+    /// The summary line of a `<details>`, which toggles it, and its body while it is open.
+    fn render_html_details(
+        &self,
+        details: &ParsedHtmlDetails,
+        source_allocator: &mut HtmlSourceAllocator,
+        builder: &mut MarkdownElementBuilder,
+        markdown_end: usize,
+        cx: &mut App,
+    ) {
+        let region = (details.source_range.start, details.ordinal);
+        let is_open = self.markdown.read(cx).is_details_open(region, details.open);
+        let markdown = self.markdown.clone();
+
+        builder.push_div(
+            h_flex()
+                .id(details_element_id(region))
+                .role(Role::DisclosureTriangle)
+                .aria_expanded(is_open)
+                .tab_index(0)
+                .gap_1()
+                .items_start()
+                .mb_2()
+                .rounded_sm()
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .focus_visible(|style| style.border_color(cx.theme().colors().border_focused))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    markdown.update(cx, |markdown, cx| {
+                        markdown.toggle_details(region);
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(if is_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+                ),
+            &details.source_range,
+            markdown_end,
+        );
+        builder.push_div(
+            div().flex_1().min_w_0(),
+            &details.source_range,
+            markdown_end,
+        );
+        builder.push_text_style(TextStyleRefinement {
+            font_weight: Some(FontWeight::SEMIBOLD),
+            ..Default::default()
+        });
+        if details.summary.is_empty() {
+            let start = details.source_range.start;
+            builder.push_text("Details", start..start);
+        } else {
+            self.render_html_paragraph(
+                &details.summary,
+                source_allocator,
+                builder,
+                cx,
+                markdown_end,
+            );
+        }
+        builder.pop_text_style();
+        builder.pop_div();
+        builder.pop_div();
+
+        if is_open && !details.body.is_empty() {
+            builder.push_div(div().pl_5(), &details.source_range, markdown_end);
+            self.render_html_elements(&details.body, source_allocator, builder, markdown_end, cx);
+            builder.pop_div();
         }
     }
 
@@ -549,6 +639,19 @@ mod tests {
         CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownOptions,
         MarkdownStyle,
     };
+
+    #[test]
+    fn details_regions_never_share_an_element_id() {
+        // Under `start * 64 + ordinal` these two were the same number.
+        assert_ne!(
+            super::details_element_id((0, 64)),
+            super::details_element_id((1, 0))
+        );
+        assert_eq!(
+            super::details_element_id((7, 2)),
+            super::details_element_id((7, 2))
+        );
+    }
 
     fn ensure_theme_initialized(cx: &mut TestAppContext) {
         cx.update(|cx| {

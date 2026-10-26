@@ -8,8 +8,8 @@ use futures::{StreamExt, channel::oneshot};
 use gpui::{
     App, AsyncApp, Context, Entity, EventEmitter, Img, Subscription, Task, WeakEntity, prelude::*,
 };
+use image::ExtendedColorType;
 pub use image::ImageFormat;
-use image::{ExtendedColorType, GenericImageView, ImageReader};
 use language::{DiskState, File};
 use rpc::{AnyProtoClient, ErrorExt as _, TypedEnvelope, proto};
 use std::num::NonZeroU64;
@@ -110,19 +110,16 @@ pub struct ImageItem {
 impl ImageItem {
     pub fn compute_metadata_from_bytes(image_bytes: &[u8]) -> Result<ImageMetadata> {
         let image_format = image::guess_format(image_bytes)?;
-
-        let mut image_reader = ImageReader::new(std::io::Cursor::new(image_bytes));
-        image_reader.set_format(image_format);
-        let image = image_reader.decode()?;
-
-        let (width, height) = image.dimensions();
+        // Only the header is read: no pixels are decoded, so a picture the decoder cannot draw
+        // (or one too large to decode) can still be opened.
+        let header = gpui::image_header(image_bytes, image_format)?;
 
         Ok(ImageMetadata {
-            width,
-            height,
+            width: header.width,
+            height: header.height,
             file_size: image_bytes.len() as u64,
             format: image_format,
-            colors: ImageColorInfo::from_color_type(image.color()),
+            colors: ImageColorInfo::from_color_type(header.color_type),
         })
     }
 

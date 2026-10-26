@@ -30,6 +30,7 @@ use std::{
     fmt::Display,
     future::Future,
     iter::Iterator,
+    mem,
     num::NonZeroU64,
     ops::{self, Deref, Range, Sub},
     str,
@@ -120,7 +121,11 @@ pub struct BufferSnapshot {
     pub version: clock::Global,
     remote_id: BufferId,
     replica_id: ReplicaId,
+    /// The ending of the first line, and of every later line until the next entry of
+    /// `line_ending_changes`.
     line_ending: LineEnding,
+    /// Where the ending changes: each anchor sits at the start of the first line that uses its ending.
+    line_ending_changes: Arc<[(Anchor, LineEnding)]>,
 }
 
 #[derive(Clone, Debug)]
@@ -747,9 +752,15 @@ impl FromIterator<char> for LineIndent {
 impl Buffer {
     pub fn new(replica_id: ReplicaId, remote_id: BufferId, base_text: impl Into<String>) -> Buffer {
         let mut base_text = base_text.into();
-        let line_ending = LineEnding::detect(&base_text);
-        LineEnding::normalize(&mut base_text);
-        Self::new_normalized(replica_id, remote_id, line_ending, Rope::from(&*base_text))
+        let line_endings = LineEnding::normalize_with_endings(&mut base_text);
+        let mut buffer = Self::new_normalized(
+            replica_id,
+            remote_id,
+            line_endings.first,
+            Rope::from(&*base_text),
+        );
+        buffer.set_line_endings(line_endings);
+        buffer
     }
 
     pub fn new_normalized(
@@ -810,6 +821,7 @@ impl Buffer {
                 visible_text,
                 deleted_text: Rope::new(),
                 line_ending,
+                line_ending_changes: Arc::default(),
                 fragments,
                 insertions,
                 version,
@@ -902,8 +914,20 @@ impl Buffer {
         edit_op
     }
 
+    /// Makes every line of the buffer use `line_ending`.
     pub fn set_line_ending(&mut self, line_ending: LineEnding) {
-        self.snapshot.line_ending = line_ending;
+        self.set_line_endings(LineEndings::uniform(line_ending));
+    }
+
+    /// Gives each line the ending `line_endings` assigns it. Its offsets index the current text and
+    /// must lie on line starts.
+    pub fn set_line_endings(&mut self, line_endings: LineEndings) {
+        self.snapshot.line_ending = line_endings.first;
+        self.snapshot.line_ending_changes = line_endings
+            .changes
+            .iter()
+            .map(|&(offset, ending)| (self.snapshot.anchor_before(offset), ending))
+            .collect();
     }
 
     pub fn apply_ops<I: IntoIterator<Item = Operation>>(&mut self, ops: I) {
@@ -2194,8 +2218,36 @@ impl BufferSnapshot {
         self.visible_text.to_string()
     }
 
+    /// The ending of the first line. Use [`Self::line_endings`] when the text mixes endings.
     pub fn line_ending(&self) -> LineEnding {
-        self.line_ending
+        // Edits keep the changes in order and can only gather them at the start of the text, where
+        // the last one that did is the first line's ending. Later ones are not resolved.
+        let mut first = self.line_ending;
+        for (anchor, ending) in self.line_ending_changes.iter() {
+            if anchor.to_offset(self) > 0 {
+                break;
+            }
+            first = *ending;
+        }
+        first
+    }
+
+    /// The text as it is saved to disk: each line with the ending it was loaded with. [`Self::text`]
+    /// has every ending normalized to `\n`.
+    pub fn text_with_line_endings(&self) -> String {
+        chunks_with_line_endings(&self.visible_text, &self.line_endings()).collect()
+    }
+
+    /// The ending of every line, following the text through edits.
+    pub fn line_endings(&self) -> LineEndings {
+        let mut line_endings = LineEndings::uniform(self.line_ending);
+        let offsets = self.summaries_for_anchors::<usize, _>(
+            self.line_ending_changes.iter().map(|(anchor, _)| *anchor),
+        );
+        for (offset, (_, ending)) in offsets.zip(self.line_ending_changes.iter()) {
+            line_endings.push_change(offset, *ending);
+        }
+        line_endings
     }
 
     pub fn deleted_text(&self) -> String {
@@ -3574,10 +3626,14 @@ impl FromAnchor for usize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineEnding {
+    /// `\n`
     Unix,
+    /// `\r\n`
     Windows,
+    /// `\r`, the terminator of classic Mac OS text files.
+    Mac,
 }
 
 impl Default for LineEnding {
@@ -3590,11 +3646,110 @@ impl Default for LineEnding {
     }
 }
 
+/// The line terminators of a text that may mix several kinds.
+///
+/// Offsets index the text with every terminator normalized to `\n`, so they match the buffer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineEndings {
+    /// The ending of the first line.
+    pub first: LineEnding,
+    /// In increasing order, the offset of each line start whose line ends differently from the
+    /// line before it, and the ending that line and the ones after it use.
+    pub changes: Vec<(usize, LineEnding)>,
+}
+
+impl LineEndings {
+    /// Every line uses `ending`.
+    pub fn uniform(ending: LineEnding) -> Self {
+        Self {
+            first: ending,
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn is_uniform(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    /// The endings of the lines in `range`, with offsets relative to its start.
+    pub fn slice(&self, range: Range<usize>) -> LineEndings {
+        let mut sliced = LineEndings::uniform(self.ending_at(range.start));
+        for &(start, ending) in &self.changes {
+            if start > range.start && start < range.end {
+                sliced.push_change(start - range.start, ending);
+            }
+        }
+        sliced
+    }
+
+    /// The ending of the line that holds `offset`.
+    pub fn ending_at(&self, offset: usize) -> LineEnding {
+        let changed = self.changes.partition_point(|(start, _)| *start <= offset);
+        changed
+            .checked_sub(1)
+            .map_or(self.first, |ix| self.changes[ix].1)
+    }
+
+    /// These endings, except that each of `lines` uses the ending it is paired with. `lines` are
+    /// the spans of whole lines in ascending order, and `len` is the length of the text, whose end
+    /// starts no line.
+    pub fn with_lines_overridden(
+        &self,
+        lines: &[(Range<usize>, LineEnding)],
+        len: usize,
+    ) -> LineEndings {
+        let ending_at = |offset: usize| {
+            let line = lines.partition_point(|(span, _)| span.end <= offset);
+            match lines.get(line) {
+                Some((span, ending)) if span.start <= offset => *ending,
+                _ => self.ending_at(offset),
+            }
+        };
+        let mut line_starts: Vec<usize> = self
+            .changes
+            .iter()
+            .map(|(start, _)| *start)
+            .chain(lines.iter().flat_map(|(span, _)| [span.start, span.end]))
+            .filter(|start| *start > 0 && *start < len)
+            .collect();
+        line_starts.sort_unstable();
+        line_starts.dedup();
+
+        let mut overridden = LineEndings::uniform(ending_at(0));
+        for start in line_starts {
+            overridden.push_change(start, ending_at(start));
+        }
+        overridden
+    }
+
+    /// Records that lines from `offset` on use `ending`. A later call for the same offset
+    /// overrides the earlier one, and a change to the ending already in force is dropped, so equal
+    /// layouts compare equal.
+    fn push_change(&mut self, offset: usize, ending: LineEnding) {
+        if offset == 0 {
+            self.first = ending;
+            self.changes.clear();
+            return;
+        }
+        while self.changes.last().is_some_and(|(last, _)| *last == offset) {
+            self.changes.pop();
+        }
+        let current = self
+            .changes
+            .last()
+            .map_or(self.first, |(_, ending)| *ending);
+        if ending != current {
+            self.changes.push((offset, ending));
+        }
+    }
+}
+
 impl LineEnding {
     pub fn as_str(&self) -> &'static str {
         match self {
             LineEnding::Unix => "\n",
             LineEnding::Windows => "\r\n",
+            LineEnding::Mac => "\r",
         }
     }
 
@@ -3602,24 +3757,63 @@ impl LineEnding {
         match self {
             LineEnding::Unix => "LF",
             LineEnding::Windows => "CRLF",
+            LineEnding::Mac => "CR",
         }
     }
 
+    /// The ending of the first line terminator in `text`, wherever it is; the platform default
+    /// when the text has none.
     pub fn detect(text: &str) -> Self {
-        let mut max_ix = cmp::min(text.len(), 1000);
-        while !text.is_char_boundary(max_ix) {
-            max_ix -= 1;
+        let bytes = text.as_bytes();
+        match bytes.iter().position(|byte| matches!(byte, b'\r' | b'\n')) {
+            Some(ix) if bytes[ix] == b'\n' => Self::Unix,
+            Some(ix) if bytes.get(ix + 1) == Some(&b'\n') => Self::Windows,
+            Some(_) => Self::Mac,
+            None => Self::default(),
+        }
+    }
+
+    /// Replaces every line terminator in `text` with `\n` and reports which terminator each line had.
+    pub fn normalize_with_endings(text: &mut String) -> LineEndings {
+        let bytes = text.as_bytes();
+        if !bytes.contains(&b'\r') {
+            let first = if bytes.contains(&b'\n') {
+                Self::Unix
+            } else {
+                Self::default()
+            };
+            return LineEndings::uniform(first);
         }
 
-        if let Some(ix) = text[..max_ix].find(['\n']) {
-            if ix > 0 && text.as_bytes()[ix - 1] == b'\r' {
-                Self::Windows
+        let mut normalized = String::with_capacity(text.len());
+        let mut line_endings = LineEndings::uniform(Self::default());
+        let mut seen_first_terminator = false;
+        let mut line_start = 0;
+        let mut copied = 0;
+        while let Some(found) = bytes[copied..]
+            .iter()
+            .position(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            let at = copied + found;
+            let (ending, len) = match bytes[at] {
+                b'\n' => (Self::Unix, 1),
+                _ if bytes.get(at + 1) == Some(&b'\n') => (Self::Windows, 2),
+                _ => (Self::Mac, 1),
+            };
+            if seen_first_terminator {
+                line_endings.push_change(line_start, ending);
             } else {
-                Self::Unix
+                line_endings.first = ending;
+                seen_first_terminator = true;
             }
-        } else {
-            Self::default()
+            normalized.push_str(&text[copied..at]);
+            normalized.push('\n');
+            line_start = normalized.len();
+            copied = at + len;
         }
+        normalized.push_str(&text[copied..]);
+        *text = normalized;
+        line_endings
     }
 
     pub fn normalize(text: &mut String) {
@@ -3645,23 +3839,71 @@ impl LineEnding {
     }
 }
 
-pub fn chunks_with_line_ending(rope: &Rope, line_ending: LineEnding) -> impl Iterator<Item = &str> {
-    rope.chunks().flat_map(move |chunk| {
-        let mut newline = false;
-        let end_with_newline = chunk.ends_with('\n').then_some(line_ending.as_str());
-        chunk
-            .lines()
-            .flat_map(move |line| {
-                let ending = if newline {
-                    Some(line_ending.as_str())
-                } else {
-                    None
-                };
-                newline = true;
-                ending.into_iter().chain([line])
-            })
-            .chain(end_with_newline)
-    })
+/// The text of `rope` with each `\n` replaced by the ending `line_endings` assigns that line.
+pub fn chunks_with_line_endings<'a>(
+    rope: &'a Rope,
+    line_endings: &'a LineEndings,
+) -> impl Iterator<Item = &'a str> {
+    ChunksWithLineEndings {
+        chunks: rope.chunks(),
+        chunk: "",
+        chunk_offset: 0,
+        line_endings,
+        next_change: 0,
+        current: line_endings.first,
+        pending_ending: None,
+    }
+}
+
+struct ChunksWithLineEndings<'a> {
+    chunks: Chunks<'a>,
+    /// The part of the current rope chunk that has not been yielded yet.
+    chunk: &'a str,
+    /// The offset of `chunk` in the rope.
+    chunk_offset: usize,
+    line_endings: &'a LineEndings,
+    /// Index into `line_endings.changes` of the first change not yet in force.
+    next_change: usize,
+    current: LineEnding,
+    pending_ending: Option<&'static str>,
+}
+
+impl<'a> Iterator for ChunksWithLineEndings<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if let Some(ending) = self.pending_ending.take() {
+            return Some(ending);
+        }
+        while self.chunk.is_empty() {
+            self.chunk = self.chunks.next()?;
+        }
+        let Some(newline_ix) = self.chunk.find('\n') else {
+            let rest = mem::take(&mut self.chunk);
+            self.chunk_offset += rest.len();
+            return Some(rest);
+        };
+
+        let newline_offset = self.chunk_offset + newline_ix;
+        while let Some(&(line_start, ending)) = self.line_endings.changes.get(self.next_change) {
+            if line_start > newline_offset {
+                break;
+            }
+            self.current = ending;
+            self.next_change += 1;
+        }
+
+        let line = &self.chunk[..newline_ix];
+        self.chunk = &self.chunk[newline_ix + 1..];
+        self.chunk_offset = newline_offset + 1;
+        let ending = self.current.as_str();
+        if line.is_empty() {
+            Some(ending)
+        } else {
+            self.pending_ending = Some(ending);
+            Some(line)
+        }
+    }
 }
 
 #[cfg(debug_assertions)]

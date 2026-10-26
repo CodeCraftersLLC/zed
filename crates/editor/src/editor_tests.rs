@@ -28420,6 +28420,183 @@ async fn test_breakpoint_toggling(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_disabled_debugging_hides_gutter_breakpoint_entries(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/a"),
+        json!({ "main.rs": "First line\nSecond line\nThird line\nFourth line" }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let cx = &mut VisualTestContext::from_window(*window, cx);
+    let worktree_id = project.update(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("main.rs")), cx)
+        })
+        .await
+        .unwrap();
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        Editor::new(
+            EditorMode::full(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            Some(project.clone()),
+            window,
+            cx,
+        )
+    });
+
+    let gutter_menu_labels = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+        editor.update_in(cx, |editor, window, cx| {
+            let anchor = editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_before(Point::new(1, 0));
+            editor
+                .gutter_context_menu(anchor, window, cx)
+                .read(cx)
+                .entry_labels()
+                .into_iter()
+                .map(|label| label.to_string())
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let labels = gutter_menu_labels(&editor, cx);
+    assert!(labels.contains(&"Set Breakpoint".to_string()), "{labels:?}");
+    assert!(labels.contains(&"Add Bookmark".to_string()), "{labels:?}");
+
+    // A debug line and a refresh of inline values that are under way when debugging is turned off.
+    let refresh_guard = Rc::new(());
+    editor.update(cx, |editor, cx| {
+        let anchor = editor
+            .buffer()
+            .read(cx)
+            .snapshot(cx)
+            .anchor_before(Point::new(1, 0));
+        editor.highlight_rows::<ActiveDebugLine>(
+            anchor..anchor,
+            |_| gpui::red(),
+            RowHighlightOptions::default(),
+            cx,
+        );
+        assert_eq!(editor.highlighted_rows::<ActiveDebugLine>(cx).count(), 1);
+        let guard = refresh_guard.clone();
+        editor.inline_value_cache.refresh_task = cx.spawn(async move |_, _| {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Some(())
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(Rc::strong_count(&refresh_guard), 2);
+
+    editor.update(cx, |editor, cx| editor.set_debugging_enabled(false, cx));
+    editor.read_with(cx, |editor, cx| {
+        assert!(editor.breakpoint_store().is_none());
+        assert!(!editor.inline_values_enabled());
+        assert_eq!(editor.highlighted_rows::<ActiveDebugLine>(cx).count(), 0);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        Rc::strong_count(&refresh_guard),
+        1,
+        "the running refresh was cancelled"
+    );
+    let labels = gutter_menu_labels(&editor, cx);
+    assert_eq!(labels, ["Add Bookmark"], "only the bookmark entry is left");
+
+    // The breakpoint chords no longer do anything.
+    editor.update_in(cx, |editor, window, cx| {
+        editor.toggle_breakpoint(&actions::ToggleBreakpoint, window, cx);
+    });
+    project.read_with(cx, |project, cx| {
+        assert!(
+            project
+                .breakpoint_store()
+                .read(cx)
+                .all_source_breakpoints(cx)
+                .is_empty()
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_git_blame_is_not_offered_without_a_renderer(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/a"), json!({ "main.rs": "First line\nSecond line" }))
+        .await;
+    let project = Project::test(fs, [path!("/a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let cx = &mut VisualTestContext::from_window(*window, cx);
+    let worktree_id = project.update(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("main.rs")), cx)
+        })
+        .await
+        .unwrap();
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        Editor::new(
+            EditorMode::full(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            Some(project.clone()),
+            window,
+            cx,
+        )
+    });
+
+    // A host that never called `editor::init` has no renderer global at all.
+    cx.update(|_, cx| cx.remove_global::<crate::git::blame::GlobalBlameRenderer>());
+    editor.update_in(cx, |editor, window, cx| {
+        assert!(!editor.git_blame_available(cx));
+        editor.toggle_git_blame(&::git::Blame, window, cx);
+        assert!(editor.blame().is_none());
+        // `editor::init` installs the placeholder renderer, which draws nothing.
+        cx.set_global(crate::git::blame::GlobalBlameRenderer(Arc::new(())));
+        assert!(!editor.git_blame_available(cx));
+
+        editor.toggle_git_blame(&::git::Blame, window, cx);
+        assert!(
+            !editor.show_git_blame_gutter,
+            "the blame column is not opened"
+        );
+        assert!(editor.blame().is_none(), "no blame is computed");
+
+        // Inline blame is on by default; with nothing to draw it computes nothing either.
+        let inline_before = editor.git_blame_inline_enabled();
+        editor.toggle_git_blame_inline(&ToggleGitBlameInline, window, cx);
+        assert_eq!(editor.git_blame_inline_enabled(), inline_before);
+        assert!(editor.blame().is_none());
+        assert!(!editor.show_git_blame_inline);
+
+        let anchor = editor
+            .buffer()
+            .read(cx)
+            .snapshot(cx)
+            .anchor_before(Point::new(0, 0));
+        let labels = editor
+            .gutter_context_menu(anchor, window, cx)
+            .read(cx)
+            .entry_labels();
+        assert!(
+            !labels.iter().any(|label| label.contains("Git Blame")),
+            "{labels:?}"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_breakpoint_after_save_as_existing_path(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

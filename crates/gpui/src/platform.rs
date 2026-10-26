@@ -37,7 +37,7 @@ use crate::{
     ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
     PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
-    SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+    SystemWindowTab, Task, Window, WindowControlArea, decode_bgra_frames, hash, point, px, size,
 };
 use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -46,8 +46,6 @@ use async_task::Runnable;
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
-use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder as _, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -57,7 +55,6 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
-use std::io::Cursor;
 use std::ops;
 use std::time::Duration;
 use std::{
@@ -283,6 +280,49 @@ pub trait PlatformDisplay: Debug {
         let offset = clipped_window_size / 2.0;
         let origin = point(center.x - offset.width, center.y - offset.height);
         Bounds::new(origin, clipped_window_size)
+    }
+}
+
+/// What a platform's frame pump knows about a window before it wakes it for a vsync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowPresence {
+    /// The window is minimised to the taskbar or dock.
+    pub minimized: bool,
+    /// The window is shown on screen, as opposed to hidden.
+    pub visible: bool,
+}
+
+impl WindowPresence {
+    /// Whether a vsync should ask the window for a frame. A minimised or hidden
+    /// window shows the user nothing, so waking it only burns CPU; the first vsync
+    /// after it is shown or restored draws it again.
+    pub fn should_present(self) -> bool {
+        self.visible && !self.minimized
+    }
+}
+
+#[cfg(test)]
+mod window_presence_tests {
+    use super::WindowPresence;
+
+    fn presence(minimized: bool, visible: bool) -> WindowPresence {
+        WindowPresence { minimized, visible }
+    }
+
+    #[test]
+    fn a_shown_window_is_presented() {
+        assert!(presence(false, true).should_present());
+    }
+
+    #[test]
+    fn a_minimised_window_is_left_alone() {
+        assert!(!presence(true, true).should_present());
+    }
+
+    #[test]
+    fn a_hidden_window_is_left_alone() {
+        assert!(!presence(false, false).should_present());
+        assert!(!presence(true, false).should_present());
     }
 }
 
@@ -2200,58 +2240,20 @@ impl Image {
 
     /// Convert the clipboard image to an `ImageData` object.
     pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
-        fn frames_for_image(
-            bytes: &[u8],
-            format: image::ImageFormat,
-        ) -> Result<SmallVec<[Frame; 1]>> {
-            let mut data = image::load_from_memory_with_format(bytes, format)?.into_rgba8();
-
-            // Convert from RGBA to BGRA.
-            for pixel in data.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-
-            Ok(SmallVec::from_elem(Frame::new(data), 1))
-        }
-
         let frames = match self.format {
-            ImageFormat::Gif => {
-                let decoder = GifDecoder::new(Cursor::new(&self.bytes))?;
-                let mut frames = SmallVec::new();
-
-                for frame in decoder.into_frames() {
-                    match frame {
-                        Ok(mut frame) => {
-                            // Convert from RGBA to BGRA.
-                            for pixel in frame.buffer_mut().chunks_exact_mut(4) {
-                                pixel.swap(0, 2);
-                            }
-                            frames.push(frame);
-                        }
-                        Err(err) => {
-                            log::debug!("Skipping GIF frame due to decode error: {err}");
-                        }
-                    }
-                }
-
-                if frames.is_empty() {
-                    anyhow::bail!("GIF could not be decoded: all frames failed");
-                }
-
-                frames
-            }
-            ImageFormat::Png => frames_for_image(&self.bytes, image::ImageFormat::Png)?,
-            ImageFormat::Jpeg => frames_for_image(&self.bytes, image::ImageFormat::Jpeg)?,
-            ImageFormat::Webp => frames_for_image(&self.bytes, image::ImageFormat::WebP)?,
-            ImageFormat::Bmp => frames_for_image(&self.bytes, image::ImageFormat::Bmp)?,
-            ImageFormat::Tiff => frames_for_image(&self.bytes, image::ImageFormat::Tiff)?,
-            ImageFormat::Ico => frames_for_image(&self.bytes, image::ImageFormat::Ico)?,
+            ImageFormat::Gif => decode_bgra_frames(&self.bytes, image::ImageFormat::Gif)?,
+            ImageFormat::Png => decode_bgra_frames(&self.bytes, image::ImageFormat::Png)?,
+            ImageFormat::Jpeg => decode_bgra_frames(&self.bytes, image::ImageFormat::Jpeg)?,
+            ImageFormat::Webp => decode_bgra_frames(&self.bytes, image::ImageFormat::WebP)?,
+            ImageFormat::Bmp => decode_bgra_frames(&self.bytes, image::ImageFormat::Bmp)?,
+            ImageFormat::Tiff => decode_bgra_frames(&self.bytes, image::ImageFormat::Tiff)?,
+            ImageFormat::Ico => decode_bgra_frames(&self.bytes, image::ImageFormat::Ico)?,
             ImageFormat::Svg => {
                 return svg_renderer
                     .render_single_frame(&self.bytes, 1.0)
                     .map_err(Into::into);
             }
-            ImageFormat::Pnm => frames_for_image(&self.bytes, image::ImageFormat::Pnm)?,
+            ImageFormat::Pnm => decode_bgra_frames(&self.bytes, image::ImageFormat::Pnm)?,
         };
 
         Ok(Arc::new(RenderImage::new(frames)))
@@ -2352,6 +2354,38 @@ mod image_tests {
         for pixel in bytes.chunks_exact(4) {
             assert_eq!(pixel, &[0xF8, 0xBD, 0x38, 0xFF]);
         }
+    }
+
+    #[test]
+    fn an_ico_whose_png_entry_is_rgb_decodes() {
+        use crate::image_decode::fixtures::{ico_with, png};
+        let entry = png(
+            &image::RgbImage::from_pixel(32, 32, image::Rgb([1, 2, 3])),
+            None,
+        );
+        let image = Image::from_bytes(ImageFormat::Ico, ico_with(&[(32, 32, 24, &entry)]));
+
+        let render_image = image.to_image_data(SvgRenderer::new(Arc::new(()))).unwrap();
+        assert_eq!(
+            render_image.size(0),
+            size(DevicePixels(32), DevicePixels(32))
+        );
+        // BGRA
+        assert_eq!(&render_image.as_bytes(0).unwrap()[..4], &[3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn a_picture_with_exif_orientation_6_is_drawn_upright() {
+        use crate::image_decode::fixtures::{exif_orientation, landscape, png};
+        let image = Image::from_bytes(
+            ImageFormat::Png,
+            png(&landscape(), Some(exif_orientation(6))),
+        );
+
+        let render_image = image.to_image_data(SvgRenderer::new(Arc::new(()))).unwrap();
+        assert_eq!(render_image.size(0), size(DevicePixels(2), DevicePixels(4)));
+        // The stored top-left corner (red) is the top-right corner once upright; BGRA.
+        assert_eq!(&render_image.as_bytes(0).unwrap()[4..8], &[0, 0, 255, 255]);
     }
 }
 

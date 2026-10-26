@@ -1805,40 +1805,36 @@ impl ProjectPanel {
         };
         let filename = self.filename_editor.read(cx).text(cx);
         if !filename.is_empty() {
-            if filename.is_empty() {
-                edit_state.validation_state =
-                    ValidationState::Error("File or directory name cannot be empty.".to_string());
-                cx.notify();
-                return;
-            }
-
             let trimmed_filename = filename.trim();
-            if trimmed_filename != filename {
-                edit_state.validation_state = ValidationState::Warning(
-                    "File or directory name contains leading or trailing whitespace.".to_string(),
-                );
-                cx.notify();
-                return;
-            }
             let trimmed_filename = trimmed_filename.trim_start_matches('/');
 
-            let Ok(filename) = RelPath::unix(trimmed_filename) else {
-                edit_state.validation_state = ValidationState::Warning(
-                    "File or directory name contains leading or trailing whitespace.".to_string(),
-                );
-                cx.notify();
-                return;
-            };
-
             // The same name and path style Enter validates with, so the inline
-            // error and the confirmation never disagree.
+            // error and the confirmation never disagree. The host's reason comes
+            // first: it names what is wrong, where a path-syntax complaint would
+            // not (a folder named `..` is not "whitespace").
             if let Some(message) =
-                Self::name_rejection(self.name_validator.as_ref(), trimmed_filename, path_style)
+                Self::name_rejection(self.name_validator.as_ref(), &filename, path_style)
             {
                 edit_state.validation_state = ValidationState::Error(message);
                 cx.notify();
                 return;
             }
+
+            if filename.trim() != filename {
+                edit_state.validation_state = ValidationState::Warning(
+                    "File or directory name contains leading or trailing whitespace.".to_string(),
+                );
+                cx.notify();
+                return;
+            }
+
+            let Ok(filename) = RelPath::unix(trimmed_filename) else {
+                edit_state.validation_state = ValidationState::Error(
+                    "File or directory name is not a valid path.".to_string(),
+                );
+                cx.notify();
+                return;
+            };
 
             if let Some(worktree) = self
                 .project
@@ -3240,10 +3236,14 @@ impl ProjectPanel {
         }
     }
 
+    /// Where pasting `source` next to `target_entry` puts it. When `moving`, the source's own
+    /// current place is not taken: cutting a file and pasting it in the same folder leaves it
+    /// where it is instead of renaming it "name copy".
     fn create_paste_path(
         &self,
         source: &SelectedEntry,
         (worktree, target_entry): (Entity<Worktree>, &Entry),
+        moving: bool,
         cx: &App,
     ) -> Option<(Arc<RelPath>, Option<Range<usize>>)> {
         let mut new_path = target_entry.path.to_rel_path_buf();
@@ -3275,7 +3275,10 @@ impl ProjectPanel {
         let mut ix = 0;
         {
             let worktree = worktree.read(cx);
-            while worktree.entry_for_path(&new_path).is_some() {
+            while worktree
+                .entry_for_path(&new_path)
+                .is_some_and(|existing| !(moving && existing.id == source.entry_id))
+            {
                 new_path.pop();
 
                 let mut new_file_name = file_name_without_extension.to_string();
@@ -3344,12 +3347,20 @@ impl ProjectPanel {
             let mut disambiguation_range = None;
             let clip_is_cut = clipboard_entries.is_cut();
             for clipboard_entry in clipboard_entries.items() {
-                let (new_path, new_disambiguation_range) =
-                    self.create_paste_path(clipboard_entry, self.selected_sub_entry(cx)?, cx)?;
+                let (new_path, new_disambiguation_range) = self.create_paste_path(
+                    clipboard_entry,
+                    self.selected_sub_entry(cx)?,
+                    clip_is_cut,
+                    cx,
+                )?;
                 let clip_entry_id = clipboard_entry.entry_id;
                 let destination: ProjectPath = (worktree_id, new_path).into();
                 let task = if clipboard_entries.is_cut() {
                     let original_path = self.project.read(cx).path_for_entry(clip_entry_id, cx)?;
+                    if original_path == destination {
+                        // Already there: nothing to move.
+                        continue;
+                    }
                     let task = self.project.update(cx, |project, cx| {
                         project.rename_entry(clip_entry_id, destination.clone(), cx)
                     });
@@ -3366,6 +3377,11 @@ impl ProjectPanel {
                 };
                 paste_tasks.push(task);
                 disambiguation_range = new_disambiguation_range.or(disambiguation_range);
+            }
+
+            if paste_tasks.is_empty() {
+                // Every cut entry is already where it would be pasted; they stay cut.
+                return Some(());
             }
 
             let item_count = paste_tasks.len();
@@ -4774,6 +4790,7 @@ impl ProjectPanel {
                     let (new_path, new_disambiguation_range) = self.create_paste_path(
                         selection,
                         (target_worktree.clone(), &target_entry),
+                        false,
                         cx,
                     )?;
 

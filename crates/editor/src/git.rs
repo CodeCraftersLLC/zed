@@ -210,12 +210,22 @@ impl Editor {
             .update(cx, |buffer, cx| buffer.expand_diff_hunks(ranges, cx))
     }
 
+    /// Whether a blame renderer is installed. Without one, blame data would be computed and a
+    /// gutter column reserved for it, and nothing would be drawn in it.
+    pub fn git_blame_available(&self, cx: &App) -> bool {
+        cx.try_global::<GlobalBlameRenderer>()
+            .is_some_and(|renderer| renderer.0.is_available())
+    }
+
     pub fn toggle_git_blame(
         &mut self,
         _: &::git::Blame,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.git_blame_available(cx) {
+            return;
+        }
         self.show_git_blame_gutter = !self.show_git_blame_gutter;
 
         if self.show_git_blame_gutter && !self.has_blame_entries(cx) {
@@ -1567,6 +1577,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.git_blame_available(cx) {
+            return;
+        }
         if self.git_blame_inline_enabled {
             self.git_blame_inline_enabled = false;
             self.show_git_blame_inline = false;
@@ -1585,6 +1598,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.git_blame_available(cx) {
+            return;
+        }
         self.start_git_blame(user_triggered, window, cx);
 
         if ProjectSettings::get_global(cx)
@@ -1610,6 +1626,9 @@ impl Editor {
     }
 
     pub(super) fn start_inline_blame_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.git_blame_available(cx) {
+            return;
+        }
         if let Some(delay) = ProjectSettings::get_global(cx).git.inline_blame_delay() {
             self.show_git_blame_inline = false;
 
@@ -1771,6 +1790,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.git_blame_available(cx) {
+            return;
+        }
         if let Some(project) = self.project() {
             if let Some(buffer) = self.buffer().read(cx).as_singleton()
                 && buffer.read(cx).file().is_none()

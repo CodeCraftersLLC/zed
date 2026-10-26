@@ -146,6 +146,125 @@ fn test_set_line_ending(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_text_with_line_endings_returns_the_loaded_endings(cx: &mut gpui::App) {
+    let buffer = cx.new(|cx| Buffer::local("one\r\ntwo\r\nthree", cx));
+    buffer.update(cx, |buffer, cx| {
+        assert_eq!(buffer.text(), "one\ntwo\nthree");
+        buffer.edit([(4..4, "X")], None, cx);
+        assert_eq!(buffer.text(), "one\nXtwo\nthree");
+        assert_eq!(buffer.text_with_line_endings(), "one\r\nXtwo\r\nthree");
+    });
+}
+
+#[gpui::test]
+async fn test_a_diff_to_mixed_text_installs_its_line_endings(cx: &mut TestAppContext) {
+    let buffer = cx.new(|cx| Buffer::local("a\nb\n", cx));
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.diff("a\r\nb\nc\r\n", cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.apply_diff(diff, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "a\nb\nc\n");
+        assert_eq!(
+            buffer.line_endings(),
+            LineEndings {
+                first: LineEnding::Windows,
+                changes: vec![(2, LineEnding::Unix), (4, LineEnding::Windows)],
+            }
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_a_diff_that_missed_an_edit_changes_only_the_endings_of_lines_it_wrote(
+    cx: &mut TestAppContext,
+) {
+    let buffer = cx.new(|cx| Buffer::local("a\r\nb\nc\r\n", cx));
+    // The loaded text appends a line with its own ending and gives `b` another one.
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.diff("a\r\nb\r\nc\r\nd\n", cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "x")], None, cx);
+        buffer.apply_diff(diff, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "xa\nb\nc\nd\n");
+        // `a`, `b` and `c` keep the endings they had; only `d`, which the diff wrote, takes its own.
+        assert_eq!(buffer.text_with_line_endings(), "xa\r\nb\nc\r\nd\n");
+    });
+}
+
+#[gpui::test]
+async fn test_a_diff_that_missed_an_edit_gives_a_rewritten_line_its_loaded_ending(
+    cx: &mut TestAppContext,
+) {
+    let buffer = cx.new(|cx| Buffer::local("ab\ncd\n", cx));
+    // The first line is rewritten in the middle, so the terminator the diff writes ends a line
+    // that began before the diff's edit.
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.diff("aX\r\nY\r\ncd\n", cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(6..6, "z")], None, cx);
+        buffer.apply_diff(diff, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "aX\nY\ncd\nz");
+        let saved = buffer.text_with_line_endings();
+        assert!(saved.starts_with("aX\r\n"), "{saved:?}");
+        assert!(saved.ends_with("cd\nz"), "{saved:?}");
+    });
+}
+
+#[gpui::test]
+async fn test_a_diff_that_missed_an_edit_leaves_a_mixed_buffer_as_it_was(cx: &mut TestAppContext) {
+    let buffer = cx.new(|cx| Buffer::local("one\r\ntwo\nthree\r\n", cx));
+    // The file was rewritten with the first line's ending everywhere, and the diff has no text
+    // change to offer.
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.diff("one\r\ntwo\r\nthree\r\n", cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "x")], None, cx);
+        buffer.apply_diff(diff, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text_with_line_endings(), "xone\r\ntwo\nthree\r\n");
+    });
+}
+
+#[gpui::test]
+async fn test_edits_that_do_not_come_from_the_text_keep_mixed_line_endings(
+    cx: &mut TestAppContext,
+) {
+    let buffer = cx.new(|cx| Buffer::local("a \r\nb\nc\r\n", cx));
+    let diff = buffer
+        .update(cx, |buffer, cx| buffer.remove_trailing_whitespace(cx))
+        .await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.apply_diff(diff, cx);
+    });
+    let expected = LineEndings {
+        first: LineEnding::Windows,
+        changes: vec![(2, LineEnding::Unix), (4, LineEnding::Windows)],
+    };
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "a\nb\nc\n");
+        assert_eq!(buffer.line_endings(), expected);
+    });
+
+    buffer.update(cx, |buffer, cx| {
+        buffer.did_reload(buffer.version(), buffer.line_ending(), None, cx);
+    });
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.line_endings(), expected);
+    });
+}
+
+#[gpui::test]
 fn test_select_language(cx: &mut App) {
     init_settings(cx, |_| {});
 

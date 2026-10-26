@@ -919,7 +919,8 @@ impl Fs for RealFs {
             .await
             .with_context(|| format!("Failed to create file at {:?}", path))?;
         let mut writer = smol::io::BufWriter::with_capacity(buffer_size, file);
-        for chunk in text::chunks_with_line_ending(text, line_ending) {
+        for chunk in text::chunks_with_line_endings(text, &text::LineEndings::uniform(line_ending))
+        {
             writer.write_all(chunk.as_bytes()).await?;
         }
         writer.flush().await?;
@@ -3012,7 +3013,9 @@ impl Fs for FakeFs {
     async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
         self.simulate_random_delay().await;
         let path = normalize_path(path);
-        let content = text::chunks_with_line_ending(text, line_ending).collect::<String>();
+        let content =
+            text::chunks_with_line_endings(text, &text::LineEndings::uniform(line_ending))
+                .collect::<String>();
         if let Some(path) = path.parent() {
             self.create_dir(path).await?;
         }

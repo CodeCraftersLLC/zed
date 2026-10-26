@@ -449,8 +449,14 @@ impl DirectXRenderer {
         let width = new_size.width.0.max(1) as u32;
         let height = new_size.height.0.max(1) as u32;
         if self.width == width && self.height == height {
+            log::debug!("renderer resize skipped: swap chain is already {width}x{height}");
             return Ok(());
         }
+        log::debug!(
+            "renderer resize {}x{} -> {width}x{height}",
+            self.width,
+            self.height
+        );
         self.width = width;
         self.height = height;
 
@@ -477,6 +483,7 @@ impl DirectXRenderer {
                 )
                 .context("Failed to resize swap chain")?;
         }
+        log::debug!("swap chain buffers resized to {width}x{height}");
 
         resources.recreate_resources(devices, width, height)?;
 

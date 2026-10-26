@@ -1325,6 +1325,20 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                     capture_phase = DispatchPhase::Bubble;
                 }
 
+                #[cfg(any(test, feature = "test-support"))]
+                for layout in &prepaint_state.thumbs {
+                    let (thumb_selector, track_selector) = match layout.axis {
+                        ScrollbarAxis::Vertical => {
+                            ("scrollbar-thumb-vertical", "scrollbar-track-vertical")
+                        }
+                        ScrollbarAxis::Horizontal => {
+                            ("scrollbar-thumb-horizontal", "scrollbar-track-horizontal")
+                        }
+                    };
+                    window.insert_debug_bounds(thumb_selector, layout.thumb_bounds);
+                    window.insert_debug_bounds(track_selector, layout.track_bounds);
+                }
+
                 for ScrollbarLayout {
                     thumb_bounds,
                     cursor_hitbox,
@@ -1557,5 +1571,68 @@ impl<T: ScrollableHandle> IntoElement for ScrollbarElement<T> {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext, div};
+
+    struct RowList {
+        handle: ScrollHandle,
+        rows: usize,
+    }
+
+    impl Render for RowList {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().size(px(200.)).child(
+                div()
+                    .id("rows")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.handle)
+                    .children((0..self.rows).map(|ix| div().h(px(20.)).child(ix.to_string())))
+                    .custom_scrollbars(
+                        Scrollbars::always_visible(ScrollAxes::Vertical)
+                            .tracked_scroll_handle(&self.handle),
+                        window,
+                        cx,
+                    ),
+            )
+        }
+    }
+
+    fn drawn_list(rows: usize, cx: &mut TestAppContext) -> &mut VisualTestContext {
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+        let (_list, cx) = cx.add_window_view(|_, _| RowList {
+            handle: ScrollHandle::new(),
+            rows,
+        });
+        // The first frame learns the content height; the scrollbar draws on the next.
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx
+    }
+
+    #[gpui::test]
+    fn a_list_taller_than_its_viewport_paints_a_scrollbar_thumb(cx: &mut TestAppContext) {
+        let cx = drawn_list(100, cx);
+
+        let thumb = cx
+            .debug_bounds("scrollbar-thumb-vertical")
+            .expect("a thumb is painted");
+        let track = cx
+            .debug_bounds("scrollbar-track-vertical")
+            .expect("a track is laid out");
+        assert!(thumb.size.height > px(0.));
+        assert!(thumb.size.height < track.size.height);
+    }
+
+    #[gpui::test]
+    fn a_list_that_fits_its_viewport_paints_no_thumb(cx: &mut TestAppContext) {
+        let cx = drawn_list(3, cx);
+
+        assert_eq!(cx.debug_bounds("scrollbar-thumb-vertical"), None);
     }
 }

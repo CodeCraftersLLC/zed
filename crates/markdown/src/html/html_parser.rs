@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::HashMap, mem, ops::Range};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    mem,
+    ops::Range,
+};
 
 use gpui::{DefiniteLength, FontWeight, SharedString, TextAlign, px, relative};
 use html5ever::{
@@ -8,6 +13,7 @@ use markup5ever_rcdom::{Node, NodeData, RcDom};
 use pulldown_cmark::{Alignment, HeadingLevel};
 use stacksafe::stacksafe;
 
+use crate::details::{closing_tails, details_balance};
 use crate::html::html_minifier::{Minifier, MinifierOptions};
 
 #[derive(Debug, Clone, Default)]
@@ -15,6 +21,80 @@ use crate::html::html_minifier::{Minifier, MinifierOptions};
 pub(crate) struct ParsedHtmlBlock {
     pub source_range: Range<usize>,
     pub children: Vec<ParsedHtmlElement>,
+    /// For each `</details>` of the block that closes a region an earlier block opened, the
+    /// content after it, or `None` when nothing but whitespace comes before the tag. A collapsed
+    /// region hides the content before its closing tag, so it shows this in place of `children`.
+    pub closing_tails: Vec<Option<ParsedClosingTail>>,
+}
+
+/// The content after a closing `</details>`, and where in the block it starts.
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) struct ParsedClosingTail {
+    /// The byte offset in the block at which the content starts.
+    pub start: usize,
+    pub elements: Vec<ParsedHtmlElement>,
+}
+
+impl ParsedHtmlBlock {
+    /// The `<details>` this block opens but does not close, outermost first. Their bodies are in
+    /// the blocks after it.
+    pub(crate) fn open_ended_details(
+        &self,
+        closed_through: Option<usize>,
+    ) -> Vec<&ParsedHtmlDetails> {
+        let mut found = Vec::new();
+        collect_open_ended_details(self.elements(closed_through), &mut found);
+        found
+    }
+
+    /// What the block shows. `closed_through` is the `</details>` (counted among those that close
+    /// an earlier block's region) of a collapsed region that ends in this block: what comes
+    /// before that tag is hidden with the rest of the region.
+    pub(crate) fn elements(&self, closed_through: Option<usize>) -> &[ParsedHtmlElement] {
+        self.closing_tail(closed_through)
+            .map_or(&self.children, |tail| &tail.elements)
+    }
+
+    /// The source offset in the document at which what `elements` shows starts.
+    pub(crate) fn elements_source_start(&self, closed_through: Option<usize>) -> usize {
+        self.source_range.start
+            + self
+                .closing_tail(closed_through)
+                .map_or(0, |tail| tail.start)
+    }
+
+    fn closing_tail(&self, closed_through: Option<usize>) -> Option<&ParsedClosingTail> {
+        closed_through
+            .and_then(|close| self.closing_tails.get(close))
+            .and_then(Option::as_ref)
+    }
+}
+
+#[stacksafe]
+fn collect_open_ended_details<'a>(
+    elements: &'a [ParsedHtmlElement],
+    found: &mut Vec<&'a ParsedHtmlDetails>,
+) {
+    for element in elements {
+        match element {
+            ParsedHtmlElement::Details(details) => {
+                if !details.closed {
+                    found.push(details);
+                }
+                collect_open_ended_details(&details.body, found);
+            }
+            ParsedHtmlElement::List(list) => {
+                for item in &list.items {
+                    collect_open_ended_details(&item.content, found);
+                }
+            }
+            ParsedHtmlElement::BlockQuote(quote) => {
+                collect_open_ended_details(&quote.children, found);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +106,23 @@ pub(crate) enum ParsedHtmlElement {
     BlockQuote(ParsedHtmlBlockQuote),
     Paragraph(ParsedHtmlParagraph),
     Image(HtmlImage),
+    Details(ParsedHtmlDetails),
+}
+
+/// A `<details>` disclosure: a summary line that is always shown and a body shown while open.
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) struct ParsedHtmlDetails {
+    pub source_range: Range<usize>,
+    /// Which `<details>` of its HTML block this is, in document order.
+    pub ordinal: usize,
+    /// Whether the `open` attribute makes it start expanded.
+    pub open: bool,
+    pub summary: HtmlParagraph,
+    pub body: Vec<ParsedHtmlElement>,
+    /// False when the block ends before `</details>`: the body continues in the Markdown blocks
+    /// that follow, up to the block holding the closing tag.
+    pub closed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +144,7 @@ impl ParsedHtmlElement {
                 HtmlParagraphChunk::Image(image) => image.source_range.clone(),
             },
             Self::Image(image) => image.source_range.clone(),
+            Self::Details(details) => details.source_range.clone(),
         })
     }
 }
@@ -178,22 +276,53 @@ impl HtmlImage {
     }
 }
 
-#[derive(Debug)]
-struct ParseHtmlNodeContext {
+/// What parsing one node needs to know about the HTML block around it. Lists and block quotes
+/// change the depth and keep the rest, so `<details>` inside them number and close as the
+/// block-wide count does.
+#[derive(Clone, Copy, Debug)]
+struct ParseHtmlNodeContext<'a> {
     list_item_depth: u16,
-}
-
-impl Default for ParseHtmlNodeContext {
-    fn default() -> Self {
-        Self { list_item_depth: 1 }
-    }
+    /// Which `<details>` of the block, in the order they open, the block does not close.
+    unclosed_details: &'a [usize],
+    /// How many `<details>` elements have been parsed in the block so far.
+    details_seen: &'a Cell<usize>,
 }
 
 pub(crate) fn parse_html_block(
     source: &str,
     source_range: Range<usize>,
 ) -> Option<ParsedHtmlBlock> {
-    let bytes = cleanup_html(source);
+    let children = parse_html_children(source, 0, 0, &source_range)?;
+    let closing_tails = closing_tails(source)
+        .into_iter()
+        .map(|tail| {
+            tail.and_then(|tail| {
+                let elements =
+                    parse_html_children(source, tail.start, tail.opened_before, &source_range)?;
+                Some(ParsedClosingTail {
+                    start: tail.start,
+                    elements,
+                })
+            })
+        })
+        .collect();
+
+    Some(ParsedHtmlBlock {
+        source_range,
+        children,
+        closing_tails,
+    })
+}
+
+/// The elements of `source` from byte `from` on. `opened_before` is how many `<details>` the part
+/// before `from` opens, so the ones after it keep the numbers they have in the whole block.
+fn parse_html_children(
+    source: &str,
+    from: usize,
+    opened_before: usize,
+    source_range: &Range<usize>,
+) -> Option<Vec<ParsedHtmlElement>> {
+    let bytes = cleanup_html(&source[from..]);
     let mut cursor = std::io::Cursor::new(bytes);
     let dom = parse_document(RcDom::default(), ParseOpts::default())
         .from_utf8()
@@ -201,17 +330,19 @@ pub(crate) fn parse_html_block(
         .ok()?;
 
     let mut children = Vec::new();
+    let unclosed_details = details_balance(source).unclosed;
+    let details_seen = Cell::new(opened_before);
     parse_html_node(
         source_range.clone(),
         &dom.document,
         &mut children,
-        &ParseHtmlNodeContext::default(),
+        &ParseHtmlNodeContext {
+            list_item_depth: 1,
+            unclosed_details: &unclosed_details,
+            details_seen: &details_seen,
+        },
     );
-
-    Some(ParsedHtmlBlock {
-        source_range,
-        children,
-    })
+    Some(children)
 }
 
 fn cleanup_html(source: &str) -> Vec<u8> {
@@ -237,7 +368,7 @@ fn parse_html_node(
     source_range: Range<usize>,
     node: &Node,
     elements: &mut Vec<ParsedHtmlElement>,
-    context: &ParseHtmlNodeContext,
+    context: &ParseHtmlNodeContext<'_>,
 ) {
     match &node.data {
         NodeData::Document => {
@@ -319,22 +450,26 @@ fn parse_html_node(
                     }));
                 }
             } else if name.local == local_name!("ul") || name.local == local_name!("ol") {
-                if let Some(list) = extract_html_list(
-                    node,
-                    name.local == local_name!("ol"),
-                    context.list_item_depth,
-                    source_range,
-                ) {
+                if let Some(list) =
+                    extract_html_list(node, name.local == local_name!("ol"), context, source_range)
+                {
                     elements.push(ParsedHtmlElement::List(list));
                 }
             } else if name.local == local_name!("blockquote") {
-                if let Some(blockquote) = extract_html_blockquote(node, source_range) {
+                if let Some(blockquote) = extract_html_blockquote(node, context, source_range) {
                     elements.push(ParsedHtmlElement::BlockQuote(blockquote));
                 }
             } else if name.local == local_name!("table") {
                 if let Some(table) = extract_html_table(node, source_range) {
                     elements.push(ParsedHtmlElement::Table(table));
                 }
+            } else if name.local == local_name!("details") {
+                elements.push(ParsedHtmlElement::Details(extract_html_details(
+                    node,
+                    attrs,
+                    source_range,
+                    context,
+                )));
             } else {
                 consume_children(source_range, node, elements, context);
             }
@@ -531,11 +666,50 @@ fn parse_table_column(source_range: Range<usize>, node: &Node) -> Option<ParsedH
     }
 }
 
+fn extract_html_details(
+    node: &Node,
+    attrs: &RefCell<Vec<Attribute>>,
+    source_range: Range<usize>,
+    context: &ParseHtmlNodeContext<'_>,
+) -> ParsedHtmlDetails {
+    let ordinal = context.details_seen.get();
+    context.details_seen.set(ordinal + 1);
+
+    let mut summary = HtmlParagraph::new();
+    let mut body = Vec::new();
+    for child in node.children.borrow().iter() {
+        let is_summary = matches!(
+            &child.data,
+            NodeData::Element { name, .. } if name.local == local_name!("summary")
+        );
+        if is_summary && summary.is_empty() {
+            consume_paragraph(
+                source_range.clone(),
+                child,
+                &mut summary,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+        } else {
+            parse_html_node(source_range.clone(), child, &mut body, context);
+        }
+    }
+
+    ParsedHtmlDetails {
+        source_range,
+        ordinal,
+        open: attr_value(attrs, local_name!("open")).is_some(),
+        summary,
+        body,
+        closed: !context.unclosed_details.contains(&ordinal),
+    }
+}
+
 fn consume_children(
     source_range: Range<usize>,
     node: &Node,
     elements: &mut Vec<ParsedHtmlElement>,
-    context: &ParseHtmlNodeContext,
+    context: &ParseHtmlNodeContext<'_>,
 ) {
     for child in node.children.borrow().iter() {
         parse_html_node(source_range.clone(), child, elements, context);
@@ -672,9 +846,10 @@ fn extract_image(source_range: Range<usize>, attrs: &RefCell<Vec<Attribute>>) ->
 fn extract_html_list(
     node: &Node,
     ordered: bool,
-    depth: u16,
+    context: &ParseHtmlNodeContext<'_>,
     source_range: Range<usize>,
 ) -> Option<ParsedHtmlList> {
+    let depth = context.list_item_depth;
     let mut items = Vec::with_capacity(node.children.borrow().len());
 
     for (index, child) in node.children.borrow().iter().enumerate() {
@@ -690,6 +865,7 @@ fn extract_html_list(
                 &mut content,
                 &ParseHtmlNodeContext {
                     list_item_depth: depth + 1,
+                    ..*context
                 },
             );
 
@@ -737,6 +913,7 @@ fn parse_html_element_dimension(value: &str) -> Option<DefiniteLength> {
 
 fn extract_html_blockquote(
     node: &Node,
+    context: &ParseHtmlNodeContext<'_>,
     source_range: Range<usize>,
 ) -> Option<ParsedHtmlBlockQuote> {
     let mut children = Vec::new();
@@ -744,7 +921,10 @@ fn extract_html_blockquote(
         source_range.clone(),
         node,
         &mut children,
-        &ParseHtmlNodeContext::default(),
+        &ParseHtmlNodeContext {
+            list_item_depth: 1,
+            ..*context
+        },
     );
 
     if children.is_empty() {
@@ -808,6 +988,78 @@ fn extract_html_table(node: &Node, source_range: Range<usize>) -> Option<ParsedH
 mod tests {
     use super::*;
     use gpui::TextAlign;
+
+    #[test]
+    fn a_details_inside_a_tag_s_attributes_is_not_a_details_element() {
+        let has_details = |html: &str| {
+            let parsed = parse_html_block(html, 0..html.len()).unwrap();
+            let mut found = Vec::new();
+            collect_open_ended_details(&parsed.children, &mut found);
+            !found.is_empty()
+                || matches!(parsed.children.first(), Some(ParsedHtmlElement::Details(_)))
+        };
+        assert!(has_details("1 < 2 <details><summary>S</summary>"));
+        assert!(!has_details("<b <details><summary>S</summary>"));
+    }
+
+    fn paragraph_text(element: &ParsedHtmlElement) -> String {
+        let ParsedHtmlElement::Paragraph(paragraph) = element else {
+            panic!("expected paragraph, got {element:?}");
+        };
+        paragraph
+            .contents
+            .iter()
+            .map(|chunk| match chunk {
+                HtmlParagraphChunk::Text(text) => text.contents.to_string(),
+                chunk => panic!("expected text, got {chunk:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_closing_block_keeps_the_content_after_the_tag_apart_from_the_content_before_it() {
+        let html = "<p>hidden</p>\n</details>\n<p>shown</p>";
+        let parsed = parse_html_block(html, 0..html.len()).unwrap();
+        assert_eq!(parsed.children.len(), 2);
+        assert_eq!(paragraph_text(&parsed.children[0]), "hidden");
+        let tail = parsed.elements(Some(0));
+        assert_eq!(tail.len(), 1);
+        assert_eq!(paragraph_text(&tail[0]), "shown");
+        // Without a collapsed region closing here, the block shows all of it.
+        assert_eq!(parsed.elements(None).len(), 2);
+    }
+
+    #[test]
+    fn the_content_after_a_closing_tag_is_sourced_from_where_it_starts() {
+        let html = "<p>hidden</p>\n</details>\n<p>shown</p>";
+        let parsed = parse_html_block(html, 10..10 + html.len()).unwrap();
+        let tail_start = html.find("</details>").unwrap() + "</details>".len();
+        assert_eq!(parsed.elements_source_start(Some(0)), 10 + tail_start);
+        assert_eq!(parsed.elements_source_start(None), 10);
+    }
+
+    #[test]
+    fn a_closing_block_with_nothing_before_the_tag_has_no_tail() {
+        let html = "</details>\n<p>shown</p>";
+        let parsed = parse_html_block(html, 0..html.len()).unwrap();
+        assert_eq!(parsed.closing_tails, [None]);
+        assert_eq!(parsed.elements(Some(0)).len(), parsed.children.len());
+    }
+
+    #[test]
+    fn a_details_after_the_closing_tag_keeps_its_number_in_the_block() {
+        let html = "<p>x</p></details>\n<details>\n<summary>S</summary>";
+        let parsed = parse_html_block(html, 0..html.len()).unwrap();
+        let ordinals = |tail: Option<usize>| {
+            parsed
+                .open_ended_details(tail)
+                .iter()
+                .map(|details| details.ordinal)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ordinals(None), [0]);
+        assert_eq!(ordinals(Some(0)), [0]);
+    }
 
     #[test]
     fn parses_html_styled_text() {

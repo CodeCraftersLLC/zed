@@ -94,6 +94,12 @@
 //! - [`Interactivity::paint`], which is called by:
 //! - [`StatefulInteractiveElement::on_a11y_action`], which is a public-facing API
 //!
+//! [`Interactivity::paint`] also registers a [`Action::Click`] listener for an
+//! element that has click handlers and no explicit [`Action::Click`] listener. It
+//! runs the handlers directly with a keyboard click event: the mouse press that
+//! [`Window::handle_a11y_action`] synthesises when no listener matches is
+//! hit-tested, so it misses a control that is clipped out of its container.
+//!
 //! These are cleared at the start of a frame, and re-populated during painting.
 //!
 //! [`NodeId`]: accesskit::NodeId

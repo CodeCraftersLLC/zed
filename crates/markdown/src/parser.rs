@@ -479,6 +479,20 @@ pub(crate) fn parse_markdown_with_options(
                     source_range: Range<usize>,
                     merged_range: Range<usize>,
                     parsed: CowStr<'a>,
+                    /// An inline HTML tag between two pieces of text. It adds nothing to the merged
+                    /// text that links are found in, but stays an event of its own.
+                    is_inline_html: bool,
+                }
+
+                fn event_for_range(
+                    text: &str,
+                    range: TextRange<'_>,
+                ) -> (Range<usize>, MarkdownEvent) {
+                    if range.is_inline_html {
+                        (range.source_range, MarkdownEvent::InlineHtml)
+                    } else {
+                        event_for(text, range.source_range, &range.parsed)
+                    }
                 }
 
                 let mut last_len = parsed.len();
@@ -486,6 +500,7 @@ pub(crate) fn parse_markdown_with_options(
                     source_range: range.clone(),
                     merged_range: 0..last_len,
                     parsed,
+                    is_inline_html: false,
                 }];
 
                 while matches!(parser.peek(), Some((pulldown_cmark::Event::Text(_), _)))
@@ -498,6 +513,7 @@ pub(crate) fn parse_markdown_with_options(
                     let Some((next_event, next_range)) = parser.next() else {
                         unreachable!()
                     };
+                    let is_inline_html = matches!(next_event, pulldown_cmark::Event::InlineHtml(_));
                     let next_text = match next_event {
                         pulldown_cmark::Event::Text(next_event) => next_event,
                         pulldown_cmark::Event::InlineHtml(_) => CowStr::Borrowed(""),
@@ -508,6 +524,7 @@ pub(crate) fn parse_markdown_with_options(
                         source_range: next_range.clone(),
                         merged_range: last_len..next_len,
                         parsed: next_text,
+                        is_inline_html,
                     });
                     last_len = next_len;
                 }
@@ -534,7 +551,7 @@ pub(crate) fn parse_markdown_with_options(
                             .is_some_and(|range| range.merged_range.end <= link_start_in_merged)
                         {
                             let range = ranges.next().unwrap();
-                            let (range, event) = event_for(text, range.source_range, &range.parsed);
+                            let (range, event) = event_for_range(text, range);
                             state.push_event(range, event);
                         }
 
@@ -559,13 +576,15 @@ pub(crate) fn parse_markdown_with_options(
                         let mut link_end_in_source = range.source_range.end;
                         let mut link_events = Vec::new();
 
-                        while ranges
-                            .peek()
-                            .is_some_and(|range| range.merged_range.end <= link_end_in_merged)
-                        {
+                        // A tag right after the link is not part of it.
+                        while ranges.peek().is_some_and(|range| {
+                            range.merged_range.end <= link_end_in_merged
+                                && !(range.is_inline_html
+                                    && range.merged_range.start >= link_end_in_merged)
+                        }) {
                             let range = ranges.next().unwrap();
                             link_end_in_source = range.source_range.end;
-                            link_events.push(event_for(text, range.source_range, &range.parsed));
+                            link_events.push(event_for_range(text, range));
                         }
 
                         if let Some(range) = ranges.peek_mut() {
@@ -605,7 +624,7 @@ pub(crate) fn parse_markdown_with_options(
                 }
 
                 for range in ranges {
-                    let (range, event) = event_for(text, range.source_range, &range.parsed);
+                    let (range, event) = event_for_range(text, range);
                     state.push_event(range, event);
                 }
             }
@@ -908,6 +927,52 @@ mod tests {
     const UNWANTED_OPTIONS: Options = Options::ENABLE_MATH
         .union(Options::ENABLE_DEFINITION_LIST)
         .union(Options::ENABLE_WIKILINKS);
+
+    #[test]
+    fn inline_html_after_text_keeps_its_event() {
+        let source = "see <b>bold</b> here";
+        let events: Vec<_> = parse_markdown_with_options(source, true, false, false)
+            .events
+            .into_iter()
+            .map(|(range, event)| (&source[range], event))
+            .filter(|(_, event)| !matches!(event, RootStart | RootEnd(_)))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                ("see <b>bold</b> here", Start(Paragraph)),
+                ("see ", Text),
+                ("<b>", InlineHtml),
+                ("bold", Text),
+                ("</b>", InlineHtml),
+                (" here", Text),
+                ("see <b>bold</b> here", End(MarkdownTagEnd::Paragraph)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tag_right_after_an_autolink_is_not_part_of_it() {
+        let source = "see https://example.com<b> bold</b>";
+        let events: Vec<_> = parse_markdown_with_options(source, true, false, false)
+            .events
+            .into_iter()
+            .map(|(range, event)| (&source[range], event))
+            .filter(|(_, event)| !matches!(event, RootStart | RootEnd(_)))
+            .collect();
+        let link = |events: &[(&str, MarkdownEvent)]| {
+            events
+                .iter()
+                .find(|(_, event)| matches!(event, Start(Link { .. })))
+                .map(|(text, _)| text.to_string())
+        };
+        assert_eq!(link(&events).as_deref(), Some("https://example.com"));
+        let end_of_link = events
+            .iter()
+            .position(|(_, event)| matches!(event, End(MarkdownTagEnd::Link)))
+            .unwrap();
+        assert_eq!(events[end_of_link + 1], ("<b>", InlineHtml));
+    }
 
     #[test]
     fn all_options_considered() {

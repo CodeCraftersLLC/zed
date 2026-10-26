@@ -7786,6 +7786,7 @@ dependencies = [
  "parking_lot",
  "pathfinder_geometry",
  "pin-project",
+ "png 0.18.0",
  "pollster 0.4.0",
  "postage",
  "profiling",

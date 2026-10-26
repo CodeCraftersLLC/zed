@@ -17,7 +17,7 @@ pub fn generate_heading_slug(text: &str) -> String {
 }
 
 /// Returns true if the URL starts with a URI scheme (RFC 3986 §3.1).
-fn has_uri_scheme(url: &str) -> bool {
+pub fn has_uri_scheme(url: &str) -> bool {
     let mut chars = url.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() => {}
@@ -32,6 +32,23 @@ fn has_uri_scheme(url: &str) -> bool {
         }
     }
     false
+}
+
+/// URL schemes a link may hand to the operating system; every other scheme is refused.
+const OS_OPENABLE_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
+
+pub fn is_os_openable_scheme(scheme: &str) -> bool {
+    OS_OPENABLE_SCHEMES
+        .iter()
+        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+}
+
+/// Returns true if `link` is an absolute URL whose scheme may be handed to the operating system.
+pub fn is_os_openable_link(link: &str) -> bool {
+    has_uri_scheme(link)
+        && link
+            .split_once(':')
+            .is_some_and(|(scheme, _)| is_os_openable_scheme(scheme))
 }
 
 /// Splits a relative URL into its path and `#fragment` parts.
@@ -348,6 +365,38 @@ mod tests {
             split_local_url_fragment("123:not-a-scheme#frag"),
             ("123:not-a-scheme", Some("frag"))
         );
+    }
+
+    #[test]
+    fn only_http_https_and_mailto_links_are_os_openable() {
+        for openable in [
+            "https://example.com",
+            "HTTP://example.com",
+            "http://example.com",
+            "mailto:user@example.com",
+            "MailTo:user@example.com",
+        ] {
+            assert!(is_os_openable_link(openable), "{openable:?} was refused");
+        }
+
+        for refused in [
+            "calc.exe",
+            "nonexistent.txt",
+            "./docs/readme.md",
+            "ms-msdt:/id x",
+            "search-ms:query=a",
+            "vscode://x",
+            "ftp://h/x",
+            "file:///etc/hosts",
+            "javascript:alert(1)",
+            "C:\\Windows\\System32\\calc.exe",
+            "\\\\server\\share\\x.exe",
+            " https://example.com",
+            "https",
+            "",
+        ] {
+            assert!(!is_os_openable_link(refused), "{refused:?} was allowed");
+        }
     }
 
     #[test]
