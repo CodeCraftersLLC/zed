@@ -1412,7 +1412,10 @@ impl WorktreeHandle {
 fn path_for_message(path: &Path) -> String {
     let mut shown = String::new();
     for c in path.display().to_string().chars() {
-        if c.is_control() || is_invisible_format_or_separator(c) {
+        // On Windows a backslash is the path separator; elsewhere it is a name character that
+        // would otherwise read the same as the escape for a control character.
+        let is_name_backslash = c == '\\' && !cfg!(windows);
+        if c.is_control() || is_name_backslash || is_invisible_format_or_separator(c) {
             shown.extend(c.escape_default());
         } else {
             shown.push(c);
@@ -1434,6 +1437,13 @@ fn is_invisible_format_or_separator(c: char) -> bool {
 mod tests {
     use super::path_for_message;
     use std::path::Path;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_literal_backslash_is_distinct_from_an_escaped_control_character() {
+        assert_eq!(path_for_message(Path::new("a\\nb")), "a\\\\nb");
+        assert_eq!(path_for_message(Path::new("a\nb")), "a\\nb");
+    }
 
     #[test]
     fn a_path_in_a_message_cannot_break_the_line() {
