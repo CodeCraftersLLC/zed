@@ -297,6 +297,13 @@ impl BranchDiff {
             .is_some_and(|task| !task.is_ready())
     }
 
+    /// True while the active repository exists but its first status scan has not landed.
+    pub fn is_status_loading(&self, cx: &App) -> bool {
+        self.repo
+            .as_ref()
+            .is_some_and(|repo| !repo.read(cx).snapshot().has_scanned_statuses())
+    }
+
     pub async fn reload_tree_diff(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let task = this.update(cx, |this, cx| {
             let DiffBase::Merge { base_ref } = this.diff_base.clone() else {

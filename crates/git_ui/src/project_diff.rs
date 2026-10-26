@@ -1487,10 +1487,19 @@ impl Item for ProjectDiff {
     }
 }
 
+impl ProjectDiff {
+    fn is_loading(&self, cx: &App) -> bool {
+        let branch_diff = self.branch_diff.read(cx);
+        branch_diff.is_tree_base_loading()
+            || branch_diff.is_status_loading(cx)
+            || !self._task.is_ready()
+    }
+}
+
 impl Render for ProjectDiff {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_empty = self.multibuffer.read(cx).is_empty();
-        let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
+        let is_loading = self.is_loading(cx);
 
         let is_branch_diff_view = matches!(self.diff_base(cx), DiffBase::Merge { .. });
 
@@ -2211,7 +2220,7 @@ mod tests {
     use project::FakeFs;
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};
-    use std::path::Path;
+    use std::{cell::RefCell, path::Path, rc::Rc};
     use unindent::Unindent as _;
     use util::{
         path,
@@ -3107,6 +3116,131 @@ mod tests {
 
         assert_eq!(active_base_ref, "origin/main");
         assert_eq!(base_refs, vec!["origin/main", "topic"]);
+    }
+
+    async fn open_project_diff_before_first_scan(
+        modified: bool,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ProjectDiff>, &mut gpui::VisualTestContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "README.md": "# My cool project\n" }),
+        )
+        .await;
+        let working = if modified {
+            "# Changed\n"
+        } else {
+            "# My cool project\n"
+        };
+        fs.insert_file(path!("/project/README.md"), working.into())
+            .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("README.md", "# My cool project\n".to_owned())],
+        );
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.focus(&workspace);
+        cx.update(|window, cx| {
+            window.dispatch_action(project_diff::Diff.boxed_clone(), cx);
+        });
+        let item = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
+        });
+        (item, cx)
+    }
+
+    #[gpui::test]
+    async fn test_loading_until_first_status_scan_with_changes(cx: &mut TestAppContext) {
+        let (item, cx) = open_project_diff_before_first_scan(true, cx).await;
+        assert!(
+            item.read_with(cx, |item, cx| item.is_loading(cx)),
+            "diff must be loading before the first status scan"
+        );
+        cx.run_until_parked();
+        item.read_with(cx, |item, cx| {
+            assert!(!item.is_loading(cx));
+            assert!(
+                !item.multibuffer.read(cx).is_empty(),
+                "excerpt must be present"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_clean_repository_stops_loading_after_first_scan(cx: &mut TestAppContext) {
+        let (item, cx) = open_project_diff_before_first_scan(false, cx).await;
+        assert!(item.read_with(cx, |item, cx| item.is_loading(cx)));
+        cx.run_until_parked();
+        item.read_with(cx, |item, cx| {
+            assert!(!item.is_loading(cx));
+            assert!(item.multibuffer.read(cx).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_loading_between_head_scan_and_status_scan(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "README.md": "# Changed\n" }))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.focus(&workspace);
+        cx.update(|window, cx| {
+            window.dispatch_action(project_diff::Diff.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+        let item = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
+        });
+        assert!(!item.read_with(cx, |item, cx| item.is_loading(cx)));
+
+        let loading_at_head_scan = Rc::new(RefCell::new(Vec::new()));
+        let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+        let _subscription = cx.update(|_, cx| {
+            let loading_at_head_scan = loading_at_head_scan.clone();
+            let item = item.clone();
+            cx.subscribe(&git_store, move |_, event, cx| {
+                if matches!(
+                    event,
+                    project::git_store::GitStoreEvent::RepositoryUpdated(
+                        _,
+                        project::git_store::RepositoryEvent::HeadChanged,
+                        _
+                    )
+                ) {
+                    loading_at_head_scan
+                        .borrow_mut()
+                        .push(item.read(cx).is_loading(cx));
+                }
+            })
+        });
+
+        fs::Fs::create_dir(fs.as_ref(), path!("/project/.git").as_ref())
+            .await
+            .unwrap();
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("README.md", "# My cool project\n".to_owned())],
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            loading_at_head_scan.borrow().first(),
+            Some(&true),
+            "diff must stay loading after HEAD is read but before statuses are scanned"
+        );
+        item.read_with(cx, |item, cx| {
+            assert!(!item.is_loading(cx));
+            assert!(!item.multibuffer.read(cx).is_empty());
+        });
     }
 
     #[gpui::test]

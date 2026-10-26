@@ -132,6 +132,9 @@ message UpdateRepository {
   optional string repository_dir_abs_path = 19;
   optional string common_dir_abs_path = 20;
   optional string branch_list_error = 21;
+  // Whether `updated_statuses` of the repository's updates so far hold a full status scan.
+  // Absent from a sender that predates the field, which only sends an update once it has scanned.
+  optional bool statuses_scanned = 22;
 }
 
 message RemoveRepository {

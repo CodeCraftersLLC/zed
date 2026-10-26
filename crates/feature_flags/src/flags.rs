@@ -95,6 +95,11 @@ impl FeatureFlag for ProjectPanelUndoRedoFeatureFlag {
     fn enabled_for_staff() -> bool {
         true
     }
+
+    /// Cherry Pick has no staff or server flags, so a release build would never handle Undo.
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 register_feature_flag!(ProjectPanelUndoRedoFeatureFlag);
 
@@ -149,3 +154,17 @@ impl FeatureFlag for SandboxingFeatureFlag {
     type Value = PresenceFlag;
 }
 register_feature_flag!(SandboxingFeatureFlag);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FeatureFlagStore;
+
+    #[test]
+    fn the_tree_undo_redo_flag_is_on_without_staff_or_a_flag_store() {
+        assert!(ProjectPanelUndoRedoFeatureFlag::enabled_for_all());
+        assert!(FeatureFlagStore::has_flag_default::<
+            ProjectPanelUndoRedoFeatureFlag,
+        >());
+    }
+}

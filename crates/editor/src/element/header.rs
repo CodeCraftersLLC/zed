@@ -614,6 +614,17 @@ pub(crate) fn header_jump_data(
     }
 }
 
+/// Whether a header carries the Open File button and lets its file name open the file. A deleted
+/// file has nothing to open (the action would do nothing) and a header without a path has nothing
+/// to name; a buffer with no file has no path. `file` is the buffer file's `(can_open, disk_state)`.
+fn shows_open_file_button(
+    file: Option<(bool, language::DiskState)>,
+    has_relative_path: bool,
+) -> bool {
+    has_relative_path
+        && file.is_none_or(|(can_open, disk_state)| can_open && !disk_state.is_deleted())
+}
+
 pub(crate) fn render_buffer_header(
     editor: &Entity<Editor>,
     for_excerpt: &ExcerptBoundaryInfo,
@@ -658,9 +669,10 @@ pub(crate) fn render_buffer_header(
         .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
         .unwrap_or_default();
     let file = buffer.file();
-    let can_open_excerpts = file.is_none_or(|file| file.can_open());
+    let open_file_button_file = file.map(|file| (file.can_open(), file.disk_state()));
     let path_style = file.map(|file| file.path_style(cx));
     let relative_path = buffer.resolve_file_path(include_root, cx);
+    let shows_open_file = shows_open_file_button(open_file_button_file, relative_path.is_some());
     let (parent_path, filename) = if let Some(path) = &relative_path {
         if let Some(path_style) = path_style {
             let (dir, file_name) = path_style.split(path);
@@ -832,24 +844,30 @@ pub(crate) fn render_buffer_header(
                                                     ),
                                             )
                                             .tooltip(move |_, cx| {
-                                                Tooltip::with_meta(
-                                                    "Open File",
-                                                    None,
-                                                    full_path.clone(),
-                                                    cx,
-                                                )
-                                            })
-                                            .on_click(window.listener_for(editor, {
-                                                let jump_data = jump_data.clone();
-                                                move |editor, e: &ClickEvent, window, cx| {
-                                                    editor.open_excerpts_common(
-                                                        Some(jump_data.clone()),
-                                                        e.modifiers().secondary(),
-                                                        window,
+                                                if shows_open_file {
+                                                    Tooltip::with_meta(
+                                                        "Open File",
+                                                        None,
+                                                        full_path.clone(),
                                                         cx,
-                                                    );
+                                                    )
+                                                } else {
+                                                    Tooltip::simple(full_path.clone(), cx)
                                                 }
-                                            })),
+                                            })
+                                            .when(shows_open_file, |button| {
+                                                button.on_click(window.listener_for(editor, {
+                                                    let jump_data = jump_data.clone();
+                                                    move |editor, e: &ClickEvent, window, cx| {
+                                                        editor.open_excerpts_common(
+                                                            Some(jump_data.clone()),
+                                                            e.modifiers().secondary(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                }))
+                                            }),
                                     )
                                     .when_some(parent_path, |then, path| {
                                         then.child(
@@ -886,7 +904,7 @@ pub(crate) fn render_buffer_header(
                                     })
                             },
                         ))
-                        .when(can_open_excerpts && relative_path.is_some(), |this| {
+                        .when(shows_open_file, |this| {
                             this.child(
                                 div()
                                     .when(!is_selected, |this| {
@@ -1069,4 +1087,33 @@ fn file_status_label_color(file_status: Option<FileStatus>) -> Color {
             Color::Default
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shows_open_file_button;
+    use language::DiskState;
+
+    #[test]
+    fn the_header_shows_open_file_only_for_an_openable_existing_file() {
+        let present = DiskState::Present {
+            mtime: fs::MTime::from_seconds_and_nanos(100, 0),
+            size: 10,
+        };
+        assert!(shows_open_file_button(Some((true, present)), true));
+        assert!(
+            shows_open_file_button(Some((true, DiskState::New)), true),
+            "a new, unsaved file still has a buffer to open"
+        );
+        assert!(!shows_open_file_button(
+            Some((true, DiskState::Deleted)),
+            true
+        ));
+        assert!(!shows_open_file_button(
+            Some((true, DiskState::Historic { was_deleted: true })),
+            true
+        ));
+        assert!(!shows_open_file_button(Some((false, present)), true));
+        assert!(!shows_open_file_button(Some((true, present)), false));
+    }
 }

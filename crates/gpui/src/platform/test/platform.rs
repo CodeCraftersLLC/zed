@@ -2,9 +2,9 @@ use crate::{
     AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
     DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, PathPromptOptions, Platform,
     PlatformDisplay, PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper,
-    PlatformTextSystem, PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
-    SourceMetadata, Task, TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams,
-    size,
+    PlatformTextSystem, PromptButton, PromptLevel, ScreenCaptureFrame, ScreenCaptureSource,
+    ScreenCaptureStream, SourceMetadata, Task, TestDisplay, TestWindow, ThermalState,
+    WindowAppearance, WindowParams, size,
 };
 use anyhow::Result;
 use collections::VecDeque;
@@ -33,6 +33,8 @@ pub(crate) struct TestPlatform {
     pub(crate) prompts: RefCell<TestPrompts>,
     screen_capture_sources: RefCell<Vec<TestScreenCaptureSource>>,
     pub opened_url: RefCell<Option<String>>,
+    /// The paths handed to `open_with_system`, oldest first.
+    pub opened_with_system: RefCell<Vec<std::path::PathBuf>>,
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
@@ -76,6 +78,7 @@ impl ScreenCaptureStream for TestScreenCaptureStream {
 }
 
 struct TestPrompt {
+    level: PromptLevel,
     msg: String,
     detail: Option<String>,
     answers: Vec<String>,
@@ -134,6 +137,7 @@ impl TestPlatform {
             current_find_pasteboard_item: Mutex::new(None),
             weak: weak.clone(),
             opened_url: Default::default(),
+            opened_with_system: Default::default(),
             text_system,
             headless_renderer_factory,
         })
@@ -200,6 +204,10 @@ impl TestPlatform {
         !self.prompts.borrow().multiple_choice.is_empty()
     }
 
+    pub(crate) fn pending_prompt_level(&self) -> Option<PromptLevel> {
+        Some(self.prompts.borrow().multiple_choice.front()?.level)
+    }
+
     pub(crate) fn pending_prompt(&self) -> Option<(String, String)> {
         let prompts = self.prompts.borrow();
         let prompt = prompts.multiple_choice.front()?;
@@ -215,6 +223,7 @@ impl TestPlatform {
 
     pub(crate) fn prompt(
         &self,
+        level: PromptLevel,
         msg: &str,
         detail: Option<&str>,
         answers: &[PromptButton],
@@ -225,6 +234,7 @@ impl TestPlatform {
             .borrow_mut()
             .multiple_choice
             .push_back(TestPrompt {
+                level,
                 msg: msg.to_string(),
                 detail: detail.map(|s| s.to_string()),
                 answers,
@@ -491,8 +501,10 @@ impl Platform for TestPlatform {
         unimplemented!()
     }
 
-    fn open_with_system(&self, _path: &Path) {
-        unimplemented!()
+    fn open_with_system(&self, path: &Path) {
+        self.opened_with_system
+            .borrow_mut()
+            .push(path.to_path_buf());
     }
 }
 

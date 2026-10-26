@@ -2,7 +2,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, AtomicUsize},
     },
 };
@@ -17,6 +17,7 @@ use gpui::{
 };
 use itertools::Either;
 use postage::{prelude::Stream as _, watch};
+use regex::Regex;
 use rpc::{
     AnyProtoClient, ErrorExt, TypedEnvelope,
     proto::{self, REMOTE_SERVER_PROJECT_ID},
@@ -587,7 +588,13 @@ impl WorktreeStore {
                             },
                         )
                         .await
-                        .with_context(|| format!("renaming {old_path:?} into {new_path:?}"))
+                        .with_context(|| {
+                            format!(
+                                "renaming {} into {}",
+                                path_for_message(old_path),
+                                path_for_message(new_path)
+                            )
+                        })
                     };
 
                 let rename = cx.background_spawn({
@@ -1398,5 +1405,67 @@ impl WorktreeHandle {
             WorktreeHandle::Strong(handle) => Some(handle.clone()),
             WorktreeHandle::Weak(handle) => handle.upgrade(),
         }
+    }
+}
+
+/// A path as an error message shows it. Control characters, a newline in a file name for one,
+/// are escaped so that a name cannot rewrite the message around it.
+fn path_for_message(path: &Path) -> String {
+    let mut shown = String::new();
+    for c in path.display().to_string().chars() {
+        // On Windows a backslash is the path separator; elsewhere it is a name character that
+        // would otherwise read the same as the escape for a control character.
+        let is_name_backslash = c == '\\' && !cfg!(windows);
+        if c.is_control() || is_name_backslash || is_invisible_format_or_separator(c) {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
+/// Characters that draw nothing or reorder what is around them: every Unicode format character
+/// (`Cf`: zero-width and bidi marks and overrides, invisible operators, the BOM, tag characters)
+/// and the line and paragraph separators (`Zl`, `Zp`).
+fn is_invisible_format_or_separator(c: char) -> bool {
+    static INVISIBLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^[\p{Cf}\p{Zl}\p{Zp}]$").expect("a valid character class"));
+    INVISIBLE.is_match(c.encode_utf8(&mut [0; 4]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_for_message;
+    use std::path::Path;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_literal_backslash_is_distinct_from_an_escaped_control_character() {
+        assert_eq!(path_for_message(Path::new("a\\nb")), "a\\\\nb");
+        assert_eq!(path_for_message(Path::new("a\nb")), "a\\nb");
+    }
+
+    #[test]
+    fn a_path_in_a_message_cannot_break_the_line() {
+        assert_eq!(path_for_message(Path::new("a/b.txt")), "a/b.txt");
+        assert_eq!(
+            path_for_message(Path::new("dir/two\nlines\t\u{7}.txt")),
+            "dir/two\\nlines\\t\\u{7}.txt"
+        );
+        assert_eq!(
+            path_for_message(Path::new(
+                "a\u{202e}txt.exe\u{2066}\u{200f}\u{2028}\u{2029}b"
+            )),
+            "a\\u{202e}txt.exe\\u{2066}\\u{200f}\\u{2028}\\u{2029}b"
+        );
+        assert_eq!(
+            path_for_message(Path::new("a\u{600}b\u{180e}c\u{e0001}d\u{110bd}e")),
+            "a\\u{600}b\\u{180e}c\\u{e0001}d\\u{110bd}e"
+        );
+        assert_eq!(
+            path_for_message(Path::new("caf\u{e9}/\u{65e5}\u{672c}")),
+            "caf\u{e9}/\u{65e5}\u{672c}"
+        );
     }
 }

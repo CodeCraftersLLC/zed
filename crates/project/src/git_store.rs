@@ -306,6 +306,9 @@ pub enum CommitDataState {
 pub struct RepositorySnapshot {
     pub id: RepositoryId,
     pub statuses_by_path: SumTree<StatusEntry>,
+    /// Whether `statuses_by_path` holds a full status scan yet (a local scan, or a
+    /// host's complete update), as opposed to the empty set a new repository starts with.
+    pub statuses_scanned: bool,
     pub work_directory_abs_path: Arc<Path>,
     pub dot_git_abs_path: Arc<Path>,
     /// Absolute path to the directory holding this worktree's Git state.
@@ -4620,6 +4623,10 @@ impl RepositoryId {
 }
 
 impl RepositorySnapshot {
+    pub fn has_scanned_statuses(&self) -> bool {
+        self.statuses_scanned
+    }
+
     fn empty(
         id: RepositoryId,
         work_directory_abs_path: Arc<Path>,
@@ -4638,6 +4645,7 @@ impl RepositorySnapshot {
         Self {
             id,
             statuses_by_path: Default::default(),
+            statuses_scanned: false,
             repository_dir_abs_path,
             dot_git_abs_path,
             common_dir_abs_path,
@@ -4684,6 +4692,7 @@ impl RepositorySnapshot {
             entry_ids: vec![self.id.to_proto()],
             scan_id: self.scan_id,
             is_last_update: true,
+            statuses_scanned: Some(self.statuses_scanned),
             stash_entries: self
                 .stash_entries
                 .entries
@@ -4771,6 +4780,7 @@ impl RepositorySnapshot {
             entry_ids: vec![],
             scan_id: self.scan_id,
             is_last_update: true,
+            statuses_scanned: Some(self.statuses_scanned),
             stash_entries: self
                 .stash_entries
                 .entries
@@ -8320,14 +8330,20 @@ impl Repository {
                     }),
             )
             .collect::<Vec<_>>();
-        if conflicts_changed || !edits.is_empty() {
+        let was_scanned = self.snapshot.has_scanned_statuses();
+        if update.is_last_update {
+            self.snapshot.scan_id = update.scan_id;
+        }
+        self.snapshot.statuses_scanned =
+            statuses_scanned_after(was_scanned, update.is_last_update, update.statuses_scanned);
+        if conflicts_changed
+            || !edits.is_empty()
+            || (!was_scanned && self.snapshot.has_scanned_statuses())
+        {
             cx.emit(RepositoryEvent::StatusesChanged);
         }
         self.snapshot.statuses_by_path.edit(edits, ());
 
-        if update.is_last_update {
-            self.snapshot.scan_id = update.scan_id;
-        }
         self.clear_pending_ops(cx);
         Ok(())
     }
@@ -9482,6 +9498,37 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_guest_counts_statuses_as_scanned_only_when_the_host_had_scanned() {
+        // The host's first, empty snapshot of a new repository.
+        assert!(!statuses_scanned_after(false, true, Some(false)));
+        // A chunk that is not the last says nothing.
+        assert!(!statuses_scanned_after(false, false, Some(true)));
+        assert!(statuses_scanned_after(false, true, Some(true)));
+        // A host that predates the field only sends after its scan.
+        assert!(statuses_scanned_after(false, true, None));
+        // Once scanned, a repository stays so.
+        assert!(statuses_scanned_after(true, true, Some(false)));
+    }
+
+    #[test]
+    fn a_host_says_whether_its_snapshot_holds_a_status_scan() {
+        let mut snapshot = RepositorySnapshot::empty(
+            RepositoryId(1),
+            Path::new("/project").into(),
+            None,
+            None,
+            None,
+            PathStyle::Posix,
+        );
+        let old = snapshot.clone();
+        assert_eq!(snapshot.initial_update(1).statuses_scanned, Some(false));
+        assert_eq!(snapshot.build_update(&old, 1).statuses_scanned, Some(false));
+        snapshot.statuses_scanned = true;
+        assert_eq!(snapshot.initial_update(1).statuses_scanned, Some(true));
+        assert_eq!(snapshot.build_update(&old, 1).statuses_scanned, Some(true));
+    }
+
     #[gpui::test]
     async fn test_open_uncommitted_diff_skips_symlinks(cx: &mut TestAppContext) {
         use util::rel_path::rel_path;
@@ -10121,7 +10168,9 @@ async fn compute_snapshot(
     log::debug!("new merge details: {merge_details:?}");
 
     this.update(cx, |this, cx| {
-        if conflicts_changed || statuses_by_path != this.snapshot.statuses_by_path {
+        let is_first_scan = !this.snapshot.has_scanned_statuses();
+        if is_first_scan || conflicts_changed || statuses_by_path != this.snapshot.statuses_by_path
+        {
             cx.emit(RepositoryEvent::StatusesChanged);
         }
         if stash_entries != this.snapshot.stash_entries {
@@ -10131,10 +10180,23 @@ async fn compute_snapshot(
         this.snapshot.scan_id += 1;
         this.snapshot.merge = merge_details;
         this.snapshot.statuses_by_path = statuses_by_path;
+        this.snapshot.statuses_scanned = true;
         this.snapshot.stash_entries = stash_entries;
 
         this.snapshot.clone()
     })
+}
+
+/// Whether a repository holds a full status scan once an update has landed. Only an update's last
+/// chunk can say so, and only when its sender had scanned: a sender that has not yet scanned (a new
+/// repository's first, empty snapshot) says `false`, and one that predates the field sends no
+/// update before its scan, so it counts as scanned.
+fn statuses_scanned_after(
+    was_scanned: bool,
+    is_last_update: bool,
+    sender_scanned: Option<bool>,
+) -> bool {
+    was_scanned || (is_last_update && sender_scanned.unwrap_or(true))
 }
 
 fn status_from_proto(

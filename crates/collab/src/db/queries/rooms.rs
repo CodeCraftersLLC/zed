@@ -808,6 +808,7 @@ impl Database {
                             abs_path: db_repository.abs_path.clone(),
                             scan_id: db_repository.scan_id as u64,
                             is_last_update: true,
+                            statuses_scanned: None,
                             merge_message: db_repository.merge_message,
                             stash_entries: Vec::new(),
                             remote_upstream_url: db_repository.remote_upstream_url.clone(),

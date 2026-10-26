@@ -72,6 +72,7 @@ use util::{
     paths::{PathStyle, compare_paths},
     rel_path::{RelPath, RelPathBuf},
 };
+use workspace::invalid_item_view::{is_named_like_program_or_shortcut, is_program_or_shortcut};
 use workspace::{
     DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
     SelectedEntry, SplitDirection, Workspace,
@@ -692,6 +693,49 @@ fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
     }
 }
 
+/// Whether `new_path` would land on a sibling other than `own_id`: exactly, or, on a
+/// case-insensitive filesystem, by name ignoring case (`M.RS` collides with `m.rs`), in a
+/// directory ignoring case too (`foo/M.rs` collides with `Foo/m.rs`).
+fn sibling_exists(worktree: &Worktree, new_path: &RelPath, own_id: Option<ProjectEntryId>) -> bool {
+    if worktree
+        .entry_for_path(new_path)
+        .is_some_and(|existing| Some(existing.id) != own_id)
+    {
+        return true;
+    }
+    let case_insensitive = worktree
+        .as_local()
+        .is_some_and(|local| !local.fs_is_case_sensitive());
+    let (Some(parent), Some(name)) = (new_path.parent(), new_path.file_name()) else {
+        return false;
+    };
+    if !case_insensitive {
+        return false;
+    }
+    let matches_ignoring_case = |entry: &worktree::Entry, lowered: &str| {
+        entry
+            .path
+            .file_name()
+            .is_some_and(|entry_name| entry_name.to_lowercase() == lowered)
+    };
+    let mut directory = RelPath::empty_arc();
+    for component in parent.components() {
+        let lowered = component.to_lowercase();
+        let Some(next) = worktree
+            .child_entries(&directory)
+            .find(|entry| matches_ignoring_case(entry, &lowered))
+            .map(|entry| entry.path.clone())
+        else {
+            return false;
+        };
+        directory = next;
+    }
+    let lowered = name.to_lowercase();
+    worktree
+        .child_entries(&directory)
+        .any(|sibling| Some(sibling.id) != own_id && matches_ignoring_case(sibling, &lowered))
+}
+
 impl ProjectPanel {
     fn new(
         workspace: &mut Workspace,
@@ -1159,6 +1203,12 @@ impl ProjectPanel {
             let is_remote = project.is_remote();
             let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
+            // Names only: the menu is built on the UI thread. The action checks the file itself.
+            let offers_default_app = is_local
+                && !is_named_like_program_or_shortcut(
+                    &worktree.absolutize(&entry.path),
+                    entry.canonical_path.as_deref(),
+                );
 
             let settings = ProjectPanelSettings::get_global(cx);
             let visible_worktrees_count = project.visible_worktrees(cx).count();
@@ -1212,7 +1262,7 @@ impl ProjectPanel {
                                     Box::new(RevealInFileManager),
                                 )
                             })
-                            .when(is_local, |menu| {
+                            .when(offers_default_app, |menu| {
                                 menu.action("Open in Default App", Box::new(OpenWithSystem))
                             })
                             .when(context_menu_policy.show_terminal_actions, |menu| {
@@ -1233,9 +1283,11 @@ impl ProjectPanel {
                                     .action("Compare Marked Files", Box::new(CompareMarkedFiles))
                             })
                             .separator()
-                            .action("Cut", Box::new(Cut))
-                            .action("Copy", Box::new(Copy))
-                            .action("Duplicate", Box::new(Duplicate))
+                            .when(!is_root, |menu| {
+                                menu.action("Cut", Box::new(Cut))
+                                    .action("Copy", Box::new(Copy))
+                                    .action("Duplicate", Box::new(Duplicate))
+                            })
                             .action_disabled_when(!has_pasteable_content, "Paste", Box::new(Paste))
                             .when(cx.has_flag::<ProjectPanelUndoRedoFeatureFlag>(), |menu| {
                                 menu.action_disabled_when(
@@ -1842,23 +1894,16 @@ impl ProjectPanel {
                 .worktree_for_id(edit_state.worktree_id, cx)
                 && let Some(entry) = worktree.read(cx).entry_for_id(edit_state.entry_id)
             {
-                let mut already_exists = false;
-                if edit_state.is_new_entry() {
+                let already_exists = if edit_state.is_new_entry() {
                     let new_path = entry.path.join(filename);
-                    if worktree.read(cx).entry_for_path(&new_path).is_some() {
-                        already_exists = true;
-                    }
+                    sibling_exists(worktree.read(cx), &new_path, None)
                 } else {
                     let new_path = if let Some(parent) = entry.path.clone().parent() {
                         parent.join(&filename)
                     } else {
                         filename.into()
                     };
-                    if let Some(existing) = worktree.read(cx).entry_for_path(&new_path)
-                        && existing.id != entry.id
-                    {
-                        already_exists = true;
-                    }
+                    sibling_exists(worktree.read(cx), &new_path, Some(entry.id))
                 };
                 if already_exists {
                     edit_state.validation_state = ValidationState::Error(format!(
@@ -1934,7 +1979,7 @@ impl ProjectPanel {
                 entry_id: NEW_ENTRY_ID,
             });
             let new_path = entry.path.join(&filename);
-            if worktree.read(cx).entry_for_path(&new_path).is_some() {
+            if sibling_exists(worktree.read(cx), &new_path, None) {
                 return None;
             }
 
@@ -1950,8 +1995,12 @@ impl ProjectPanel {
             } else {
                 filename.clone()
             };
-            if let Some(existing) = worktree.read(cx).entry_for_path(&new_path) {
-                if existing.id == entry.id && refocus {
+            let unchanged = worktree
+                .read(cx)
+                .entry_for_path(&new_path)
+                .is_some_and(|existing| existing.id == entry.id);
+            if unchanged || sibling_exists(worktree.read(cx), &new_path, Some(entry.id)) {
+                if unchanged && refocus {
                     window.focus(&self.focus_handle, cx);
                 }
                 return None;
@@ -2628,13 +2677,12 @@ impl ProjectPanel {
                     }
                 };
                 let detail = (!trash).then_some("This cannot be undone.");
-                Some(window.prompt(
-                    PromptLevel::Info,
-                    &prompt,
-                    detail,
-                    &[operation, "Cancel"],
-                    cx,
-                ))
+                let level = if trash {
+                    PromptLevel::Info
+                } else {
+                    PromptLevel::Warning
+                };
+                Some(window.prompt(level, &prompt, detail, &[operation, "Cancel"], cx))
             } else {
                 None
             };
@@ -3786,7 +3834,20 @@ impl ProjectPanel {
     fn open_system(&mut self, _: &OpenWithSystem, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((worktree, entry)) = self.selected_entry(cx) {
             let abs_path = worktree.absolutize(&entry.path);
-            cx.open_with_system(&abs_path);
+            // Looking at the file can block on a slow mount, so it is not done on this thread.
+            cx.spawn(async move |_, cx| {
+                let is_program = cx
+                    .background_executor()
+                    .spawn({
+                        let abs_path = abs_path.clone();
+                        async move { is_program_or_shortcut(&abs_path) }
+                    })
+                    .await;
+                if !is_program {
+                    cx.update(|cx| cx.open_with_system(&abs_path));
+                }
+            })
+            .detach();
         }
     }
 

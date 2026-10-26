@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!(binary_blob_caption(Some(&shown)), "2.0 KB");
         let reduced = BinaryBlob {
             size: 775 * 1024 + 205,
-            image: shown.image.clone(),
+            image: shown.image,
             reason: Some(NoPreviewReason::TooManyPixels {
                 width: 16_000,
                 height: 16_000,

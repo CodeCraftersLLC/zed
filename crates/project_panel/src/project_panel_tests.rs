@@ -11320,3 +11320,262 @@ async fn test_delete_prompt_escapes_markdown_in_file_name(cx: &mut gpui::TestApp
         "Are you sure you want to permanently delete `__somefile__`?"
     );
 }
+
+async fn panel_for(
+    fs: &Arc<FakeFs>,
+    cx: &mut TestAppContext,
+) -> (Entity<ProjectPanel>, VisualTestContext) {
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(&mut cx, ProjectPanel::new);
+    cx.run_until_parked();
+    (panel, cx)
+}
+
+fn context_menu_labels(
+    panel: &Entity<ProjectPanel>,
+    path: &str,
+    cx: &mut VisualTestContext,
+) -> Vec<String> {
+    select_path(panel, path, cx);
+    panel.update_in(cx, |panel, window, cx| {
+        let entry_id = panel.selection.unwrap().entry_id;
+        panel.deploy_context_menu(
+            gpui::point(gpui::px(1.), gpui::px(1.)),
+            entry_id,
+            window,
+            cx,
+        );
+        let (menu, _, _) = panel.context_menu.as_ref().expect("the menu opened");
+        menu.read(cx)
+            .entry_labels()
+            .into_iter()
+            .map(|label| label.to_string())
+            .collect()
+    })
+}
+
+#[gpui::test]
+async fn test_root_menu_has_no_cut_copy_or_duplicate(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "" })).await;
+    let (panel, mut cx) = panel_for(&fs, cx).await;
+
+    let root = context_menu_labels(&panel, "root", &mut cx);
+    for label in ["Cut", "Copy", "Duplicate"] {
+        assert!(
+            !root.iter().any(|entry| entry == label),
+            "{label}: {root:?}"
+        );
+    }
+    assert!(root.iter().any(|entry| entry == "Paste"), "{root:?}");
+
+    let file = context_menu_labels(&panel, "root/a.txt", &mut cx);
+    for label in ["Cut", "Copy", "Duplicate", "Paste"] {
+        assert!(file.iter().any(|entry| entry == label), "{label}: {file:?}");
+    }
+}
+
+#[gpui::test]
+async fn test_default_app_is_not_offered_for_programs_and_shortcuts(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({ "notes.txt": "", "tools.bat": "", "run.EXE": "", "link.lnk": "", "dir": {} }),
+    )
+    .await;
+    let (panel, mut cx) = panel_for(&fs, cx).await;
+
+    for program in ["tools.bat", "run.EXE", "link.lnk"] {
+        let labels = context_menu_labels(&panel, &format!("root/{program}"), &mut cx);
+        assert!(
+            !labels.iter().any(|label| label == "Open in Default App"),
+            "{program}: {labels:?}"
+        );
+    }
+    for openable in ["notes.txt", "dir"] {
+        let labels = context_menu_labels(&panel, &format!("root/{openable}"), &mut cx);
+        assert!(
+            labels.iter().any(|label| label == "Open in Default App"),
+            "{openable}: {labels:?}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_permanent_delete_prompts_as_a_warning_and_trash_as_info(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "", "b.txt": "" }))
+        .await;
+    let (panel, mut cx) = panel_for(&fs, cx).await;
+
+    select_path(&panel, "root/a.txt", &mut cx);
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.delete(&Delete { skip_prompt: false }, window, cx)
+    });
+    assert_eq!(cx.pending_prompt_level(), Some(gpui::PromptLevel::Warning));
+    cx.simulate_prompt_answer("Cancel");
+
+    select_path(&panel, "root/b.txt", &mut cx);
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.trash(&Trash { skip_prompt: false }, window, cx)
+    });
+    assert_eq!(cx.pending_prompt_level(), Some(gpui::PromptLevel::Info));
+    cx.simulate_prompt_answer("Cancel");
+}
+
+async fn typed_name_state(
+    panel: &Entity<ProjectPanel>,
+    text: &str,
+    cx: &mut VisualTestContext,
+) -> ValidationState {
+    panel.update_in(cx, |panel, window, cx| {
+        panel
+            .filename_editor
+            .update(cx, |editor, cx| editor.set_text(text, window, cx));
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, _| {
+        panel
+            .state
+            .edit_state
+            .as_ref()
+            .unwrap()
+            .validation_state
+            .clone()
+    })
+}
+
+#[gpui::test]
+async fn test_names_differing_only_by_case_clash_on_a_case_insensitive_filesystem(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.set_case_insensitive(true);
+    fs.insert_tree("/root", json!({ "m.rs": "", "other.rs": "" }))
+        .await;
+    let (panel, mut cx) = panel_for(&fs, cx).await;
+
+    select_path(&panel, "root", &mut cx);
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.new_file(&NewFile, window, cx)
+    });
+    cx.run_until_parked();
+    let state = typed_name_state(&panel, "M.RS", &mut cx).await;
+    assert!(
+        matches!(&state, ValidationState::Error(message) if message.contains("already exists")),
+        "{state:?}"
+    );
+    let confirmed = panel.update_in(&mut cx, |panel, window, cx| {
+        panel.confirm_edit(true, window, cx)
+    });
+    assert!(confirmed.is_none(), "the clashing name must not be created");
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.cancel(&Cancel, window, cx)
+    });
+
+    // Renaming another entry onto the clashing name is refused too, but a case-only rename
+    // of the entry itself is the legitimate form.
+    select_path(&panel, "root/other.rs", &mut cx);
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.rename(&Rename, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(matches!(
+        typed_name_state(&panel, "M.rs", &mut cx).await,
+        ValidationState::Error(_)
+    ));
+    assert!(matches!(
+        typed_name_state(&panel, "OTHER.rs", &mut cx).await,
+        ValidationState::None
+    ));
+}
+
+#[gpui::test]
+async fn test_a_directory_spelled_differently_still_holds_the_clashing_name(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.set_case_insensitive(true);
+    fs.insert_tree("/root", json!({ "Foo": { "Bar": { "m.rs": "" } } }))
+        .await;
+    let (panel, mut cx) = panel_for(&fs, cx).await;
+
+    select_path(&panel, "root", &mut cx);
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.new_file(&NewFile, window, cx)
+    });
+    cx.run_until_parked();
+    for clashing in ["foo/bar/M.rs", "FOO/Bar/m.rs", "foo/BAR/m.RS"] {
+        let state = typed_name_state(&panel, clashing, &mut cx).await;
+        assert!(
+            matches!(&state, ValidationState::Error(message) if message.contains("already exists")),
+            "{clashing}: {state:?}"
+        );
+    }
+    for fine in ["foo/bar/other.rs", "foo/baz/M.rs", "elsewhere/M.rs"] {
+        assert!(
+            matches!(
+                typed_name_state(&panel, fine, &mut cx).await,
+                ValidationState::None
+            ),
+            "{fine}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_open_in_default_app_runs_only_for_files_that_are_not_programs(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "notes.txt": "", "tools.bat": "" }))
+        .await;
+    let (panel, mut cx) = panel_for(&fs, cx).await;
+
+    for name in ["tools.bat", "notes.txt"] {
+        select_path(&panel, &format!("root/{name}"), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_system(&OpenWithSystem, window, cx)
+        });
+        cx.run_until_parked();
+    }
+    let opened: Vec<_> = cx
+        .opened_with_system()
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(opened, ["notes.txt"], "the batch file was not run");
+}
+
+#[gpui::test]
+async fn test_names_differing_only_by_case_are_distinct_on_a_case_sensitive_filesystem(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "m.rs": "" })).await;
+    let (panel, mut cx) = panel_for(&fs, cx).await;
+
+    select_path(&panel, "root", &mut cx);
+    panel.update_in(&mut cx, |panel, window, cx| {
+        panel.new_file(&NewFile, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(matches!(
+        typed_name_state(&panel, "M.RS", &mut cx).await,
+        ValidationState::None
+    ));
+}
