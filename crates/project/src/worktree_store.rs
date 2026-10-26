@@ -2,7 +2,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, AtomicUsize},
     },
 };
@@ -17,6 +17,7 @@ use gpui::{
 };
 use itertools::Either;
 use postage::{prelude::Stream as _, watch};
+use regex::Regex;
 use rpc::{
     AnyProtoClient, ErrorExt, TypedEnvelope,
     proto::{self, REMOTE_SERVER_PROJECT_ID},
@@ -1424,13 +1425,13 @@ fn path_for_message(path: &Path) -> String {
     shown
 }
 
-/// Characters that draw nothing or reorder what is around them: zero-width and bidi marks and
-/// overrides, invisible operators, the BOM, and the line and paragraph separators. No crate in the
-/// workspace exposes the Unicode `Cf` category, so they are listed.
+/// Characters that draw nothing or reorder what is around them: every Unicode format character
+/// (`Cf`: zero-width and bidi marks and overrides, invisible operators, the BOM, tag characters)
+/// and the line and paragraph separators (`Zl`, `Zp`).
 fn is_invisible_format_or_separator(c: char) -> bool {
-    matches!(c,
-        '\u{ad}' | '\u{61c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
-        | '\u{2060}'..='\u{206f}' | '\u{feff}')
+    static INVISIBLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^[\p{Cf}\p{Zl}\p{Zp}]$").expect("a valid character class"));
+    INVISIBLE.is_match(c.encode_utf8(&mut [0; 4]))
 }
 
 #[cfg(test)]
@@ -1457,6 +1458,10 @@ mod tests {
                 "a\u{202e}txt.exe\u{2066}\u{200f}\u{2028}\u{2029}b"
             )),
             "a\\u{202e}txt.exe\\u{2066}\\u{200f}\\u{2028}\\u{2029}b"
+        );
+        assert_eq!(
+            path_for_message(Path::new("a\u{600}b\u{180e}c\u{e0001}d\u{110bd}e")),
+            "a\\u{600}b\\u{180e}c\\u{e0001}d\\u{110bd}e"
         );
         assert_eq!(
             path_for_message(Path::new("caf\u{e9}/\u{65e5}\u{672c}")),
