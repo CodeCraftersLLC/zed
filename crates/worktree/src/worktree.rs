@@ -877,7 +877,8 @@ impl Worktree {
 
     /// [`Self::create_entry`], where `overwrite_file: false` never writes over a
     /// file that is already there: a local worktree creates it exclusively and
-    /// fails with [`EntryAlreadyExists`] instead. A remote worktree has no such
+    /// fails with [`EntryAlreadyExists`] instead. That new file starts empty, so
+    /// `content` is for the overwriting path only. A remote worktree has no such
     /// request to make, and keeps overwriting.
     pub fn create_entry_with(
         &mut self,
@@ -1625,6 +1626,10 @@ impl LocalWorktree {
         overwrite_file: bool,
         cx: &Context<Worktree>,
     ) -> Task<Result<CreatedEntry>> {
+        debug_assert!(
+            overwrite_file || content.is_none(),
+            "a file created exclusively starts empty"
+        );
         let abs_path = self.absolutize(&path);
         let path_excluded = self.settings.is_path_excluded(&path);
         let fs = self.fs.clone();
@@ -1667,11 +1672,6 @@ impl LocalWorktree {
                         .into());
                     }
                     return Err(error).with_context(|| format!("creating file {task_abs_path:?}"));
-                }
-                if let Some(content) = content.as_deref().filter(|content| !content.is_empty()) {
-                    fs.write(&task_abs_path, content)
-                        .await
-                        .with_context(|| format!("writing file {task_abs_path:?}"))?;
                 }
                 Ok(())
             }
