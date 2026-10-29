@@ -79,7 +79,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
 };
-use worktree::CreatedEntry;
+use worktree::{CreatedEntry, EntryAlreadyExists};
 use zed_actions::{
     project_panel::{Toggle, ToggleFocus},
     workspace::OpenWithSystem,
@@ -1919,6 +1919,39 @@ impl ProjectPanel {
         cx.notify();
     }
 
+    /// Create the entry, never over a file that is already there. Creating a file
+    /// writes it, which would empty one on disk that the panel does not list: the
+    /// names `sibling_exists` checks are the worktree's scan, which lacks files
+    /// excluded by `file_scan_exclusions` or inside a folder that has not been
+    /// scanned. The worktree creates the file exclusively, so the check and the
+    /// creation cannot part ways.
+    fn create_entry_without_overwriting(
+        project: &Entity<Project>,
+        project_path: ProjectPath,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CreatedEntry>> {
+        let name = project_path
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string();
+        let create = project.update(cx, |project, cx| {
+            project.create_new_entry(project_path, is_dir, cx)
+        });
+        cx.background_spawn(async move {
+            create.await.map_err(|error| {
+                if error.downcast_ref::<EntryAlreadyExists>().is_some() {
+                    anyhow::anyhow!(
+                        "File or directory '{name}' already exists at location. Please choose a different name."
+                    )
+                } else {
+                    error
+                }
+            })
+        })
+    }
+
     fn confirm_edit(
         &mut self,
         refocus: bool,
@@ -1986,9 +2019,12 @@ impl ProjectPanel {
             edited_entry = None;
             edited_entry_id = NEW_ENTRY_ID;
             new_project_path = (worktree_id, new_path).into();
-            edit_task = self.project.update(cx, |project, cx| {
-                project.create_entry(new_project_path.clone(), is_dir, cx)
-            });
+            edit_task = Self::create_entry_without_overwriting(
+                &self.project,
+                new_project_path.clone(),
+                is_dir,
+                cx,
+            );
         } else {
             let new_path = if let Some(parent) = entry.path.parent() {
                 parent.join(&filename)

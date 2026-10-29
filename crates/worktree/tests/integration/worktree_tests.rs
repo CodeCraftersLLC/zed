@@ -2642,6 +2642,79 @@ async fn test_create_dir_all_on_create_entry(cx: &mut TestAppContext) {
     });
 }
 
+/// A new file is created exclusively, so a file that is there, however it got
+/// there, keeps its content; the overwriting `create_entry` still replaces it.
+#[gpui::test]
+async fn test_create_entry_without_overwriting_leaves_an_existing_file_alone(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let temp_root = TempTree::new(json!({
+        "taken.txt": "precious",
+        "a": {},
+    }));
+    let tree = Worktree::local(
+        temp_root.path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    let error = tree
+        .update(cx, |tree, cx| {
+            tree.create_entry_with(rel_path("taken.txt").into(), false, None, false, cx)
+        })
+        .await
+        .expect_err("a file that is there is not created over");
+    assert!(
+        error
+            .downcast_ref::<worktree::EntryAlreadyExists>()
+            .is_some(),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp_root.path().join("taken.txt")).unwrap(),
+        "precious"
+    );
+
+    let created = tree
+        .update(cx, |tree, cx| {
+            tree.create_entry_with(rel_path("a/b/new.txt").into(), false, None, false, cx)
+        })
+        .await
+        .unwrap()
+        .into_included()
+        .unwrap();
+    assert!(created.is_file());
+    assert_eq!(
+        std::fs::read_to_string(temp_root.path().join("a/b/new.txt")).unwrap(),
+        ""
+    );
+
+    tree.update(cx, |tree, cx| {
+        tree.create_entry(
+            rel_path("taken.txt").into(),
+            false,
+            Some(b"replaced".to_vec()),
+            cx,
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(temp_root.path().join("taken.txt")).unwrap(),
+        "replaced",
+        "the overwriting entry point keeps overwriting"
+    );
+}
+
 #[gpui::test]
 async fn test_create_file_in_expanded_gitignored_dir(cx: &mut TestAppContext) {
     // Tests the behavior of our worktree refresh when a file in a gitignored directory

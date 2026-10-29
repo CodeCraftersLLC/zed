@@ -2552,17 +2552,37 @@ impl Project {
         is_directory: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<CreatedEntry>> {
+        self.create_entry_inner(project_path.into(), is_directory, true, cx)
+    }
+
+    /// [`Self::create_entry`] that never writes over a file already at the path:
+    /// a local worktree fails with [`worktree::EntryAlreadyExists`] instead.
+    pub fn create_new_entry(
+        &mut self,
+        project_path: impl Into<ProjectPath>,
+        is_directory: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CreatedEntry>> {
+        self.create_entry_inner(project_path.into(), is_directory, false, cx)
+    }
+
+    fn create_entry_inner(
+        &mut self,
+        project_path: ProjectPath,
+        is_directory: bool,
+        overwrite_file: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CreatedEntry>> {
         if !self.capability().editable() {
             return Task::ready(Err(anyhow!("This project is read-only")));
         }
-        let project_path = project_path.into();
         let Some(worktree) = self.worktree_for_id(project_path.worktree_id, cx) else {
             return Task::ready(Err(anyhow!(format!(
                 "No worktree for path {project_path:?}"
             ))));
         };
         worktree.update(cx, |worktree, cx| {
-            worktree.create_entry(project_path.path, is_directory, None, cx)
+            worktree.create_entry_with(project_path.path, is_directory, None, overwrite_file, cx)
         })
     }
 
