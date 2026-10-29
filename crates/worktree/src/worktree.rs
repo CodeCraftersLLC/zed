@@ -96,7 +96,7 @@ pub enum Worktree {
     Remote(RemoteWorktree),
 }
 
-/// A new file was asked for where a file already is. Nothing was written.
+/// A new file or folder was asked for where one already is. Nothing was written.
 #[derive(Debug)]
 pub struct EntryAlreadyExists {
     pub abs_path: PathBuf,
@@ -109,6 +109,60 @@ impl std::fmt::Display for EntryAlreadyExists {
 }
 
 impl std::error::Error for EntryAlreadyExists {}
+
+/// Creates a file or folder that is not there yet; whatever is there is left alone.
+async fn create_new(fs: &dyn Fs, abs_path: &Path, is_dir: bool) -> Result<()> {
+    let already_exists = || EntryAlreadyExists {
+        abs_path: abs_path.to_path_buf(),
+    };
+    if is_dir {
+        // `create_dir` succeeds for a folder that is there, so it is looked for first.
+        if fs
+            .metadata(abs_path)
+            .await
+            .with_context(|| format!("checking for {abs_path:?}"))?
+            .is_some()
+        {
+            return Err(already_exists().into());
+        }
+        return fs
+            .create_dir(abs_path)
+            .await
+            .with_context(|| format!("creating directory {abs_path:?}"));
+    }
+
+    // Only a folder that is not there is created: asking for one that is would put its
+    // name through the checks a new folder gets.
+    if let Some(parent) = abs_path.parent()
+        && fs.metadata(parent).await.ok().flatten().is_none()
+    {
+        fs.create_dir(parent)
+            .await
+            .with_context(|| format!("creating directory {parent:?}"))?;
+    }
+    // Exclusive creation fails when something is there, however it got there since
+    // anyone last looked.
+    let created = fs
+        .create_file(
+            abs_path,
+            CreateOptions {
+                overwrite: false,
+                ignore_if_exists: false,
+            },
+        )
+        .await;
+    match created {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::AlreadyExists) =>
+        {
+            Err(already_exists().into())
+        }
+        Err(error) => Err(error).with_context(|| format!("creating file {abs_path:?}")),
+    }
+}
 
 /// An entry, created in the worktree.
 #[derive(Debug)]
@@ -875,23 +929,24 @@ impl Worktree {
         self.create_entry_with(path, is_directory, content, true, cx)
     }
 
-    /// [`Self::create_entry`], where `overwrite_file: false` never writes over a
-    /// file that is already there: a local worktree creates it exclusively and
-    /// fails with [`EntryAlreadyExists`] instead. That new file starts empty, so
-    /// `content` is for the overwriting path only. A remote worktree has no such
-    /// request to make, and keeps overwriting.
+    /// [`Self::create_entry`], where `overwrite: false` never writes over a file
+    /// or folder that is already there: a local worktree creates it exclusively
+    /// and fails with [`EntryAlreadyExists`] instead. That new file starts empty,
+    /// so `content` is for the overwriting path only. The protocol to a remote
+    /// worktree carries no such flag, so a remote worktree keeps overwriting;
+    /// Cherry Pick opens local worktrees only.
     pub fn create_entry_with(
         &mut self,
         path: Arc<RelPath>,
         is_directory: bool,
         content: Option<Vec<u8>>,
-        overwrite_file: bool,
+        overwrite: bool,
         cx: &Context<Worktree>,
     ) -> Task<Result<CreatedEntry>> {
         let worktree_id = self.id();
         match self {
             Worktree::Local(this) => {
-                this.create_entry_with(path, is_directory, content, overwrite_file, cx)
+                this.create_entry_with(path, is_directory, content, overwrite, cx)
             }
             Worktree::Remote(this) => {
                 let project_id = this.project_id;
@@ -1623,57 +1678,28 @@ impl LocalWorktree {
         path: Arc<RelPath>,
         is_dir: bool,
         content: Option<Vec<u8>>,
-        overwrite_file: bool,
+        overwrite: bool,
         cx: &Context<Worktree>,
     ) -> Task<Result<CreatedEntry>> {
         debug_assert!(
-            overwrite_file || content.is_none(),
-            "a file created exclusively starts empty"
+            overwrite || content.is_none(),
+            "an entry created exclusively starts empty"
         );
         let abs_path = self.absolutize(&path);
         let path_excluded = self.settings.is_path_excluded(&path);
         let fs = self.fs.clone();
         let task_abs_path = abs_path.clone();
         let write = cx.background_spawn(async move {
-            if is_dir {
+            if !overwrite {
+                create_new(fs.as_ref(), &task_abs_path, is_dir).await
+            } else if is_dir {
                 fs.create_dir(&task_abs_path)
                     .await
                     .with_context(|| format!("creating directory {task_abs_path:?}"))
-            } else if overwrite_file {
+            } else {
                 fs.write(&task_abs_path, content.as_deref().unwrap_or(&[]))
                     .await
                     .with_context(|| format!("creating file {task_abs_path:?}"))
-            } else {
-                // Only a folder that is not there is created: asking for one that is
-                // would put its name through the checks a new folder gets.
-                if let Some(parent) = task_abs_path.parent()
-                    && fs.metadata(parent).await.ok().flatten().is_none()
-                {
-                    fs.create_dir(parent)
-                        .await
-                        .with_context(|| format!("creating directory {parent:?}"))?;
-                }
-                // Exclusive creation fails when something is there, however it got
-                // there since anyone last looked; what is there is left alone.
-                let created = fs
-                    .create_file(
-                        &task_abs_path,
-                        CreateOptions {
-                            overwrite: false,
-                            ignore_if_exists: false,
-                        },
-                    )
-                    .await;
-                if let Err(error) = created {
-                    if fs.metadata(&task_abs_path).await.ok().flatten().is_some() {
-                        return Err(EntryAlreadyExists {
-                            abs_path: task_abs_path,
-                        }
-                        .into());
-                    }
-                    return Err(error).with_context(|| format!("creating file {task_abs_path:?}"));
-                }
-                Ok(())
             }
         });
 

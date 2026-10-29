@@ -2788,7 +2788,11 @@ impl Fs for FakeFs {
                         kind = Some(PathEventKind::Changed);
                         *e.get_mut() = file;
                     } else if !options.ignore_if_exists {
-                        anyhow::bail!("path already exists: {path:?}");
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!("path already exists: {path:?}"),
+                        )
+                        .into());
                     }
                 }
                 btree_map::Entry::Vacant(e) => {

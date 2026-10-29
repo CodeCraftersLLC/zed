@@ -1919,23 +1919,20 @@ impl ProjectPanel {
         cx.notify();
     }
 
-    /// Create the entry, never over a file that is already there. Creating a file
-    /// writes it, which would empty one on disk that the panel does not list: the
-    /// names `sibling_exists` checks are the worktree's scan, which lacks files
-    /// excluded by `file_scan_exclusions` or inside a folder that has not been
-    /// scanned. The worktree creates the file exclusively, so the check and the
-    /// creation cannot part ways.
+    /// Create the entry, never over a file or folder that is already there.
+    /// Creating a file writes it, which would empty one on disk that the panel
+    /// does not list: the names `sibling_exists` checks are the worktree's scan,
+    /// which lacks entries excluded by `file_scan_exclusions` or inside a folder
+    /// that has not been scanned. The worktree creates the entry exclusively, so
+    /// the check and the creation cannot part ways. `typed_name` is what the
+    /// user typed, which the error names like the live validation does.
     fn create_entry_without_overwriting(
         project: &Entity<Project>,
         project_path: ProjectPath,
+        typed_name: String,
         is_dir: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<CreatedEntry>> {
-        let name = project_path
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string();
         let create = project.update(cx, |project, cx| {
             project.create_new_entry(project_path, is_dir, cx)
         });
@@ -1943,7 +1940,7 @@ impl ProjectPanel {
             create.await.map_err(|error| {
                 if error.downcast_ref::<EntryAlreadyExists>().is_some() {
                     anyhow::anyhow!(
-                        "File or directory '{name}' already exists at location. Please choose a different name."
+                        "File or directory '{typed_name}' already exists at location. Please choose a different name."
                     )
                 } else {
                     error
@@ -2022,6 +2019,7 @@ impl ProjectPanel {
             edit_task = Self::create_entry_without_overwriting(
                 &self.project,
                 new_project_path.clone(),
+                filename.as_unix_str().to_string(),
                 is_dir,
                 cx,
             );

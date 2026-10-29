@@ -2555,8 +2555,10 @@ impl Project {
         self.create_entry_inner(project_path.into(), is_directory, true, cx)
     }
 
-    /// [`Self::create_entry`] that never writes over a file already at the path:
-    /// a local worktree fails with [`worktree::EntryAlreadyExists`] instead.
+    /// [`Self::create_entry`] that never writes over a file or folder already at
+    /// the path, including one the worktree's scan does not list: a local
+    /// worktree fails with [`worktree::EntryAlreadyExists`] instead. A remote
+    /// worktree cannot be asked for that, so there it overwrites.
     pub fn create_new_entry(
         &mut self,
         project_path: impl Into<ProjectPath>,
@@ -2570,7 +2572,7 @@ impl Project {
         &mut self,
         project_path: ProjectPath,
         is_directory: bool,
-        overwrite_file: bool,
+        overwrite: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<CreatedEntry>> {
         if !self.capability().editable() {
@@ -2582,7 +2584,7 @@ impl Project {
             ))));
         };
         worktree.update(cx, |worktree, cx| {
-            worktree.create_entry_with(project_path.path, is_directory, None, overwrite_file, cx)
+            worktree.create_entry_with(project_path.path, is_directory, None, overwrite, cx)
         })
     }
 
