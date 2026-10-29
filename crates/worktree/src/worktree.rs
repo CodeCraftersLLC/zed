@@ -930,9 +930,11 @@ impl Worktree {
     }
 
     /// [`Self::create_entry`], where `overwrite: false` never writes over a file
-    /// or folder that is already there: a local worktree creates it exclusively
-    /// and fails with [`EntryAlreadyExists`] instead. That new file starts empty,
-    /// so `content` is for the overwriting path only. The protocol to a remote
+    /// or folder that is already there: a local worktree fails with
+    /// [`EntryAlreadyExists`] instead. A file is created exclusively, however it
+    /// got there since anyone last looked; a folder is looked for first, because
+    /// creating one that is there succeeds. A new file starts empty, so `content`
+    /// is for the overwriting path only. The protocol to a remote
     /// worktree carries no such flag, so a remote worktree keeps overwriting;
     /// Cherry Pick opens local worktrees only.
     pub fn create_entry_with(

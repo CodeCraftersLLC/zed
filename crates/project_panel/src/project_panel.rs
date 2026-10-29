@@ -1923,9 +1923,10 @@ impl ProjectPanel {
     /// Creating a file writes it, which would empty one on disk that the panel
     /// does not list: the names `sibling_exists` checks are the worktree's scan,
     /// which lacks entries excluded by `file_scan_exclusions` or inside a folder
-    /// that has not been scanned. The worktree creates the entry exclusively, so
-    /// the check and the creation cannot part ways. `typed_name` is what the
-    /// user typed, which the error names like the live validation does.
+    /// that has not been scanned. The worktree creates a file exclusively, so the
+    /// check and the creation cannot part ways; a folder is looked for first, so
+    /// one made in the moment between is adopted. `typed_name` is what the user
+    /// typed, which the error names like the live validation does.
     fn create_entry_without_overwriting(
         project: &Entity<Project>,
         project_path: ProjectPath,
