@@ -110,6 +110,13 @@ impl std::fmt::Display for EntryAlreadyExists {
 
 impl std::error::Error for EntryAlreadyExists {}
 
+/// Whether `error` says the name is taken, as opposed to any other way a creation fails.
+fn is_name_taken(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
 /// Creates a file or folder that is not there yet; whatever is there is left alone.
 async fn create_new(fs: &dyn Fs, abs_path: &Path, is_dir: bool) -> Result<()> {
     let already_exists = || EntryAlreadyExists {
@@ -125,16 +132,21 @@ async fn create_new(fs: &dyn Fs, abs_path: &Path, is_dir: bool) -> Result<()> {
         {
             return Err(already_exists().into());
         }
-        return fs
-            .create_dir(abs_path)
-            .await
-            .with_context(|| format!("creating directory {abs_path:?}"));
+        // A file that took the name since the look is reported as the name taken.
+        return match fs.create_dir(abs_path).await {
+            Err(error) if is_name_taken(&error) => Err(already_exists().into()),
+            created => created.with_context(|| format!("creating directory {abs_path:?}")),
+        };
     }
 
     // Only a folder that is not there is created: asking for one that is would put its
     // name through the checks a new folder gets.
     if let Some(parent) = abs_path.parent()
-        && fs.metadata(parent).await.ok().flatten().is_none()
+        && fs
+            .metadata(parent)
+            .await
+            .with_context(|| format!("checking for {parent:?}"))?
+            .is_none()
     {
         fs.create_dir(parent)
             .await
@@ -152,15 +164,8 @@ async fn create_new(fs: &dyn Fs, abs_path: &Path, is_dir: bool) -> Result<()> {
         )
         .await;
     match created {
-        Ok(()) => Ok(()),
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::AlreadyExists) =>
-        {
-            Err(already_exists().into())
-        }
-        Err(error) => Err(error).with_context(|| format!("creating file {abs_path:?}")),
+        Err(error) if is_name_taken(&error) => Err(already_exists().into()),
+        created => created.with_context(|| format!("creating file {abs_path:?}")),
     }
 }
 
@@ -932,8 +937,9 @@ impl Worktree {
     /// [`Self::create_entry`], where `overwrite: false` never writes over a file
     /// or folder that is already there: a local worktree fails with
     /// [`EntryAlreadyExists`] instead. A file is created exclusively, however it
-    /// got there since anyone last looked; a folder is looked for first, because
-    /// creating one that is there succeeds. A new file starts empty, so `content`
+    /// got there since anyone last looked. A folder is looked for first, because
+    /// creating one that is there succeeds, so a folder that appears after that
+    /// look is adopted rather than reported. A new file starts empty, so `content`
     /// is for the overwriting path only. The protocol to a remote
     /// worktree carries no such flag, so a remote worktree keeps overwriting;
     /// Cherry Pick opens local worktrees only.
@@ -6882,6 +6888,21 @@ fn decode_byte_full(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_taken_name_is_reported_as_one() {
+        let creation_failed = |kind| {
+            anyhow::Error::new(std::io::Error::new(kind, "creating"))
+                .context("creating directory \"vault\"")
+        };
+        assert!(is_name_taken(&creation_failed(
+            std::io::ErrorKind::AlreadyExists
+        )));
+        assert!(!is_name_taken(&creation_failed(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_name_taken(&anyhow!("not an io error")));
+    }
 
     /// reproduction of issue #50785
     fn build_pcm16_wav_bytes() -> Vec<u8> {
