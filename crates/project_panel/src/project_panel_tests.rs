@@ -3093,6 +3093,179 @@ async fn test_auto_open_on_drop_when_disabled(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// Creating a file writes it, so a name that is taken on disk but absent from the
+/// panel (excluded from the scan) must not be created over.
+#[gpui::test]
+async fn test_new_file_does_not_empty_a_file_the_panel_does_not_list(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test_with_editor(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions =
+                    Some(vec!["**/secret.txt".to_string()]);
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/src",
+        json!({
+            "visible.rs": "// visible",
+            "secret.txt": "precious",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/src".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
+        panel
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &["v src", "      visible.rs"],
+        "the panel does not list the excluded file"
+    );
+
+    let confirm_new_file = |name: &'static str, cx: &mut VisualTestContext| {
+        select_path(&panel, "src", cx);
+        panel.update_in(cx, |panel, window, cx| panel.new_file(&NewFile, window, cx));
+        cx.run_until_parked();
+        let task = panel.update_in(cx, |panel, window, cx| {
+            panel
+                .filename_editor
+                .update(cx, |editor, cx| editor.set_text(name, window, cx));
+            panel.confirm_edit(true, window, cx)
+        });
+        cx.executor().run_until_parked();
+        task
+    };
+
+    let task = confirm_new_file("secret.txt", cx)
+        .expect("the panel does not list the file, so its own name check lets the edit through");
+    let error = task
+        .await
+        .expect_err("an existing file is never created over")
+        .to_string();
+    assert_eq!(
+        error,
+        "File or directory 'secret.txt' already exists at location. Please choose a different name."
+    );
+    assert_eq!(
+        fs.load("/src/secret.txt".as_ref()).await.unwrap(),
+        "precious",
+        "the file the panel does not list keeps its content"
+    );
+
+    let task = confirm_new_file("fresh.txt", cx).expect("a free name is accepted");
+    task.await.unwrap();
+    assert_eq!(fs.load("/src/fresh.txt".as_ref()).await.unwrap(), "");
+}
+
+/// A folder is created exclusively too: adopting one the panel does not list would
+/// make undo trash what was already there, and the error names what was typed.
+#[gpui::test]
+async fn test_new_entries_do_not_adopt_what_the_panel_does_not_list(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test_with_editor(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(vec!["**/vault".to_string()]);
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/src",
+        json!({
+            "visible.rs": "// visible",
+            "vault": { "a.txt": "precious" },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/src".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
+        panel
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &["v src", "      visible.rs"],
+        "the panel does not list the excluded folder"
+    );
+
+    let confirm_new = |name: &'static str, is_dir: bool, cx: &mut VisualTestContext| {
+        select_path(&panel, "src", cx);
+        panel.update_in(cx, |panel, window, cx| {
+            if is_dir {
+                panel.new_directory(&NewDirectory, window, cx)
+            } else {
+                panel.new_file(&NewFile, window, cx)
+            }
+        });
+        cx.run_until_parked();
+        let task = panel.update_in(cx, |panel, window, cx| {
+            panel
+                .filename_editor
+                .update(cx, |editor, cx| editor.set_text(name, window, cx));
+            panel.confirm_edit(true, window, cx)
+        });
+        cx.executor().run_until_parked();
+        task
+    };
+
+    let error = confirm_new("vault", true, cx)
+        .expect("the panel does not list the folder, so its own name check lets the edit through")
+        .await
+        .expect_err("a folder that is there is not created again")
+        .to_string();
+    assert_eq!(
+        error,
+        "File or directory 'vault' already exists at location. Please choose a different name."
+    );
+
+    let error = confirm_new("vault/a.txt", false, cx)
+        .expect("the file is inside a folder the panel does not list")
+        .await
+        .expect_err("an existing file is never created over")
+        .to_string();
+    assert_eq!(
+        error,
+        "File or directory 'vault/a.txt' already exists at location. Please choose a different name."
+    );
+    assert_eq!(
+        fs.load("/src/vault/a.txt".as_ref()).await.unwrap(),
+        "precious"
+    );
+
+    confirm_new("fresh", true, cx)
+        .expect("a free name is accepted")
+        .await
+        .unwrap();
+    assert!(fs.is_dir("/src/fresh".as_ref()).await);
+}
+
 #[gpui::test]
 async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
@@ -6662,7 +6835,7 @@ async fn test_creating_excluded_entries(cx: &mut gpui::TestAppContext) {
     panel.update_in(cx, |panel, window, cx| {
         assert!(panel.filename_editor.read(cx).is_focused(window));
     });
-    panel
+    let error = panel
         .update_in(cx, |panel, window, cx| {
             panel.filename_editor.update(cx, |editor, cx| {
                 editor.set_text(excluded_file_path, window, cx)
@@ -6670,12 +6843,17 @@ async fn test_creating_excluded_entries(cx: &mut gpui::TestAppContext) {
             panel.confirm_edit(true, window, cx).unwrap()
         })
         .await
-        .unwrap();
+        .expect_err("a directory is not created over the file that is there")
+        .to_string();
+    assert_eq!(
+        error,
+        "File or directory '.git/COMMIT_EDITMSG' already exists at location. Please choose a different name."
+    );
     cx.run_until_parked();
     assert_eq!(
         visible_entries_as_strings(&panel, 0..13, cx),
         &["v root1", "      .dockerignore"],
-        "Should not change the project panel after trying to create an excluded directorya directory with the same name as the excluded file"
+        "Should not change the project panel after trying to create a directory with the same name as the excluded file"
     );
     panel.update_in(cx, |panel, window, cx| {
         assert!(
@@ -6683,16 +6861,16 @@ async fn test_creating_excluded_entries(cx: &mut gpui::TestAppContext) {
             "Should have closed the file name editor"
         );
     });
-    workspace.update_in(cx, |workspace, _, cx| {
-        let notifications = workspace.notification_ids();
-        assert_eq!(
-            notifications.len(),
-            1,
-            "Should receive one notification with the error message"
+    workspace.update_in(cx, |workspace, _, _| {
+        assert!(
+            workspace.notification_ids().is_empty(),
+            "Nothing was created, so there is no toast about an excluded directory"
         );
-        workspace.dismiss_notification(notifications.first().unwrap(), cx);
-        assert!(workspace.notification_ids().is_empty());
     });
+    assert!(
+        fs.is_file(Path::new("/root1/.git/COMMIT_EDITMSG")).await,
+        "The excluded file is still a file"
+    );
 
     select_path(&panel, "root1", cx);
     panel.update_in(cx, |panel, window, cx| {
