@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 use stacksafe::{StackSafe, stacksafe};
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     fmt::Debug,
     marker::PhantomData,
@@ -2107,6 +2107,9 @@ impl Interactivity {
                             .hover_state
                             .get_or_insert_with(Default::default);
                     }
+                    if let Some(source_bounds) = element_state.tooltip_source_bounds.as_ref() {
+                        source_bounds.set(bounds);
+                    }
                     if let Some(active_tooltip) = element_state.active_tooltip.as_ref() {
                         if self.tooltip_builder.is_some() {
                             self.tooltip_id = set_tooltip_on_window(active_tooltip, window);
@@ -2896,13 +2899,16 @@ impl Interactivity {
                     Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
                 });
                 // Use bounds instead of testing hitbox since this is called during prepaint.
+                let source_bounds = element_state
+                    .tooltip_source_bounds
+                    .get_or_insert_with(|| Rc::new(Cell::new(hitbox.bounds)))
+                    .clone();
                 let check_is_hovered_during_prepaint = Rc::new({
                     let pending_mouse_down = pending_mouse_down.clone();
-                    let source_bounds = hitbox.bounds;
                     move |window: &Window| {
                         !window.last_input_was_keyboard()
                             && pending_mouse_down.borrow().is_none()
-                            && source_bounds.contains(&window.mouse_position())
+                            && source_bounds.get().contains(&window.mouse_position())
                     }
                 });
                 let check_is_hovered = Rc::new({
@@ -3291,6 +3297,9 @@ pub struct InteractiveElementState {
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+    /// The element's bounds in the frame being prepainted. A tooltip outlives the frame whose mouse
+    /// move created it, so its prepaint visibility check reads this instead of a captured copy.
+    pub(crate) tooltip_source_bounds: Option<Rc<Cell<Bounds<Pixels>>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -4355,6 +4364,174 @@ mod tests {
             .unwrap();
 
         assert!(active_tooltip.borrow().is_none());
+    }
+
+    /// A tooltip owner whose position is driven by a shared top offset, so a test can shift the
+    /// layout under a mouse that does not move.
+    struct ShiftableTooltipOwner {
+        top: Rc<Cell<Pixels>>,
+        hoverable: bool,
+        captured_active_tooltip: CapturedActiveTooltip,
+    }
+
+    impl Render for ShiftableTooltipOwner {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let target = div().id("target").w(px(50.)).h(px(50.));
+            let target = if self.hoverable {
+                target.hoverable_tooltip(|_, cx| cx.new(|_| TestTooltipView).into())
+            } else {
+                target.tooltip(|_, cx| cx.new(|_| TestTooltipView).into())
+            };
+            TooltipCaptureElement {
+                child: div()
+                    .size_full()
+                    .child(div().h(self.top.get()))
+                    .child(target)
+                    .into_any_element(),
+                captured_active_tooltip: self.captured_active_tooltip.clone(),
+            }
+        }
+    }
+
+    fn mouse_move(test_app: &mut TestAppContext, window: AnyWindowHandle, x: f32, y: f32) {
+        test_app
+            .update_window(window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: point(px(x), px(y)),
+                        modifiers: Default::default(),
+                        pressed_button: None,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+    }
+
+    fn redraw(test_app: &mut TestAppContext, window: AnyWindowHandle) {
+        test_app
+            .update_window(window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            })
+            .unwrap();
+    }
+
+    /// Shows the tooltip with the pointer at (10, 10), then returns the handles a layout-shift
+    /// test needs. The pointer is then moved to `pointer` while the source is still beneath it.
+    fn shown_tooltip_with_shiftable_source(
+        hoverable: bool,
+        pointer: (f32, f32),
+    ) -> (
+        TestAppContext,
+        AnyWindowHandle,
+        Rc<Cell<Pixels>>,
+        Rc<RefCell<Option<ActiveTooltip>>>,
+    ) {
+        let mut test_app = TestAppContext::single();
+        let top = Rc::new(Cell::new(px(0.)));
+        let captured_active_tooltip: CapturedActiveTooltip = Rc::new(RefCell::new(None));
+        let window = test_app.add_window({
+            let top = top.clone();
+            let captured_active_tooltip = captured_active_tooltip.clone();
+            move |_, _| ShiftableTooltipOwner {
+                top,
+                hoverable,
+                captured_active_tooltip,
+            }
+        });
+        let window: AnyWindowHandle = window.into();
+        redraw(&mut test_app, window);
+        mouse_move(&mut test_app, window, 10., 10.);
+        redraw(&mut test_app, window);
+        test_app
+            .dispatcher
+            .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+        test_app.run_until_parked();
+        let active_tooltip = captured_active_tooltip
+            .borrow()
+            .clone()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::Visible { .. })
+        ));
+        if pointer != (10., 10.) {
+            mouse_move(&mut test_app, window, pointer.0, pointer.1);
+            redraw(&mut test_app, window);
+        }
+        (test_app, window, top, active_tooltip)
+    }
+
+    /// Scenario: A tooltip does not stay on a row that moved away from a still pointer
+    #[test]
+    fn tooltip_hides_when_its_element_moves_from_under_a_still_mouse() {
+        let (mut test_app, window, top, active_tooltip) =
+            shown_tooltip_with_shiftable_source(false, (10., 10.));
+
+        top.set(px(100.));
+        redraw(&mut test_app, window);
+        redraw(&mut test_app, window);
+
+        assert!(active_tooltip.borrow().is_none());
+    }
+
+    #[test]
+    fn hoverable_tooltip_stays_while_the_pointer_is_on_it_after_the_source_moves() {
+        let (mut test_app, window, top, active_tooltip) =
+            shown_tooltip_with_shiftable_source(true, (15., 15.));
+
+        top.set(px(100.));
+        redraw(&mut test_app, window);
+        test_app
+            .dispatcher
+            .advance_clock(HOVERABLE_TOOLTIP_HIDE_DELAY * 2);
+        test_app.run_until_parked();
+        redraw(&mut test_app, window);
+
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::Visible { .. })
+        ));
+    }
+
+    #[test]
+    fn hoverable_tooltip_starts_the_hide_delay_when_the_source_moves_from_a_still_pointer() {
+        let (mut test_app, window, top, active_tooltip) =
+            shown_tooltip_with_shiftable_source(true, (10., 10.));
+
+        top.set(px(100.));
+        redraw(&mut test_app, window);
+        redraw(&mut test_app, window);
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::WaitingForHide { .. })
+        ));
+
+        test_app
+            .dispatcher
+            .advance_clock(HOVERABLE_TOOLTIP_HIDE_DELAY * 2);
+        test_app.run_until_parked();
+
+        assert!(active_tooltip.borrow().is_none());
+    }
+
+    #[test]
+    fn tooltip_stays_while_the_source_still_contains_a_still_pointer_after_a_layout_change() {
+        let (mut test_app, window, top, active_tooltip) =
+            shown_tooltip_with_shiftable_source(false, (10., 10.));
+
+        top.set(px(5.));
+        redraw(&mut test_app, window);
+        redraw(&mut test_app, window);
+
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::Visible { .. })
+        ));
     }
 
     #[test]
