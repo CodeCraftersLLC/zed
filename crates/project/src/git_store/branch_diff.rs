@@ -59,6 +59,8 @@ pub struct BranchDiff {
     /// A path was left out of the last file list because the worktree had not
     /// reached a folder above it yet: the list is made again when it does.
     deferred_loads: bool,
+    /// Paths the worktree was asked to scan because they were deferred.
+    requested_scans: HashSet<crate::ProjectPath>,
     _subscription: Subscription,
     update_needed: postage::watch::Sender<()>,
     _task: Task<()>,
@@ -164,6 +166,7 @@ impl BranchDiff {
             held_rows: HashMap::default(),
             awaiting_known_rows: false,
             deferred_loads: false,
+            requested_scans: HashSet::default(),
             base_commit: None,
             head_commit: None,
             _subscription: Subscription::join(git_store_subscription, worktree_subscription),
@@ -398,6 +401,13 @@ impl BranchDiff {
         cx.notify();
     }
 
+    /// True until the host has said which rows are links and which are held
+    /// ([`Self::await_known_rows`]): nothing is listed meanwhile, which is not an
+    /// empty diff.
+    pub fn is_awaiting_known_rows(&self) -> bool {
+        self.awaiting_known_rows
+    }
+
     pub fn is_tree_base_loading(&self) -> bool {
         self.tree_diff_base_task
             .as_ref()
@@ -462,10 +472,12 @@ impl BranchDiff {
             .values()
             .filter_map(|note| note.renamed_from().cloned())
             .collect();
+        let mut requested_scans = std::mem::take(&mut self.requested_scans);
         let mut queue = LoadQueue {
             repo,
             snapshots: HashMap::default(),
             deferred: false,
+            requested_scans: &mut requested_scans,
             output: &mut output,
         };
         self.project.update(cx, |project, cx| {
@@ -494,26 +506,22 @@ impl BranchDiff {
                     continue;
                 }
 
-                // What is drawn for a row, strongest first. A note that is one
-                // line of text may refine a hold; one that would draw the file's
-                // text (a rename diffed against its old name) never outranks it,
-                // so a note computed before the attributes changed cannot show
-                // what the attributes now forbid.
-                let kind = match (
-                    self.folder_links.get(&item.repo_path),
-                    self.row_notes.get(&item.repo_path),
-                    self.held_rows.get(&item.repo_path),
-                ) {
-                    (Some(sentence), _, _) => Load::Note(sentence.clone()),
-                    (None, Some(RowNote::Sentence { text, .. }), _) => Load::Note(text.clone()),
-                    (None, _, Some(held)) => Load::Note(held.clone()),
-                    (None, Some(RowNote::Renamed { base, .. }), None) => {
-                        Load::Diff(Some(TreeDiffStatus::Modified { old: *base }))
-                    }
-                    (None, None, None) => Load::Diff(branch_diff),
-                };
+                let kind = self.row_load(&item.repo_path, branch_diff);
                 queue.push(project, item.repo_path.clone(), item.status, kind, cx);
             }
+            for (path, branch_diff) in self.tree_diff.iter().flat_map(|t| t.entries.iter()) {
+                if seen.contains(path) || renamed_away.contains(path) {
+                    continue;
+                }
+                if let Some(link) = self.link_ancestor(path) {
+                    linked_parents.insert(link);
+                    continue;
+                }
+                let file_status = diff_status_to_file_status(branch_diff);
+                let load = self.row_load(path, Some(branch_diff.clone()));
+                queue.push(project, path.clone(), file_status, load, cx);
+            }
+
             // Status can list only what is beneath a link to a folder (the files
             // behind a junction) and no entry for the link itself.
             for link in linked_parents {
@@ -524,21 +532,31 @@ impl BranchDiff {
                     }
                 }
             }
-            let Some(tree_diff) = self.tree_diff.as_ref() else {
-                return;
-            };
-
-            for (path, branch_diff) in tree_diff.entries.iter() {
-                if seen.contains(&path) {
-                    continue;
-                }
-                let file_status = diff_status_to_file_status(branch_diff);
-                let load = Load::Diff(Some(branch_diff.clone()));
-                queue.push(project, path.clone(), file_status, load, cx);
-            }
         });
         self.deferred_loads = queue.deferred;
+        self.requested_scans = requested_scans;
         output
+    }
+
+    /// What is drawn for a changed row, strongest first, whichever list the row
+    /// came from. A note that is one line of text may refine a hold; one that
+    /// would draw the file's text (a rename diffed against its old name) never
+    /// outranks it, so a note computed before the attributes changed cannot show
+    /// what the attributes now forbid.
+    fn row_load(&self, path: &RepoPath, branch_diff: Option<TreeDiffStatus>) -> Load {
+        match (
+            self.folder_links.get(path),
+            self.row_notes.get(path),
+            self.held_rows.get(path),
+        ) {
+            (Some(sentence), _, _) => Load::Note(sentence.clone()),
+            (None, Some(RowNote::Sentence { text, .. }), _) => Load::Note(text.clone()),
+            (None, _, Some(held)) => Load::Note(held.clone()),
+            (None, Some(RowNote::Renamed { base, .. }), None) => {
+                Load::Diff(Some(TreeDiffStatus::Modified { old: *base }))
+            }
+            (None, None, None) => Load::Diff(branch_diff),
+        }
     }
 
     /// What the worktree's own snapshot says about reading `project_path`: see
@@ -758,6 +776,9 @@ struct LoadQueue<'a> {
     snapshots: HashMap<WorktreeId, worktree::Snapshot>,
     /// A path was left out because the worktree has not reached a folder above it.
     deferred: bool,
+    /// Paths the worktree was already asked to scan: asked once, so a path that
+    /// stays unknown does not ask on every retry.
+    requested_scans: &'a mut HashSet<crate::ProjectPath>,
     output: &'a mut Vec<DiffBuffer>,
 }
 
@@ -788,6 +809,15 @@ impl LoadQueue<'_> {
                     Admission::Behind => return,
                     Admission::NotScanned => {
                         self.deferred = true;
+                        // A folder the worktree skips on its own (an ignored one)
+                        // is never reached otherwise; its update retries the list.
+                        if self.requested_scans.insert(project_path.clone())
+                            && let Some(local) = project
+                                .worktree_for_id(project_path.worktree_id, cx)
+                                .and_then(|worktree| worktree.read(cx).as_local())
+                        {
+                            local.refresh_entries_for_paths(vec![project_path.path.clone()]);
+                        }
                         return;
                     }
                 }

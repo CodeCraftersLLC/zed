@@ -640,8 +640,10 @@ impl WindowTextSystem {
         self.line_layout_cache.finish_frame()
     }
 
-    /// The text of every line this window laid out for its most recently drawn frame, which is
-    /// what a test can read of what was drawn: labels, tooltips and the like.
+    /// The text of the lines this window laid out from text for its most recently drawn frame
+    /// ([`Self::layout_line`] and [`Self::layout_wrapped_line`]), which is what a test can read of
+    /// what was drawn: labels, tooltips and the like. A line shaped by a hash of its text
+    /// ([`Self::shape_line_by_hash`]) keeps no text and is not listed.
     #[cfg(any(test, feature = "test-support"))]
     pub fn texts_of_last_frame(&self) -> Vec<SharedString> {
         self.line_layout_cache.texts_of_last_frame()

@@ -1560,6 +1560,7 @@ impl ProjectDiff {
     fn is_loading(&self, cx: &App) -> bool {
         let branch_diff = self.branch_diff.read(cx);
         branch_diff.is_tree_base_loading()
+            || branch_diff.is_awaiting_known_rows()
             || branch_diff.is_status_loading(cx)
             || !self._task.is_ready()
     }
@@ -4188,6 +4189,110 @@ mod tests {
             ["d.txt"],
             "the tree-only loop loads what it may and passes the same admission as status"
         );
+    }
+
+    #[gpui::test]
+    async fn a_changed_file_in_an_ignored_folder_the_worktree_never_scans_is_scanned_and_shown(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                ".gitignore": "vendor/\n",
+                "kept.txt": "after\n",
+                "vendor": { "pkg": { "file.rs": "after\n" } },
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                (".gitignore", "vendor/\n".to_string()),
+                ("kept.txt", "before\n".to_string()),
+                ("vendor/pkg/file.rs", "before\n".to_string()),
+            ],
+        );
+
+        let (diff, cx) = open_diff(cx, &fs).await;
+
+        assert_eq!(shown(&diff, cx).0, ["kept.txt", "vendor/pkg/file.rs"]);
+    }
+
+    #[gpui::test]
+    async fn a_note_and_a_rename_reach_a_file_that_only_the_tree_diff_lists(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "d.txt": "text of d", "e.txt": "text of e" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                ProjectDiff::new_with_default_branch(project.clone(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let committed = [
+            ("d.txt", "text of d".to_string()),
+            ("e.txt", "text of e".to_string()),
+        ];
+        fs.set_index_for_repo(Path::new(path!("/project/.git")), &committed);
+        fs.set_head_for_repo(Path::new(path!("/project/.git")), &committed, "sha");
+        fs.set_merge_base_content_for_repo(Path::new(path!("/project/.git")), &[]);
+        cx.run_until_parked();
+        assert_eq!(shown(&diff, cx).0, ["d.txt", "e.txt"]);
+
+        note_paths(
+            &diff,
+            cx,
+            &[(
+                "d.txt",
+                RowNote::Sentence {
+                    text: "Binary file changed".into(),
+                    renamed_from: Some(RepoPath::new("e.txt").unwrap()),
+                },
+            )],
+        );
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["d.txt"], "the old name of a rename is not listed");
+        assert_eq!(text, "Binary file changed");
+    }
+
+    #[gpui::test]
+    async fn an_embedded_diff_waiting_for_the_hosts_rows_is_loading_not_empty(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "kept.txt": "after\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("kept.txt", "before\n".to_string())],
+        );
+        let (diff, cx) = open_gated_diff(cx, &fs).await;
+
+        assert!(diff.read_with(cx, |diff, cx| diff.is_loading(cx)));
+
+        diff.update(cx, |diff, cx| diff.set_known_rows([], [], cx));
+        cx.run_until_parked();
+        assert!(!diff.read_with(cx, |diff, cx| diff.is_loading(cx)));
+        assert_eq!(shown(&diff, cx).0, ["kept.txt"]);
     }
 
     #[gpui::test]

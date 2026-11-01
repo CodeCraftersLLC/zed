@@ -62,6 +62,29 @@ actions!(
     ]
 );
 
+/// Byte offsets into `name` itself (not its lowercase form, whose characters can be longer) of
+/// the characters that spell `query_lower` in order, and how many query bytes were matched.
+fn channel_match_positions(name: &str, query_lower: &str) -> (Vec<usize>, usize) {
+    let mut positions = Vec::new();
+    let mut query_idx = 0;
+    for (name_idx, name_char) in name.char_indices() {
+        let mut matched = false;
+        for lower_char in name_char.to_lowercase() {
+            let Some(query_char) = query_lower[query_idx..].chars().next() else {
+                break;
+            };
+            if lower_char == query_char {
+                matched = true;
+                query_idx += query_char.len_utf8();
+            }
+        }
+        if matched {
+            positions.push(name_idx);
+        }
+    }
+    (positions, query_idx)
+}
+
 impl ModalView for FileFinder {}
 
 /// Decides whether the name typed after "Create file" may be created, and says why when it may not.
@@ -1107,18 +1130,8 @@ impl FileFinderDelegate {
                         let channel_name = candidate.string;
                         let name_lower = channel_name.to_lowercase();
 
-                        let mut positions = Vec::new();
-                        let mut query_idx = 0;
-                        for (name_idx, name_char) in name_lower.char_indices() {
-                            if query_idx < query_lower.len() {
-                                let query_char =
-                                    query_lower[query_idx..].chars().next().unwrap_or_default();
-                                if name_char == query_char {
-                                    positions.push(name_idx);
-                                    query_idx += query_char.len_utf8();
-                                }
-                            }
-                        }
+                        let (positions, query_idx) =
+                            channel_match_positions(&channel_name, &query_lower);
 
                         if query_idx == query_lower.len() {
                             let channel = &channels[candidate.id];

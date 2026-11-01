@@ -72,6 +72,11 @@ pub fn glyph_run_positions(
     run_left: f32,
     right_to_left: bool,
 ) -> (Vec<PlacedGlyph>, f32) {
+    debug_assert_eq!(
+        advances.len(),
+        advance_offsets.len(),
+        "a glyph without an offset would be dropped by the zip"
+    );
     let total: f32 = advances.iter().sum();
     let mut pen = 0.0;
     let mut placed: Vec<PlacedGlyph> = advances

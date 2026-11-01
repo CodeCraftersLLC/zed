@@ -5147,3 +5147,20 @@ async fn test_exact_filename_with_directory_token(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[test]
+fn channel_match_positions_are_offsets_into_the_original_name() {
+    // 'İ' (2 bytes) lowercases to "i\u{307}" (3 bytes), so offsets in the lowercased name drift.
+    let name = "İx";
+    let (positions, matched) = channel_match_positions(name, "i\u{307}x");
+    assert_eq!(matched, "i\u{307}x".len());
+    assert_eq!(positions, [0, 2]);
+    assert!(
+        positions
+            .iter()
+            .all(|&position| name.is_char_boundary(position))
+    );
+
+    let (positions, matched) = channel_match_positions("Général", "gé");
+    assert_eq!((positions, matched), (vec![0, 1], "gé".len()));
+}

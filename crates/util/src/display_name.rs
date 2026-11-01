@@ -73,7 +73,8 @@ pub fn display_name_with_positions(name: &str, positions: &[usize]) -> (String, 
     let drawn = display_name(name);
     let positions = positions
         .iter()
-        .map(|&position| display_name(&name[..position]).len())
+        .filter_map(|&position| name.get(..position))
+        .map(|prefix| display_name(prefix).len())
         .collect();
     (drawn.into_owned(), positions)
 }
@@ -103,5 +104,13 @@ mod tests {
 
         drop(hook);
         assert_eq!(display_name("READ\u{200B}ME.md"), "READ\u{200B}ME.md");
+    }
+
+    #[test]
+    fn a_position_past_the_end_or_inside_a_character_is_dropped_not_a_panic() {
+        let _hook = install_hook_for_test(Arc::new(escape_zero_width_space));
+        let (drawn, positions) = display_name_with_positions("é\u{200B}b", &[0, 1, 2, 3, 5, 99]);
+        assert_eq!(drawn, "é<U+200B>b");
+        assert_eq!(positions, [0, 2, 10]);
     }
 }
