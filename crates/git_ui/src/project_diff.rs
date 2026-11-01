@@ -4272,6 +4272,46 @@ mod tests {
         assert_eq!(shown(&diff, cx).0, ["kept.txt", "vendor/pkg/file.rs"]);
     }
 
+    /// Many changed files in one folder the worktree has not listed cost one listing of that
+    /// folder: the worktree lists an unlisted folder once, however many requests name it.
+    #[gpui::test]
+    async fn changed_files_in_one_unlisted_folder_ask_for_it_to_be_listed_once(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let names: Vec<String> = (0..20).map(|n| format!("f{n}.rs")).collect();
+        let vendor: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .map(|name| (name.clone(), json!("after\n")))
+            .collect();
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, ".gitignore": "vendor/\n", "vendor": vendor }),
+        )
+        .await;
+        let paths: Vec<String> = names.iter().map(|name| format!("vendor/{name}")).collect();
+        let mut committed = vec![(".gitignore", "vendor/\n".to_string())];
+        committed.extend(
+            paths
+                .iter()
+                .map(|path| (path.as_str(), "before\n".to_string())),
+        );
+        fs.set_head_and_index_for_repo(Path::new(path!("/project/.git")), &committed);
+
+        let (diff, cx) = open_gated_diff(cx, &fs).await;
+        let listings_before = fs.read_dir_call_count();
+        diff.update(cx, |diff, cx| diff.set_known_rows([], [], cx));
+        cx.run_until_parked();
+
+        assert_eq!(shown(&diff, cx).0.len(), 20, "every file is shown");
+        assert_eq!(
+            fs.read_dir_call_count() - listings_before,
+            1,
+            "the folder is listed once for all twenty files"
+        );
+    }
+
     #[gpui::test]
     async fn the_scan_for_a_file_in_an_ignored_folder_does_not_follow_a_link_beside_it(
         cx: &mut TestAppContext,

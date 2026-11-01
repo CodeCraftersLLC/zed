@@ -1017,6 +1017,9 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    /// The views waiting on a pending asset, by asset: a view redrawn while the asset loads
+    /// waits once, not once per frame.
+    asset_waiters: FxHashSet<(TypeId, u64, EntityId)>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -1715,6 +1718,7 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            asset_waiters: FxHashSet::default(),
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -3347,20 +3351,23 @@ impl Window {
     pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
         let (task, _) = cx.fetch_asset::<A>(source);
         task.clone().now_or_never().or_else(|| {
-            // Every caller waits, not only the one that started the load: a view that joins a
+            // Every view waits, not only the one that started the load: a view that joins a
             // load already under way, such as a split of the same image, needs the redraw too.
-            let entity_id = self.current_view();
-            self.spawn(cx, {
-                let task = task.clone();
-                async move |cx| {
-                    task.await;
+            let waiter = (TypeId::of::<A>(), crate::hash(source), self.current_view());
+            if self.asset_waiters.insert(waiter) {
+                self.spawn(cx, {
+                    let task = task.clone();
+                    async move |cx| {
+                        task.await;
 
-                    cx.on_next_frame(move |_, cx| {
-                        cx.notify(entity_id);
-                    });
-                }
-            })
-            .detach();
+                        cx.on_next_frame(move |window, cx| {
+                            window.asset_waiters.remove(&waiter);
+                            cx.notify(waiter.2);
+                        });
+                    }
+                })
+                .detach();
+            }
 
             None
         })
@@ -6384,6 +6391,29 @@ mod use_asset_tests {
         }
     }
 
+    static RELEASE_REDRAWN: Mutex<Option<oneshot::Receiver<u32>>> = Mutex::new(None);
+
+    struct RedrawnAsset;
+
+    impl Asset for RedrawnAsset {
+        type Source = u8;
+        type Output = u32;
+
+        fn load(_: u8, _: &mut App) -> impl Future<Output = u32> + Send + 'static {
+            let receiver = RELEASE_REDRAWN.lock().unwrap().take().expect("one load");
+            async move { receiver.await.unwrap() }
+        }
+    }
+
+    struct Redrawn;
+
+    impl Render for Redrawn {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            window.use_asset::<RedrawnAsset>(&0, cx);
+            div()
+        }
+    }
+
     struct Waiter;
 
     impl Render for Waiter {
@@ -6443,6 +6473,29 @@ mod use_asset_tests {
         assert!(
             second_count > 0,
             "the view that joined the load was not notified"
+        );
+    }
+
+    /// A view redrawn many times while its asset loads waits on it once: one redraw when it
+    /// loads, not one per frame it was drawn in.
+    #[crate::test]
+    fn a_view_redrawn_while_its_asset_loads_waits_once(cx: &mut TestAppContext) {
+        let (release, receiver) = oneshot::channel();
+        *RELEASE_REDRAWN.lock().unwrap() = Some(receiver);
+
+        let (view, cx) = cx.add_window_view(|_, _| Redrawn);
+        cx.run_until_parked();
+        for _ in 0..5 {
+            cx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+            cx.run_until_parked();
+        }
+
+        release.send(7).unwrap();
+        cx.run_until_parked();
+        let waiting = cx.update(|window, _| window.next_frame_callbacks.borrow().len());
+        assert_eq!(
+            waiting, 1,
+            "one redraw is owed, however often the view was drawn"
         );
     }
 }
