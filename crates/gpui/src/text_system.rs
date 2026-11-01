@@ -1,11 +1,13 @@
 mod font_fallbacks;
 mod font_features;
+mod glyph_clusters;
 mod line;
 mod line_layout;
 mod line_wrapper;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
+pub use glyph_clusters::*;
 pub use line::*;
 pub use line_layout::*;
 pub use line_wrapper::*;
