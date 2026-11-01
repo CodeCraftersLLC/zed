@@ -625,6 +625,29 @@ fn shows_open_file_button(
         && file.is_none_or(|(can_open, disk_state)| can_open && !disk_state.is_deleted())
 }
 
+/// What a buffer header draws for a file: its name, its folder and the path its tooltip names,
+/// each through the host's display-name hook, as tab titles are. Only what is drawn: the icon and
+/// the jump keep the real path.
+struct ShownHeaderPath {
+    filename: SharedString,
+    parent: Option<String>,
+    tooltip: String,
+}
+
+fn shown_header_path(parent: Option<&str>, filename: &str) -> ShownHeaderPath {
+    let full_path = match parent {
+        Some(parent) if !parent.is_empty() => format!("{parent}{filename}"),
+        _ => filename.to_string(),
+    };
+    ShownHeaderPath {
+        filename: util::display_name::display_name(filename)
+            .into_owned()
+            .into(),
+        parent: parent.map(|parent| util::display_name::display_name(parent).into_owned()),
+        tooltip: util::display_name::display_name(&full_path).into_owned(),
+    }
+}
+
 pub(crate) fn render_buffer_header(
     editor: &Entity<Editor>,
     for_excerpt: &ExcerptBoundaryInfo,
@@ -814,12 +837,11 @@ pub(crate) fn render_buffer_header(
                                     .map(SharedString::from)
                                     .unwrap_or_else(|| "untitled".into());
 
-                                let full_path = match parent_path.as_deref() {
-                                    Some(parent) if !parent.is_empty() => {
-                                        format!("{}{}", parent, filename.as_str())
-                                    }
-                                    _ => filename.as_str().to_string(),
-                                };
+                                let ShownHeaderPath {
+                                    filename: shown_filename,
+                                    parent: shown_parent,
+                                    tooltip: full_path,
+                                } = shown_header_path(parent_path.as_deref(), filename.as_str());
 
                                 path_header
                                     .child(
@@ -834,7 +856,7 @@ pub(crate) fn render_buffer_header(
                                                 )
                                             })
                                             .child(
-                                                Label::new(filename)
+                                                Label::new(shown_filename)
                                                     .single_line()
                                                     .color(file_status_label_color(file_status))
                                                     .buffer_font(cx)
@@ -869,7 +891,7 @@ pub(crate) fn render_buffer_header(
                                                 }))
                                             }),
                                     )
-                                    .when_some(parent_path, |then, path| {
+                                    .when_some(shown_parent, |then, path| {
                                         then.child(
                                             Label::new(path)
                                                 .buffer_font(cx)
@@ -1091,6 +1113,19 @@ fn file_status_label_color(file_status: Option<FileStatus>) -> Color {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_header_names_the_file_its_folder_and_its_tooltip_path_through_the_display_hook() {
+        let hook = util::display_name::install_hook_for_test(std::sync::Arc::new(|name: &str| {
+            std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+        }));
+        let shown = super::shown_header_path(Some("d\u{200B}ir/"), "we\u{200B}ird.rs");
+        drop(hook);
+
+        assert_eq!(shown.filename.as_ref(), "we<U+200B>ird.rs");
+        assert_eq!(shown.parent.as_deref(), Some("d<U+200B>ir/"));
+        assert_eq!(shown.tooltip, "d<U+200B>ir/we<U+200B>ird.rs");
+    }
+
     use super::shows_open_file_button;
     use language::DiskState;
 

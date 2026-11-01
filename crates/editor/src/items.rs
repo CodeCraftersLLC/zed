@@ -2905,6 +2905,58 @@ mod tests {
         assert_no_raw_zero_width_space(&drawn);
     }
 
+    /// The file header above each file of a multibuffer, as the combined Local
+    /// Changes diff draws them, names a file the way the tab does.
+    #[gpui::test]
+    async fn the_drawn_buffer_header_is_the_display_name(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let hook = util::display_name::install_hook_for_test(Arc::new(|name: &str| {
+            std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+        }));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({ "d\u{200B}ir": { "we\u{200B}ird.rs": "fn main() {}\n" } }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/d\u{200B}ir/we\u{200B}ird.rs"), cx)
+            })
+            .await
+            .unwrap();
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(language::Capability::ReadWrite);
+            let path = multi_buffer::PathKey::for_buffer(&buffer, cx);
+            multibuffer.set_excerpts_for_path(
+                path,
+                buffer.clone(),
+                [text::Point::new(0, 0)..text::Point::new(0, 12)],
+                0,
+                cx,
+            );
+            multibuffer
+        });
+        let (_editor, cx) = cx.add_window_view(|window, cx| {
+            Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        let drawn = cx.redraw_text();
+        drop(hook);
+
+        assert!(
+            drawn.iter().any(|text| text == "we<U+200B>ird.rs"),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|text| text.contains("d<U+200B>ir")),
+            "{drawn:?}"
+        );
+        assert_no_raw_zero_width_space(&drawn);
+    }
+
     // Regression test for https://github.com/zed-industries/zed/issues/35947
     // Verifies that deserializing a non-worktree editor does not add the item
     // to any pane as a side effect.
