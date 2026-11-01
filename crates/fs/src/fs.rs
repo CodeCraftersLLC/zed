@@ -117,6 +117,12 @@ pub trait Fs: Send + Sync {
         content: Archive<Pin<&mut (dyn AsyncRead + Send)>>,
     ) -> Result<()>;
     async fn copy_file(&self, source: &Path, target: &Path, options: CopyOptions) -> Result<()>;
+    /// Asks whether `path` may be read as the source of a recursive copy. `copy_recursive` asks
+    /// for every item it will copy before it creates anything, so a refusal leaves no partial
+    /// copy behind.
+    async fn check_copy_source(&self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
     async fn rename(&self, source: &Path, target: &Path, options: RenameOptions) -> Result<()>;
 
     /// Removes a directory from the filesystem.
@@ -1350,6 +1356,7 @@ struct FakeFsState {
     trash: Vec<(TrashedEntry, FakeFsEntry)>,
     file_to_create_before_watch_add: Option<(PathBuf, PathBuf)>,
     remove_dir_errors: std::collections::HashMap<PathBuf, String>,
+    copy_source_refusals: std::collections::HashMap<PathBuf, String>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1678,6 +1685,7 @@ impl FakeFs {
                 trash: Vec::new(),
                 file_to_create_before_watch_add: None,
                 remove_dir_errors: Default::default(),
+                copy_source_refusals: Default::default(),
             })),
         });
 
@@ -2428,6 +2436,14 @@ impl FakeFs {
             .insert(normalize_path(path.as_ref()), message);
     }
 
+    /// Makes `check_copy_source` refuse `path` with `message`.
+    pub fn refuse_copy_source(&self, path: impl AsRef<Path>, message: String) {
+        self.state
+            .lock()
+            .copy_source_refusals
+            .insert(normalize_path(path.as_ref()), message);
+    }
+
     pub fn paths(&self, include_dot_git: bool) -> Vec<PathBuf> {
         let mut result = Vec::new();
         let mut queue = collections::VecDeque::new();
@@ -2917,6 +2933,18 @@ impl Fs for FakeFs {
         Ok(())
     }
 
+    async fn check_copy_source(&self, path: &Path) -> Result<()> {
+        if let Some(message) = self
+            .state
+            .lock()
+            .copy_source_refusals
+            .get(&normalize_path(path))
+        {
+            anyhow::bail!("{message}");
+        }
+        Ok(())
+    }
+
     async fn copy_file(&self, source: &Path, target: &Path, options: CopyOptions) -> Result<()> {
         self.simulate_random_delay().await;
 
@@ -3296,7 +3324,11 @@ pub async fn copy_recursive<'a>(
     target: &'a Path,
     options: CopyOptions,
 ) -> Result<()> {
-    for (item, is_dir) in read_dir_items(fs, source).await? {
+    let items = read_dir_items(fs, source).await?;
+    for (item, _) in &items {
+        fs.check_copy_source(item).await?;
+    }
+    for (item, is_dir) in items {
         let Ok(item_relative_path) = item.strip_prefix(source) else {
             continue;
         };

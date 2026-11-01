@@ -4850,6 +4850,58 @@ async fn test_load_file_encoding(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn write_file_refuses_when_the_worktree_root_is_gone(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    let dir = TempTree::new(json!({ "repo": { "src": { "lib.rs": "old" } } }));
+    let root = dir.path().join("repo");
+
+    let worktree = Worktree::local(
+        root.as_path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    let moved = dir.path().join("repo-moved");
+    std::fs::rename(&root, &moved).unwrap();
+
+    let error = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("was moved or deleted")
+            && error
+                .to_string()
+                .contains("Your edits are kept in the editor"),
+        "{error}"
+    );
+    assert!(!root.exists(), "the vanished root must not be recreated");
+    assert_eq!(
+        std::fs::read_to_string(moved.join("src/lib.rs")).unwrap(),
+        "old"
+    );
+}
+
+#[gpui::test]
 async fn test_write_file_encoding(cx: &mut gpui::TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

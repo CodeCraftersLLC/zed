@@ -128,6 +128,17 @@ pub fn from_buffer(buffer_snapshot: &BufferSnapshot) -> TableLikeContent {
     }
 }
 
+/// A line with no separator and no text. A row such as `,,` has cells, all of them empty, and is
+/// kept, and so is a row that is only a quoted empty field (`""`): `quoted` says the record used
+/// quoting syntax, which a decoded empty string no longer shows.
+fn is_blank_line(row: &[(SharedString, std::ops::Range<usize>)], quoted: bool) -> bool {
+    match row {
+        [] => !quoted,
+        [(field, _)] => !quoted && field.trim().is_empty(),
+        _ => false,
+    }
+}
+
 /// Parse CSV and track byte positions for each cell
 fn parse_csv_with_positions(
     text: &str,
@@ -142,6 +153,7 @@ fn parse_csv_with_positions(
     let mut field_start_offset = 0;
     let mut current_offset = 0;
     let mut in_quotes = false;
+    let mut row_quoted = false;
     let mut current_line = 1; // 1-based line numbering
     let mut row_start_line = 1;
     let mut chars = text.chars().peekable();
@@ -164,6 +176,7 @@ fn parse_csv_with_positions(
                 } else {
                     // Start of quoted field
                     in_quotes = true;
+                    row_quoted = true;
                     if current_field.is_empty() {
                         // Include the opening quote in the range
                         field_start_offset = current_offset;
@@ -198,9 +211,7 @@ fn parse_csv_with_positions(
                     current_field.clear();
 
                     // Only add non-empty rows
-                    if !current_row.is_empty()
-                        && !current_row.iter().all(|(field, _)| field.trim().is_empty())
-                    {
+                    if !is_blank_line(&current_row, row_quoted) {
                         rows.push(current_row);
                         // Add line number info for this row
                         let line_info = if row_start_line == current_line - 1 {
@@ -211,6 +222,7 @@ fn parse_csv_with_positions(
                         line_numbers.push(line_info);
                     }
                     current_row = Vec::new();
+                    row_quoted = false;
                     row_start_line = current_line;
                     field_start_offset = current_offset + char_byte_len;
                 } else {
@@ -236,9 +248,7 @@ fn parse_csv_with_positions(
                         current_field.clear();
 
                         // Only add non-empty rows
-                        if !current_row.is_empty()
-                            && !current_row.iter().all(|(field, _)| field.trim().is_empty())
-                        {
+                        if !is_blank_line(&current_row, row_quoted) {
                             rows.push(current_row);
                             // Add line number info for this row
                             let line_info = if row_start_line == current_line - 1 {
@@ -249,6 +259,7 @@ fn parse_csv_with_positions(
                             line_numbers.push(line_info);
                         }
                         current_row = Vec::new();
+                        row_quoted = false;
                         row_start_line = current_line;
                         field_start_offset = current_offset + char_byte_len;
                     } else {
@@ -269,14 +280,14 @@ fn parse_csv_with_positions(
     }
 
     // Add the last field and row if not empty
-    if !current_field.is_empty() || !current_row.is_empty() {
+    if !current_field.is_empty() || !current_row.is_empty() || row_quoted {
         let field_end_offset = current_offset;
         current_row.push((
             current_field.clone().into(),
             field_start_offset..field_end_offset,
         ));
     }
-    if !current_row.is_empty() && !current_row.iter().all(|(field, _)| field.trim().is_empty()) {
+    if !is_blank_line(&current_row, row_quoted) {
         rows.push(current_row);
         // Add line number info for the last row
         let line_info = if row_start_line == current_line {
@@ -409,6 +420,53 @@ Jane,"Simple name""#;
             }
             _ => panic!("Expected LineRange for second multiline row"),
         }
+    }
+
+    #[test]
+    fn an_all_empty_row_is_kept_and_only_a_blank_line_is_skipped() {
+        let parsed = TableLikeContent::from_str("a,b,c\n,,\n\n1,2,3\n".to_string());
+
+        assert_eq!(parsed.rows.len(), 2);
+        assert_eq!(parsed.rows[0].cols(), 3);
+        for col in 0..3 {
+            assert_eq!(parsed.rows[0][col].display_value().unwrap().as_ref(), "");
+        }
+        assert_eq!(parsed.rows[1][0].display_value().unwrap().as_ref(), "1");
+        assert_eq!(parsed.line_numbers.len(), 2);
+    }
+
+    #[test]
+    fn a_quoted_empty_record_is_kept_and_an_unquoted_blank_line_is_not() {
+        let parsed = TableLikeContent::from_str("header\n\"\"\nnext\n".to_string());
+        assert_eq!(parsed.rows.len(), 2);
+        assert_eq!(parsed.rows[0][0].display_value().unwrap().as_ref(), "");
+        assert_eq!(parsed.rows[1][0].display_value().unwrap().as_ref(), "next");
+
+        let parsed = TableLikeContent::from_str("header\n\r\nnext\n".to_string());
+        assert_eq!(parsed.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_multiline_cell_carries_its_one_line_text_from_parsing() {
+        let parsed = TableLikeContent::from_str("h\n\"a\nb\"\n".to_string());
+        let cell = &parsed.rows[0][0];
+        assert_eq!(cell.display_value().unwrap().as_ref(), "a\nb");
+        assert_eq!(cell.single_line_value().unwrap().as_ref(), "a↵b");
+    }
+
+    #[test]
+    fn a_final_quoted_empty_record_is_kept_with_or_without_a_newline() {
+        for text in ["header\n\"\"", "header\n\"\"\n", "header\r\"\""] {
+            let parsed = TableLikeContent::from_str(text.to_string());
+            assert_eq!(parsed.rows.len(), 1, "{text:?}");
+            assert_eq!(parsed.rows[0][0].display_value().unwrap().as_ref(), "");
+        }
+    }
+
+    #[test]
+    fn an_all_empty_last_row_without_a_newline_is_kept() {
+        let parsed = TableLikeContent::from_str("a,b\n,".to_string());
+        assert_eq!(parsed.rows.len(), 1);
     }
 
     #[test]

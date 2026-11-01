@@ -1761,11 +1761,23 @@ impl LocalWorktree {
         let fs = self.fs.clone();
         let is_private = self.is_path_private(&path);
         let abs_path = self.absolutize(&path);
+        // A file below the root is saved with its parent folders created, which would rebuild a
+        // repository folder that was moved or deleted while the file was open. A worktree that is
+        // a single file has no folder to protect.
+        let root_to_keep = (!path.is_empty()).then(|| self.abs_path().to_path_buf());
 
         let write = cx.background_spawn({
             let fs = fs.clone();
             let abs_path = abs_path.clone();
             async move {
+                if let Some(root) = root_to_keep
+                    && fs.metadata(&root).await?.is_none()
+                {
+                    anyhow::bail!(
+                        "'{}' was moved or deleted. Your edits are kept in the editor; relocate the repository or use Save As elsewhere.",
+                        root.display()
+                    );
+                }
                 // For UTF-8 text whose lines all end alike, use the optimized `fs.save` which
                 // writes Rope chunks directly to disk without allocating a contiguous string.
                 if encoding == encoding_rs::UTF_8 && !has_bom && line_endings.is_uniform() {

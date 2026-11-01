@@ -1,7 +1,11 @@
 mod image_info;
 mod image_viewer_settings;
 
-use std::path::Path;
+use std::{
+    mem,
+    path::Path,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use anyhow::Context as _;
 use editor::{EditorSettings, RevealInFileManager, items::entry_git_aware_label_color};
@@ -15,7 +19,10 @@ use gpui::{
 };
 use language::File as _;
 use persistence::ImageViewerDb;
-use project::{ImageItem, Project, ProjectPath, image_store::ImageItemEvent};
+use project::{
+    ImageItem, Project, ProjectPath,
+    image_store::{ImageFormat, ImageItemEvent, ImageMetadata},
+};
 use settings::Settings;
 use theme_settings::ThemeSettings;
 use ui::{Tooltip, prelude::*};
@@ -52,7 +59,72 @@ const ZOOM_STEP: f32 = 1.1;
 const SCROLL_LINE_MULTIPLIER: f32 = 20.0;
 const BASE_SQUARE_SIZE: f32 = 32.0;
 
+/// The longest side of the picture drawn in place of an image that is too large to decode whole.
+const REDUCED_SIDE: u32 = 1024;
+
+/// How an image is drawn, decided from its header alone.
+#[derive(Debug, PartialEq, Eq)]
+enum ImageDraw {
+    /// Decoded whole and drawn.
+    Full,
+    /// Over the raster limits, so a PNG is streamed down to [`REDUCED_SIDE`] and that is drawn.
+    Reduced,
+    /// Over the raster limits and not a PNG: nothing can be drawn, and the viewer says so.
+    TooLarge,
+}
+
+/// The limits are the ones `gpui` decodes within: a side longer than the GPU atlas holds, or a
+/// raster past the memory a decode may take, is never decoded whole.
+fn image_draw(metadata: &ImageMetadata) -> ImageDraw {
+    let bytes_per_pixel = metadata.colors.map_or(4, |colors| {
+        u64::from(colors.bits_per_pixel()).div_ceil(8).max(4)
+    });
+    let decoded = u64::from(metadata.width) * u64::from(metadata.height) * bytes_per_pixel;
+    let within_limits = metadata.width <= gpui::MAX_RASTER_SIDE
+        && metadata.height <= gpui::MAX_RASTER_SIDE
+        && decoded <= gpui::MAX_RASTER_BYTES;
+    match (within_limits, metadata.format) {
+        (true, _) => ImageDraw::Full,
+        (false, ImageFormat::Png) => ImageDraw::Reduced,
+        (false, _) => ImageDraw::TooLarge,
+    }
+}
+
+fn too_large_message(width: u32, height: u32) -> SharedString {
+    format!("{width} \u{d7} {height} px is too large to display").into()
+}
+
+/// A PNG of `bytes` streamed down to [`REDUCED_SIDE`]; the failure says why the file would not
+/// stream.
+fn reduced_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let thumbnail = gpui::png_thumbnail(bytes, REDUCED_SIDE, &AtomicBool::new(false))
+        .map_err(|error| error.to_string())?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(thumbnail)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|error| error.to_string())?;
+    Ok(png)
+}
+
+/// What the viewer draws for the image.
+enum Shown {
+    Picture(Arc<gpui::Image>),
+    /// A line of text in place of a picture that cannot be drawn.
+    Card(SharedString),
+    /// The reduced picture is still being made.
+    Waiting,
+}
+
+/// The reduced picture of an image over the raster limits.
+enum Reduction {
+    NotNeeded,
+    Pending { _task: Task<()> },
+    Ready(Arc<gpui::Image>),
+    Failed(SharedString),
+}
+
 pub struct ImageView {
+    reduction: Reduction,
     image_item: Entity<ImageItem>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
@@ -80,37 +152,123 @@ impl ImageView {
             image.image.clone().get_render_image(window, cx)
         });
 
-        cx.subscribe(&image_item, Self::on_image_event).detach();
-        cx.on_release_in(window, |this, window, cx| {
-            let image_data = this.image_item.read(cx).image.clone();
-            if let Some(image) = image_data.clone().get_render_image(window, cx) {
-                cx.drop_image(image, None);
-            }
-            image_data.remove_asset(cx);
-        })
-        .detach();
-
         let image_size = image_item
             .read(cx)
             .image_metadata
             .map(|m| (m.width, m.height));
+        Self::attach(
+            image_item,
+            project,
+            1.0,
+            Point::default(),
+            image_size,
+            window,
+            cx,
+        )
+    }
 
-        Self {
+    /// A view of `image_item` with its subscriptions, release cleanup and reduction in place; the
+    /// one setup shared by [`Self::new`] and a split.
+    fn attach(
+        image_item: Entity<ImageItem>,
+        project: Entity<Project>,
+        zoom_level: f32,
+        pan_offset: Point<Pixels>,
+        image_size: Option<(u32, u32)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.subscribe_in(&image_item, window, Self::on_image_event)
+            .detach();
+        cx.on_release_in(window, |this, window, cx| {
+            Self::release_image(this.image_item.read(cx).image.clone(), window, cx);
+            this.release_reduction(window, cx);
+        })
+        .detach();
+
+        let mut view = Self {
             image_item,
             project,
             focus_handle: cx.focus_handle(),
-            zoom_level: 1.0,
-            pan_offset: Point::default(),
+            zoom_level,
+            pan_offset,
             last_mouse_position: None,
             container_bounds: None,
             image_size,
+            reduction: Reduction::NotNeeded,
+        };
+        view.start_reduction(window, cx);
+        view
+    }
+
+    /// Drops the decoded picture and its asset, which GPUI otherwise keeps for the life of the app.
+    fn release_image(image: Arc<gpui::Image>, window: &mut Window, cx: &mut App) {
+        if let Some(render_image) = image.clone().get_render_image(window, cx) {
+            cx.drop_image(render_image, None);
+        }
+        image.remove_asset(cx);
+    }
+
+    fn release_reduction(&mut self, window: &mut Window, cx: &mut App) {
+        if let Reduction::Ready(image) = mem::replace(&mut self.reduction, Reduction::NotNeeded) {
+            Self::release_image(image, window, cx);
+        }
+    }
+
+    fn start_reduction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.release_reduction(window, cx);
+        let item = self.image_item.read(cx);
+        let reduced = item
+            .image_metadata
+            .is_some_and(|metadata| image_draw(&metadata) == ImageDraw::Reduced);
+        if !reduced {
+            self.reduction = Reduction::NotNeeded;
+            return;
+        }
+        let image = item.image.clone();
+        self.reduction = Reduction::Pending {
+            _task: cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { reduced_png(&image.bytes) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.reduction = match result {
+                    Ok(png) => {
+                        Reduction::Ready(Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)))
+                    }
+                    Err(error) => Reduction::Failed(
+                        format!("The image is too large to display and could not be reduced: {error}")
+                            .into(),
+                    ),
+                };
+                cx.notify();
+            })
+            .ok();
+            }),
+        };
+    }
+
+    fn shown(&self, cx: &App) -> Shown {
+        let item = self.image_item.read(cx);
+        let Some(metadata) = item.image_metadata else {
+            return Shown::Picture(item.image.clone());
+        };
+        match (image_draw(&metadata), &self.reduction) {
+            (ImageDraw::Full, _) => Shown::Picture(item.image.clone()),
+            (ImageDraw::TooLarge, _) => {
+                Shown::Card(too_large_message(metadata.width, metadata.height))
+            }
+            (ImageDraw::Reduced, Reduction::Ready(image)) => Shown::Picture(image.clone()),
+            (ImageDraw::Reduced, Reduction::Failed(message)) => Shown::Card(message.clone()),
+            (ImageDraw::Reduced, _) => Shown::Waiting,
         }
     }
 
     fn on_image_event(
         &mut self,
-        _: Entity<ImageItem>,
+        _: &Entity<ImageItem>,
         event: &ImageItemEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
@@ -122,6 +280,7 @@ impl ImageView {
                     .read(cx)
                     .image_metadata
                     .map(|m| (m.width, m.height));
+                self.start_reduction(window, cx);
                 cx.emit(ImageViewEvent::TitleChanged);
                 cx.notify();
             }
@@ -338,8 +497,13 @@ impl Element for ImageContentElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let mut shown = self.image_view.read(cx).shown(cx);
+        if let Shown::Picture(image) = &shown
+            && let Some(Err(error)) = image.clone().use_render_image_result(window, cx)
+        {
+            shown = Shown::Card(format!("The image could not be displayed: {error}").into());
+        }
         let image_view = self.image_view.read(cx);
-        let image = image_view.image_item.read(cx).image.clone();
 
         let first_layout = image_view.container_bounds.is_none();
 
@@ -384,36 +548,47 @@ impl Element for ImageContentElement {
             }
         });
 
-        let mut image_content = div()
-            .relative()
-            .size_full()
-            .child(
-                div()
-                    .absolute()
-                    .left(left)
-                    .top(top)
-                    .w(scaled_width)
-                    .h(scaled_height)
-                    .child(
-                        div()
-                            .size_full()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .child(div().size_full().bg(checkerboard(
-                                cx.theme().colors().panel_background,
-                                BASE_SQUARE_SIZE * zoom_level,
-                            )))
-                            .border_1()
-                            .border_color(border_color),
-                    )
-                    .child({
-                        img(image)
-                            .id(("image-viewer-image", self.image_view.entity_id()))
-                            .size_full()
-                    }),
-            )
-            .into_any_element();
+        let mut image_content = match shown {
+            Shown::Picture(image) => div()
+                .relative()
+                .size_full()
+                .child(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w(scaled_width)
+                        .h(scaled_height)
+                        .child(
+                            div()
+                                .size_full()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .child(div().size_full().bg(checkerboard(
+                                    cx.theme().colors().panel_background,
+                                    BASE_SQUARE_SIZE * zoom_level,
+                                )))
+                                .border_1()
+                                .border_color(border_color),
+                        )
+                        .child({
+                            img(image)
+                                .id(("image-viewer-image", self.image_view.entity_id()))
+                                .size_full()
+                        }),
+                )
+                .into_any_element(),
+            Shown::Card(message) => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .child(Label::new(message).color(Color::Muted))
+                .into_any_element(),
+            Shown::Waiting => div().size_full().into_any_element(),
+        };
 
         image_content.prepaint_as_root(bounds.origin, bounds.size.into(), window, cx);
         Some((image_content, is_dragging))
@@ -480,7 +655,11 @@ impl Item for ImageView {
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
         let abs_path = self.image_item.read(cx).abs_path(cx)?;
         let file_path = abs_path.compact().to_string_lossy().into_owned();
-        Some(file_path.into())
+        Some(
+            util::display_name::display_name(&file_path)
+                .into_owned()
+                .into(),
+        )
     }
 
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
@@ -513,6 +692,13 @@ impl Item for ImageView {
     }
 
     fn tab_content_text(&self, _: usize, cx: &App) -> SharedString {
+        util::display_name::display_name(self.image_item.read(cx).file.file_name(cx))
+            .into_owned()
+            .into()
+    }
+
+    /// The real name: Save As proposes what is on disk, not what the display hook draws.
+    fn suggested_filename(&self, cx: &App) -> SharedString {
         self.image_item
             .read(cx)
             .file
@@ -545,7 +731,7 @@ impl Item for ImageView {
 
         Some((
             vec![HighlightedText {
-                text: text.into(),
+                text: util::display_name::display_name(&text).into_owned().into(),
                 highlights: vec![],
             }],
             Some(font),
@@ -559,21 +745,22 @@ impl Item for ImageView {
     fn clone_on_split(
         &self,
         _workspace_id: Option<WorkspaceId>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>>
     where
         Self: Sized,
     {
-        Task::ready(Some(cx.new(|cx| Self {
-            image_item: self.image_item.clone(),
-            project: self.project.clone(),
-            focus_handle: cx.focus_handle(),
-            zoom_level: self.zoom_level,
-            pan_offset: self.pan_offset,
-            last_mouse_position: None,
-            container_bounds: None,
-            image_size: self.image_size,
+        Task::ready(Some(cx.new(|cx| {
+            Self::attach(
+                self.image_item.clone(),
+                self.project.clone(),
+                self.zoom_level,
+                self.pan_offset,
+                self.image_size,
+                window,
+                cx,
+            )
         })))
     }
 
@@ -917,5 +1104,249 @@ mod persistence {
                 WHERE item_id = ? AND workspace_id = ?
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::Fs as _;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::image_store::ImageColorInfo;
+
+    fn metadata(width: u32, height: u32, format: ImageFormat) -> ImageMetadata {
+        ImageMetadata {
+            width,
+            height,
+            file_size: 1,
+            colors: Some(ImageColorInfo {
+                channels: 4,
+                bits_per_channel: 8,
+            }),
+            format,
+        }
+    }
+
+    #[test]
+    fn an_image_over_the_raster_limits_is_reduced_if_it_is_a_png_and_a_card_otherwise() {
+        let side = gpui::MAX_RASTER_SIDE;
+        assert_eq!(
+            image_draw(&metadata(800, 600, ImageFormat::Jpeg)),
+            ImageDraw::Full
+        );
+        assert_eq!(
+            image_draw(&metadata(side + 1, 10, ImageFormat::Png)),
+            ImageDraw::Reduced
+        );
+        assert_eq!(
+            image_draw(&metadata(10, side + 1, ImageFormat::Jpeg)),
+            ImageDraw::TooLarge
+        );
+        let wide_and_tall = metadata(side, side, ImageFormat::Bmp);
+        assert_eq!(
+            image_draw(&wide_and_tall),
+            ImageDraw::TooLarge,
+            "within the side limit but past the memory a decode may take"
+        );
+        assert_eq!(
+            too_large_message(20_000, 5),
+            "20000 \u{d7} 5 px is too large to display"
+        );
+    }
+
+    #[test]
+    fn a_png_is_reduced_to_a_png_and_a_broken_one_says_why() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2048, 4))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let reduced = reduced_png(&png).unwrap();
+        let (width, height) = image::load_from_memory(&reduced)
+            .map(|picture| (picture.width(), picture.height()))
+            .unwrap();
+        assert_eq!(width, REDUCED_SIDE);
+        assert!(height >= 1);
+        assert!(!reduced_png(&png[..png.len() / 2]).unwrap_err().is_empty());
+    }
+
+    fn small_png() -> Vec<u8> {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    fn wide_png() -> Vec<u8> {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(gpui::MAX_RASTER_SIDE + 1, 1))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    async fn open_image(
+        cx: &mut TestAppContext,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> (Entity<Project>, Entity<ImageItem>) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        let path = std::path::Path::new("/root").join(name);
+        fs.create_dir(path.parent().unwrap()).await.unwrap();
+        fs.insert_file(path, bytes).await;
+        let project = Project::test(fs, ["/root".as_ref()], cx).await;
+        let image_item = project
+            .update(cx, |project, cx| {
+                let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
+                let path = ProjectPath {
+                    worktree_id,
+                    path: util::rel_path::RelPath::unix(name).unwrap().into(),
+                };
+                project.open_image(path, cx)
+            })
+            .await
+            .unwrap();
+        (project, image_item)
+    }
+
+    #[gpui::test]
+    async fn tab_tooltip_and_breadcrumbs_use_the_display_name_but_save_as_keeps_the_real_name(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, image_item) = open_image(cx, "we\u{200B}ird.png", small_png()).await;
+        let (view, cx) =
+            cx.add_window_view(|window, cx| ImageView::new(image_item, project, window, cx));
+
+        let hook = util::display_name::install_hook_for_test(Arc::new(|name: &str| {
+            std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+        }));
+        let (tab, tooltip, breadcrumbs, suggested) = view.read_with(cx, |view, cx| {
+            (
+                view.tab_content_text(0, cx),
+                view.tab_tooltip_text(cx).unwrap(),
+                view.breadcrumbs(cx).unwrap().0,
+                view.suggested_filename(cx),
+            )
+        });
+        drop(hook);
+
+        assert_eq!(tab, "we<U+200B>ird.png");
+        assert!(tooltip.ends_with("we<U+200B>ird.png"), "{tooltip}");
+        assert_eq!(breadcrumbs[0].text.as_ref(), "we<U+200B>ird.png");
+        assert_eq!(suggested, "we\u{200B}ird.png");
+    }
+
+    /// A workspace window whose pane shows `dir/we<ZWSP>ird.png` and has a breadcrumbs toolbar
+    /// item, while a display name hook that escapes the zero width space is installed.
+    async fn weird_image_in_a_workspace(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, util::display_name::TestHook) {
+        let hook = util::display_name::install_hook_for_test(Arc::new(|name: &str| {
+            std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+        }));
+        let (project, image_item) = open_image(cx, "dir/we\u{200B}ird.png", small_png()).await;
+        cx.update(editor::init);
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let breadcrumbs = cx.new(|_| breadcrumbs::Breadcrumbs::new());
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.toolbar()
+                    .update(cx, |toolbar, cx| toolbar.add_item(breadcrumbs, window, cx))
+            });
+            let view = cx.new(|cx| ImageView::new(image_item, project, window, cx));
+            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        (cx, hook)
+    }
+
+    fn assert_no_raw_zero_width_space(drawn: &[SharedString]) {
+        assert!(
+            !drawn.iter().any(|text| text.contains('\u{200B}')),
+            "{drawn:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_drawn_tab_title_is_the_display_name(cx: &mut TestAppContext) {
+        let (cx, _hook) = weird_image_in_a_workspace(cx).await;
+        let drawn = cx.redraw_text();
+        assert!(
+            drawn.iter().any(|text| text == "we<U+200B>ird.png"),
+            "{drawn:?}"
+        );
+        assert_no_raw_zero_width_space(&drawn);
+    }
+
+    #[gpui::test]
+    async fn the_drawn_tab_tooltip_is_the_display_name(cx: &mut TestAppContext) {
+        let (cx, _hook) = weird_image_in_a_workspace(cx).await;
+        let tab = cx.debug_bounds("TAB-0").expect("the tab was drawn");
+        cx.simulate_mouse_move(tab.center(), None, gpui::Modifiers::none());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let drawn = cx.redraw_text();
+        assert!(
+            drawn
+                .iter()
+                .any(|text| text == util::path!("/root/dir/we<U+200B>ird.png")),
+            "{drawn:?}"
+        );
+        assert_no_raw_zero_width_space(&drawn);
+    }
+
+    #[gpui::test]
+    async fn the_drawn_breadcrumb_is_the_display_name(cx: &mut TestAppContext) {
+        let (cx, _hook) = weird_image_in_a_workspace(cx).await;
+        let drawn = cx.redraw_text();
+        assert!(
+            drawn
+                .iter()
+                .any(|text| text.ends_with("dir/we<U+200B>ird.png")),
+            "{drawn:?}"
+        );
+        assert_no_raw_zero_width_space(&drawn);
+    }
+
+    #[gpui::test]
+    async fn a_split_view_starts_a_new_reduction_when_the_image_reloads(cx: &mut TestAppContext) {
+        let (project, image_item) = open_image(cx, "wide.png", wide_png()).await;
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ImageView::new(image_item.clone(), project.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.reduction, Reduction::Ready(_)))
+        });
+
+        let split = view
+            .update_in(cx, |view, window, cx| view.clone_on_split(None, window, cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        split.read_with(cx, |split, _| {
+            assert!(matches!(split.reduction, Reduction::Ready(_)))
+        });
+
+        image_item.update(cx, |_, cx| cx.emit(ImageItemEvent::Reloaded));
+        split.read_with(cx, |split, _| {
+            assert!(
+                matches!(split.reduction, Reduction::Pending { .. }),
+                "the split must follow the item's reloads like the original"
+            )
+        });
+        cx.run_until_parked();
+        split.read_with(cx, |split, _| {
+            assert!(matches!(split.reduction, Reduction::Ready(_)))
+        });
     }
 }

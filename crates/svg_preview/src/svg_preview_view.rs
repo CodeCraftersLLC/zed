@@ -329,7 +329,10 @@ impl Item for SvgPreviewView {
         self.buffer
             .as_ref()
             .and_then(|svg_path| svg_path.read(cx).file())
-            .map(|name| format!("Preview {}", name.file_name(cx)).into())
+            .map(|name| {
+                let file_name = name.file_name(cx);
+                format!("Preview {}", util::display_name::display_name(file_name)).into()
+            })
             .unwrap_or_else(|| "SVG Preview".into())
     }
 

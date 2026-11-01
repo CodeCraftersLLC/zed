@@ -34,8 +34,8 @@ pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBu
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
-    PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
+    ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageCacheError, ImageSource, Keymap, LineLayout,
+    Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
     SystemWindowTab, Task, Window, WindowControlArea, decode_bgra_frames, hash, point, px, size,
 };
@@ -2231,6 +2231,17 @@ impl Image {
         ImageSource::Image(self)
             .get_data(None, window, cx)
             .and_then(|result| result.ok())
+    }
+
+    /// Like [`Self::use_render_image`], but a decode failure is returned rather than dropped, so a
+    /// caller can say why nothing is drawn. `None` while the image is still loading, and the
+    /// current view is notified when it finishes.
+    pub fn use_render_image_result(
+        self: Arc<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        ImageSource::Image(self).use_data(None, window, cx)
     }
 
     /// Use the GPUI `remove_asset` API to drop this image, if possible.

@@ -640,6 +640,13 @@ impl WindowTextSystem {
         self.line_layout_cache.finish_frame()
     }
 
+    /// The text of every line this window laid out for its most recently drawn frame, which is
+    /// what a test can read of what was drawn: labels, tooltips and the like.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn texts_of_last_frame(&self) -> Vec<SharedString> {
+        self.line_layout_cache.texts_of_last_frame()
+    }
+
     /// Layout the given line of text, at the given font_size.
     /// Subsets of the line can be styled independently with the `runs` parameter.
     /// Generally, you should prefer to use [`Self::shape_line`] instead, which

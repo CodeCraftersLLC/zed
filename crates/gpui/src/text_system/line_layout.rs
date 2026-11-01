@@ -494,6 +494,18 @@ impl LineLayoutCache {
             .truncate(index.wrapped_lines_by_hash_index);
     }
 
+    /// The text of every line laid out by the most recently finished frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn texts_of_last_frame(&self) -> Vec<SharedString> {
+        let frame = self.previous_frame.lock();
+        frame
+            .used_lines
+            .iter()
+            .chain(&frame.used_wrapped_lines)
+            .map(|key| key.text.clone())
+            .collect()
+    }
+
     pub fn finish_frame(&self) {
         let mut prev_frame = self.previous_frame.lock();
         let mut curr_frame = self.current_frame.write();

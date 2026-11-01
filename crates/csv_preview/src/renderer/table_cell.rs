@@ -10,10 +10,17 @@ impl CsvPreviewView {
     pub fn create_selectable_cell(
         display_cell_id: DisplayCellId,
         cell_content: SharedString,
+        single_line_content: SharedString,
         vertical_alignment: VerticalAlignment,
         cx: &Context<CsvPreviewView>,
     ) -> AnyElement {
-        create_table_cell(display_cell_id, cell_content, vertical_alignment, cx)
+        create_table_cell(
+            display_cell_id,
+            cell_content,
+            single_line_content,
+            vertical_alignment,
+            cx,
+        )
             // Mouse events handlers will be here
             .into_any_element()
     }
@@ -23,6 +30,7 @@ impl CsvPreviewView {
 fn create_table_cell(
     display_cell_id: DisplayCellId,
     cell_content: SharedString,
+    single_line_content: SharedString,
     vertical_alignment: VerticalAlignment,
     cx: &Context<'_, CsvPreviewView>,
 ) -> gpui::Stateful<Div> {
@@ -50,6 +58,6 @@ fn create_table_cell(
             VerticalAlignment::Center => div.content_center(),
         })
         .font_buffer(cx)
-        .tooltip(Tooltip::text(cell_content.clone()))
-        .child(div().child(cell_content))
+        .tooltip(Tooltip::text(cell_content))
+        .child(div().child(single_line_content))
 }

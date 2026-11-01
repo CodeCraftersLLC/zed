@@ -555,9 +555,13 @@ fn render_mermaid_error_header(
             )
         })
         .child(
-            Label::new(reason)
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+            // `min_w_0` lets the reason shrink below its text width so it wraps inside the row
+            // instead of running past the right edge.
+            div().flex_1().min_w_0().child(
+                Label::new(reason)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
         )
 }
 

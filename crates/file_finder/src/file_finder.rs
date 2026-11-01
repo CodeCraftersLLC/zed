@@ -1345,6 +1345,11 @@ impl FileFinderDelegate {
             }
         }
 
+        let (file_name, file_name_positions) =
+            util::display_name::display_name_with_positions(&file_name, &file_name_positions);
+        let (full_path, full_path_positions) =
+            util::display_name::display_name_with_positions(&full_path, &full_path_positions);
+
         (
             HighlightedLabel::new(file_name, file_name_positions),
             HighlightedLabel::new(full_path, full_path_positions)

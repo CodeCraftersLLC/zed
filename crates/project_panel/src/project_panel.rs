@@ -6297,7 +6297,7 @@ impl ProjectPanel {
                                 }
 
                                 None => this.child(
-                                    Label::new(file_name)
+                                    Label::new(entry_label(&file_name))
                                         .single_line()
                                         .color(filename_text_color)
                                         .when(
@@ -6465,7 +6465,7 @@ impl ProjectPanel {
                             }),
                         )
                         .child(
-                            Label::new(component)
+                            Label::new(entry_label(&component))
                                 .single_line()
                                 .color(filename_text_color)
                                 .when(bold_folder_labels && !is_file, |this| {
@@ -7659,11 +7659,16 @@ impl Render for DraggedProjectEntryView {
                             } else {
                                 div()
                             })
-                            .child(Label::new(self.filename.clone()))
+                            .child(Label::new(entry_label(&self.filename)))
                         }
                     }),
             )
     }
+}
+
+/// A name as the panel draws it. Paths, selection and rename keep the real name.
+pub(crate) fn entry_label(name: &str) -> String {
+    util::display_name::display_name(name).into_owned()
 }
 
 impl EventEmitter<Event> for ProjectPanel {}

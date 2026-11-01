@@ -2015,6 +2015,34 @@ async fn test_dot_dot_name_shows_the_host_reason_while_typing(cx: &mut gpui::Tes
 }
 
 #[gpui::test]
+async fn entry_labels_use_the_installed_display_name_hook(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let name = "READ\u{200B}ME.md";
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ name: "" })).await;
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let workspace = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+    let panel = workspace.update(cx, ProjectPanel::new).unwrap();
+    cx.run_until_parked();
+
+    util::display_name::set_hook(std::sync::Arc::new(|name: &str| {
+        std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+    }));
+    let label = entry_label(name);
+    util::display_name::clear_hook();
+
+    assert_eq!(label, "READ<U+200B>ME.md");
+    assert_eq!(entry_label(name), name, "no hook, no change");
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..2, cx),
+        ["v root".to_string(), format!("      {name}")],
+        "the entry itself keeps its real name"
+    );
+}
+
+#[gpui::test]
 async fn test_cut_paste_between_different_worktrees(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 

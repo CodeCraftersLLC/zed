@@ -73,6 +73,36 @@ async fn test_fake_fs(executor: BackgroundExecutor) {
 }
 
 #[gpui::test]
+async fn test_copy_recursive_creates_nothing_when_a_nested_source_is_refused(
+    executor: BackgroundExecutor,
+) {
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/outer"),
+        json!({ "tree": { "a": "A", "nested": { "link": "L", "z": "Z" } } }),
+    )
+    .await;
+    fs.refuse_copy_source(
+        path!("/outer/tree/nested/link"),
+        "link points outside the repository".into(),
+    );
+
+    let target = Path::new(path!("/outer/copy"));
+    let error = copy_recursive(
+        fs.as_ref(),
+        Path::new(path!("/outer/tree")),
+        target,
+        Default::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("outside the repository"));
+    assert!(fs.metadata(target).await.unwrap().is_none());
+    assert_eq!(fs.files().len(), 3);
+}
+
+#[gpui::test]
 async fn test_copy_recursive_with_single_file(executor: BackgroundExecutor) {
     let fs = FakeFs::new(executor.clone());
     fs.insert_tree(

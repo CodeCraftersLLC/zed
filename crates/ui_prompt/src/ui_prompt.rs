@@ -39,7 +39,7 @@ fn zed_prompt_renderer(
 ) -> RenderablePromptHandle {
     let renderer = cx.new({
         |cx| ZedPromptRenderer {
-            _level: level,
+            level,
             message: cx.new(|cx| Markdown::new(SharedString::new(message), None, None, cx)),
             actions: actions.iter().map(|a| a.label().to_string()).collect(),
             focus: cx.focus_handle(),
@@ -53,8 +53,18 @@ fn zed_prompt_renderer(
     handle.with_view(renderer, window, cx)
 }
 
+/// Info, warning and critical prompts must not look alike: the icon carries the severity that the
+/// text alone does not.
+fn level_icon(level: PromptLevel) -> (IconName, Color) {
+    match level {
+        PromptLevel::Info => (IconName::Info, Color::Info),
+        PromptLevel::Warning => (IconName::Warning, Color::Warning),
+        PromptLevel::Critical => (IconName::XCircle, Color::Error),
+    }
+}
+
 pub struct ZedPromptRenderer {
-    _level: PromptLevel,
+    level: PromptLevel,
     message: Entity<Markdown>,
     actions: Vec<String>,
     focus: FocusHandle,
@@ -128,10 +138,18 @@ impl Render for ZedPromptRenderer {
             .elevation_3(cx)
             .overflow_hidden()
             .font_family(settings.ui_font.family.clone())
-            .child(div().w_full().child(MarkdownElement::new(
-                self.message.clone(),
-                markdown_style(true, window, cx),
-            )))
+            .child({
+                let (icon, color) = level_icon(self.level);
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_start()
+                    .child(Icon::new(icon).size(IconSize::Medium).color(color))
+                    .child(div().flex_1().min_w_0().child(MarkdownElement::new(
+                        self.message.clone(),
+                        markdown_style(true, window, cx),
+                    )))
+            })
             .children(self.detail.clone().map(|detail| {
                 div().w_full().text_xs().child(MarkdownElement::new(
                     detail,
@@ -210,5 +228,23 @@ impl EventEmitter<PromptResponse> for ZedPromptRenderer {}
 impl Focusable for ZedPromptRenderer {
     fn focus_handle(&self, _: &crate::App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_prompt_level_has_its_own_icon_and_the_warning_colour() {
+        assert_eq!(level_icon(PromptLevel::Info), (IconName::Info, Color::Info));
+        assert_eq!(
+            level_icon(PromptLevel::Warning),
+            (IconName::Warning, Color::Warning)
+        );
+        assert_eq!(
+            level_icon(PromptLevel::Critical),
+            (IconName::XCircle, Color::Error)
+        );
     }
 }
