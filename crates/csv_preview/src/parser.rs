@@ -154,6 +154,7 @@ fn parse_csv_with_positions(
     let mut current_offset = 0;
     let mut in_quotes = false;
     let mut row_quoted = false;
+    let mut field_quoted = false;
     let mut current_line = 1; // 1-based line numbering
     let mut row_start_line = 1;
     let mut chars = text.chars().peekable();
@@ -177,6 +178,7 @@ fn parse_csv_with_positions(
                     // Start of quoted field
                     in_quotes = true;
                     row_quoted = true;
+                    field_quoted = true;
                     if current_field.is_empty() {
                         // Include the opening quote in the range
                         field_start_offset = current_offset;
@@ -186,7 +188,7 @@ fn parse_csv_with_positions(
             ',' if !in_quotes => {
                 // Field separator
                 let field_end_offset = current_offset;
-                if current_field.is_empty() && !in_quotes {
+                if current_field.is_empty() && !field_quoted {
                     field_start_offset = current_offset;
                 }
                 current_row.push((
@@ -194,6 +196,7 @@ fn parse_csv_with_positions(
                     field_start_offset..field_end_offset,
                 ));
                 current_field.clear();
+                field_quoted = false;
                 field_start_offset = current_offset + char_byte_len;
             }
             '\n' => {
@@ -201,7 +204,7 @@ fn parse_csv_with_positions(
                 if !in_quotes {
                     // Row separator (only when not inside quotes)
                     let field_end_offset = current_offset;
-                    if current_field.is_empty() && current_row.is_empty() && !row_quoted {
+                    if current_field.is_empty() && current_row.is_empty() && !field_quoted {
                         field_start_offset = 0;
                     }
                     current_row.push((
@@ -209,6 +212,7 @@ fn parse_csv_with_positions(
                         field_start_offset..field_end_offset,
                     ));
                     current_field.clear();
+                    field_quoted = false;
 
                     // Only add non-empty rows
                     if !is_blank_line(&current_row, row_quoted) {
@@ -246,6 +250,7 @@ fn parse_csv_with_positions(
                             field_start_offset..field_end_offset,
                         ));
                         current_field.clear();
+                        field_quoted = false;
 
                         // Only add non-empty rows
                         if !is_blank_line(&current_row, row_quoted) {
@@ -506,6 +511,18 @@ Jane,"Simple name""#;
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[1][0].0.as_ref(), "");
         assert_eq!(cells[1][0].1, 7..9);
+    }
+
+    #[test]
+    fn a_quoted_empty_field_spans_its_quotes_wherever_it_stands_in_the_record() {
+        let spans = |text: &str| -> Vec<std::ops::Range<usize>> {
+            let (cells, _) = parse_csv_with_positions(text);
+            cells[0].iter().map(|(_, span)| span.clone()).collect()
+        };
+        assert_eq!(spans("\"\",x"), [0..2, 3..4]);
+        assert_eq!(spans("x,\"\",y"), [0..1, 2..4, 5..6]);
+        assert_eq!(spans("x,\"\""), [0..1, 2..4]);
+        assert_eq!(spans("\"\""), [0..2]);
     }
 
     #[test]

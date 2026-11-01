@@ -3345,22 +3345,22 @@ impl Window {
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
     /// time.
     pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
-        let (task, is_first) = cx.fetch_asset::<A>(source);
+        let (task, _) = cx.fetch_asset::<A>(source);
         task.clone().now_or_never().or_else(|| {
-            if is_first {
-                let entity_id = self.current_view();
-                self.spawn(cx, {
-                    let task = task.clone();
-                    async move |cx| {
-                        task.await;
+            // Every caller waits, not only the one that started the load: a view that joins a
+            // load already under way, such as a split of the same image, needs the redraw too.
+            let entity_id = self.current_view();
+            self.spawn(cx, {
+                let task = task.clone();
+                async move |cx| {
+                    task.await;
 
-                        cx.on_next_frame(move |_, cx| {
-                            cx.notify(entity_id);
-                        });
-                    }
-                })
-                .detach();
-            }
+                    cx.on_next_frame(move |_, cx| {
+                        cx.notify(entity_id);
+                    });
+                }
+            })
+            .detach();
 
             None
         })
@@ -6358,5 +6358,91 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(test)]
+mod use_asset_tests {
+    use crate::{
+        App, AppContext as _, Asset, Context, IntoElement, ParentElement as _, Render,
+        TestAppContext, Window, div,
+    };
+    use futures::channel::oneshot;
+    use std::{cell::Cell, future::Future, rc::Rc, sync::Mutex};
+
+    static RELEASE: Mutex<Option<oneshot::Receiver<u32>>> = Mutex::new(None);
+
+    struct HeldAsset;
+
+    impl Asset for HeldAsset {
+        type Source = u8;
+        type Output = u32;
+
+        fn load(_: u8, _: &mut App) -> impl Future<Output = u32> + Send + 'static {
+            let receiver = RELEASE.lock().unwrap().take().expect("one load");
+            async move { receiver.await.unwrap() }
+        }
+    }
+
+    struct Waiter;
+
+    impl Render for Waiter {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            window.use_asset::<HeldAsset>(&0, cx);
+            div()
+        }
+    }
+
+    struct Both(crate::Entity<Waiter>, crate::Entity<Waiter>);
+
+    impl Render for Both {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.0.clone()).child(self.1.clone())
+        }
+    }
+
+    /// Two views ask for one asset while it loads. Only the first call starts the load, but
+    /// both views must be notified when it finishes. The test platform never requests frames, so
+    /// the frame callbacks the notifications wait on are run by hand.
+    #[crate::test]
+    fn every_view_waiting_on_an_asset_is_notified_when_it_loads(cx: &mut TestAppContext) {
+        let (release, receiver) = oneshot::channel();
+        *RELEASE.lock().unwrap() = Some(receiver);
+        let notified = Rc::new(Cell::new((0, 0)));
+
+        let (root, cx) = cx.add_window_view(|_, cx| Both(cx.new(|_| Waiter), cx.new(|_| Waiter)));
+        let (first, second) = root.read_with(cx, |both, _| (both.0.clone(), both.1.clone()));
+        cx.update(|_, cx| {
+            let counter = notified.clone();
+            cx.observe(&first, move |_, _| {
+                let (a, b) = counter.get();
+                counter.set((a + 1, b));
+            })
+            .detach();
+            let counter = notified.clone();
+            cx.observe(&second, move |_, _| {
+                let (a, b) = counter.get();
+                counter.set((a, b + 1));
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        release.send(7).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            for callback in window.next_frame_callbacks.take() {
+                callback(window, cx);
+            }
+        });
+        let (first_count, second_count) = notified.get();
+        assert!(
+            first_count > 0,
+            "the view that started the load was not notified"
+        );
+        assert!(
+            second_count > 0,
+            "the view that joined the load was not notified"
+        );
     }
 }
