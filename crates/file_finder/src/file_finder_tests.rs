@@ -5161,6 +5161,12 @@ fn channel_match_positions_are_offsets_into_the_original_name() {
             .all(|&position| name.is_char_boundary(position))
     );
 
+    // A final sigma lowercases to `ς` in context, so the query is the whole-string lowercase.
+    let name = "ΟΣ";
+    let query = name.to_lowercase();
+    let (positions, matched) = channel_match_positions(name, &query);
+    assert_eq!((positions, matched), (vec![0, 2], query.len()));
+
     let (positions, matched) = channel_match_positions("Général", "gé");
     assert_eq!((positions, matched), (vec![0, 1], "gé".len()));
 }

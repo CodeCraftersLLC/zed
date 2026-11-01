@@ -16,7 +16,7 @@ use gpui::{
 use language::{Buffer, Capability, DiskState};
 use text::BufferId;
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
-use worktree::WorktreeId;
+use worktree::{EntryKind, WorktreeId};
 use ztracing::instrument;
 
 use crate::{
@@ -59,8 +59,6 @@ pub struct BranchDiff {
     /// A path was left out of the last file list because the worktree had not
     /// reached a folder above it yet: the list is made again when it does.
     deferred_loads: bool,
-    /// Paths the worktree was asked to scan because they were deferred.
-    requested_scans: HashSet<crate::ProjectPath>,
     _subscription: Subscription,
     update_needed: postage::watch::Sender<()>,
     _task: Task<()>,
@@ -166,7 +164,6 @@ impl BranchDiff {
             held_rows: HashMap::default(),
             awaiting_known_rows: false,
             deferred_loads: false,
-            requested_scans: HashSet::default(),
             base_commit: None,
             head_commit: None,
             _subscription: Subscription::join(git_store_subscription, worktree_subscription),
@@ -472,12 +469,10 @@ impl BranchDiff {
             .values()
             .filter_map(|note| note.renamed_from().cloned())
             .collect();
-        let mut requested_scans = std::mem::take(&mut self.requested_scans);
         let mut queue = LoadQueue {
             repo,
             snapshots: HashMap::default(),
             deferred: false,
-            requested_scans: &mut requested_scans,
             output: &mut output,
         };
         self.project.update(cx, |project, cx| {
@@ -510,7 +505,7 @@ impl BranchDiff {
                 queue.push(project, item.repo_path.clone(), item.status, kind, cx);
             }
             for (path, branch_diff) in self.tree_diff.iter().flat_map(|t| t.entries.iter()) {
-                if seen.contains(path) || renamed_away.contains(path) {
+                if !seen.insert(path.clone()) || renamed_away.contains(path) {
                     continue;
                 }
                 if let Some(link) = self.link_ancestor(path) {
@@ -534,7 +529,6 @@ impl BranchDiff {
             }
         });
         self.deferred_loads = queue.deferred;
-        self.requested_scans = requested_scans;
         output
     }
 
@@ -769,6 +763,22 @@ pub fn admission(
     }
 }
 
+/// The folder to ask the worktree to list so that it comes a level closer to `path`: the nearest
+/// folder above it that the worktree knows (`known` says whether it is a link, and whether it is
+/// not listed yet). Never a link, and never `path` or anything beneath a folder not yet judged:
+/// a requested path is scanned even through a link out of the worktree, so the scan goes one
+/// level and [`admission`] judges what it found before the next is asked for.
+pub fn unloaded_folder_to_scan(
+    path: &RelPath,
+    known: impl Fn(&RelPath) -> Option<(bool, bool)>,
+) -> Option<&RelPath> {
+    let (nearest, (is_link, unloaded)) = path
+        .ancestors()
+        .skip(1)
+        .find_map(|above| known(above).map(|state| (above, state)))?;
+    (unloaded && !is_link).then_some(nearest)
+}
+
 /// The one place a [`DiffBuffer`] is made: every load of a changed file passes
 /// [`admission`] here first, whichever list the path came from.
 struct LoadQueue<'a> {
@@ -776,13 +786,40 @@ struct LoadQueue<'a> {
     snapshots: HashMap<WorktreeId, worktree::Snapshot>,
     /// A path was left out because the worktree has not reached a folder above it.
     deferred: bool,
-    /// Paths the worktree was already asked to scan: asked once, so a path that
-    /// stays unknown does not ask on every retry.
-    requested_scans: &'a mut HashSet<crate::ProjectPath>,
     output: &'a mut Vec<DiffBuffer>,
 }
 
 impl LoadQueue<'_> {
+    /// A folder the worktree skips on its own (an ignored one) is never reached
+    /// otherwise, so the nearest folder it knows above `project_path` is asked to
+    /// list itself ([`unloaded_folder_to_scan`]): one level, whose update retries
+    /// the file list. Stateless on purpose: a folder that is unloaded again is
+    /// asked again.
+    fn request_scan_of_unloaded_ancestor(
+        &self,
+        project: &Project,
+        project_path: &crate::ProjectPath,
+        cx: &App,
+    ) {
+        let Some(snapshot) = self.snapshots.get(&project_path.worktree_id) else {
+            return;
+        };
+        let folder = unloaded_folder_to_scan(&project_path.path, |path| {
+            snapshot.entry_for_path(path).map(|entry| {
+                let is_link =
+                    !path.is_empty() && (entry.canonical_path.is_some() || entry.is_external);
+                (is_link, entry.kind == EntryKind::UnloadedDir)
+            })
+        });
+        if let Some(folder) = folder
+            && let Some(local) = project
+                .worktree_for_id(project_path.worktree_id, cx)
+                .and_then(|worktree| worktree.read(cx).as_local())
+        {
+            local.refresh_entries_for_paths(vec![folder.into()]);
+        }
+    }
+
     fn push(
         &mut self,
         project: &Project,
@@ -809,15 +846,7 @@ impl LoadQueue<'_> {
                     Admission::Behind => return,
                     Admission::NotScanned => {
                         self.deferred = true;
-                        // A folder the worktree skips on its own (an ignored one)
-                        // is never reached otherwise; its update retries the list.
-                        if self.requested_scans.insert(project_path.clone())
-                            && let Some(local) = project
-                                .worktree_for_id(project_path.worktree_id, cx)
-                                .and_then(|worktree| worktree.read(cx).as_local())
-                        {
-                            local.refresh_entries_for_paths(vec![project_path.path.clone()]);
-                        }
+                        self.request_scan_of_unloaded_ancestor(project, &project_path, cx);
                         return;
                     }
                 }

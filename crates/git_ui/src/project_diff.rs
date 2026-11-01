@@ -2315,6 +2315,7 @@ mod tests {
     use collections::HashMap;
     use db::indoc;
     use editor::test::editor_test_context::{EditorTestContext, assert_state_with_diff};
+    use fs::Fs as _;
     use git::status::{TrackedStatus, UnmergedStatus, UnmergedStatusCode};
     use gpui::TestAppContext;
     use project::FakeFs;
@@ -4079,6 +4080,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_scan_goes_one_level_and_never_into_or_below_a_link() {
+        use project::git_store::branch_diff::unloaded_folder_to_scan;
+
+        let path = rel_path("vendor/pkg/file.rs");
+        // (is a link, is not listed yet)
+        let known = |entries: &'static [(&'static str, bool, bool)]| {
+            move |asked: &RelPath| {
+                entries
+                    .iter()
+                    .find(|(entry, ..)| *entry == asked.as_unix_str())
+                    .map(|&(_, link, unloaded)| (link, unloaded))
+            }
+        };
+
+        assert_eq!(
+            unloaded_folder_to_scan(path, known(&[("", false, false), ("vendor", false, true)])),
+            Some(rel_path("vendor")),
+            "the folder it knows, not the file"
+        );
+        assert_eq!(
+            unloaded_folder_to_scan(
+                path,
+                known(&[
+                    ("", false, false),
+                    ("vendor", false, true),
+                    ("vendor/pkg", false, true)
+                ])
+            ),
+            Some(rel_path("vendor/pkg"))
+        );
+        assert_eq!(
+            unloaded_folder_to_scan(
+                path,
+                known(&[
+                    ("", false, false),
+                    ("vendor", false, true),
+                    ("vendor/pkg", true, true)
+                ])
+            ),
+            None,
+            "a link is never asked for"
+        );
+        assert_eq!(
+            unloaded_folder_to_scan(path, known(&[("", false, false), ("vendor", false, false)])),
+            None,
+            "a listed folder that lacks the next one has nothing to ask"
+        );
+    }
+
     #[gpui::test]
     async fn a_path_in_a_folder_the_worktree_has_not_reached_waits_and_loads_when_it_has(
         cx: &mut TestAppContext,
@@ -4219,6 +4270,109 @@ mod tests {
         let (diff, cx) = open_diff(cx, &fs).await;
 
         assert_eq!(shown(&diff, cx).0, ["kept.txt", "vendor/pkg/file.rs"]);
+    }
+
+    #[gpui::test]
+    async fn the_scan_for_a_file_in_an_ignored_folder_does_not_follow_a_link_beside_it(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                ".gitignore": "vendor/\n",
+                "kept.txt": "after\n",
+                "vendor": { "pkg": { "file.rs": "after\n" } },
+            }),
+        )
+        .await;
+        fs.insert_tree(path!("/outside"), json!({ "secret.txt": "after\n" }))
+            .await;
+        fs.create_symlink(
+            Path::new(path!("/project/vendor/link")),
+            path!("/outside").into(),
+        )
+        .await
+        .unwrap();
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                (".gitignore", "vendor/\n".to_string()),
+                ("kept.txt", "before\n".to_string()),
+                ("vendor/pkg/file.rs", "before\n".to_string()),
+            ],
+        );
+
+        let (diff, cx) = open_diff(cx, &fs).await;
+
+        assert_eq!(shown(&diff, cx).0, ["kept.txt", "vendor/pkg/file.rs"]);
+        let below_the_link = diff.read_with(cx, |diff, cx| {
+            let project = diff.project.read(cx);
+            let worktree = project.worktrees(cx).next().unwrap().read(cx).snapshot();
+            worktree
+                .entries(true, 0)
+                .filter(|entry| entry.path.starts_with(rel_path("vendor/link")))
+                .map(|entry| entry.path.as_unix_str().to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            below_the_link,
+            ["vendor/link"],
+            "the link itself, nothing beneath it"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_link_and_a_file_beneath_it_that_only_the_tree_diff_lists_are_one_note(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "d.txt": "text of d", "link": "stands in for the link" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                ProjectDiff::new_with_default_branch(project.clone(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let committed = [
+            ("d.txt", "text of d".to_string()),
+            ("link", "stands in for the link".to_string()),
+            ("link/inside.txt", "inside".to_string()),
+        ];
+        fs.set_index_for_repo(Path::new(path!("/project/.git")), &committed);
+        fs.set_head_for_repo(Path::new(path!("/project/.git")), &committed, "sha");
+        fs.set_merge_base_content_for_repo(Path::new(path!("/project/.git")), &[]);
+        cx.run_until_parked();
+        link_paths(&diff, cx, &[("link", "A link to a folder")]);
+
+        // The multibuffer keys rows by path, so a second row for the link would
+        // be hidden there: count what the branch diff queues.
+        let queued = diff.update(cx, |diff, cx| {
+            diff.branch_diff
+                .update(cx, |branch_diff, cx| branch_diff.load_buffers(cx))
+        });
+        let links = queued
+            .iter()
+            .filter(|row| row.repo_path.as_unix_str() == "link")
+            .count();
+        assert_eq!(links, 1, "one note row for the link");
+        assert!(
+            queued
+                .iter()
+                .all(|row| row.repo_path.as_unix_str() != "link/inside.txt")
+        );
     }
 
     #[gpui::test]
