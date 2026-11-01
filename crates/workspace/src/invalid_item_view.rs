@@ -353,13 +353,13 @@ mod tests {
                 cx,
             )
         });
-        util::display_name::set_hook(Arc::new(|name: &str| {
+        let hook = util::display_name::install_hook_for_test(Arc::new(|name: &str| {
             std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
         }));
         let title = view
             .read_with(cx, |view, cx| view.tab_content_text(0, cx))
             .unwrap();
-        util::display_name::clear_hook();
+        drop(hook);
         assert_eq!(title, "we<U+200B>ird.bin");
     }
 

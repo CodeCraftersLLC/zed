@@ -127,6 +127,10 @@ impl CsvPreviewView {
             // TODO: Introduce `<null>` cell type
             let cell_content = table_cell.display_value().cloned().unwrap_or_default();
             let single_line_content = table_cell.single_line_value().cloned().unwrap_or_default();
+            let drawn_content = this
+                .settings
+                .rendering_with
+                .drawn_text(&cell_content, &single_line_content);
 
             let display_cell_id = DisplayCellId::new(display_row, col);
 
@@ -134,7 +138,7 @@ impl CsvPreviewView {
                 CsvPreviewView::create_selectable_cell(
                     display_cell_id,
                     cell_content,
-                    single_line_content,
+                    drawn_content,
                     this.settings.vertical_alignment,
                     cx,
                 ),

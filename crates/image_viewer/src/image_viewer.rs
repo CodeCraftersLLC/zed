@@ -146,12 +146,6 @@ impl ImageView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Start loading the image to render in the background to prevent the view
-        // from flickering in most cases.
-        let _ = image_item.update(cx, |image, cx| {
-            image.image.clone().get_render_image(window, cx)
-        });
-
         let image_size = image_item
             .read(cx)
             .image_metadata
@@ -204,7 +198,7 @@ impl ImageView {
     /// Drops the decoded picture and its asset, which GPUI otherwise keeps for the life of the app.
     fn release_image(image: Arc<gpui::Image>, window: &mut Window, cx: &mut App) {
         if let Some(render_image) = image.clone().get_render_image(window, cx) {
-            cx.drop_image(render_image, None);
+            cx.drop_image(render_image, Some(window));
         }
         image.remove_asset(cx);
     }
@@ -1314,6 +1308,36 @@ mod tests {
             "{drawn:?}"
         );
         assert_no_raw_zero_width_space(&drawn);
+    }
+
+    #[gpui::test]
+    async fn replacing_the_file_on_disk_refreshes_the_metadata_and_the_draw_decision(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, image_item) = open_image(cx, "swap.png", small_png()).await;
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ImageView::new(image_item.clone(), project.clone(), window, cx)
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.image_size, Some((2, 2)));
+            assert!(matches!(view.reduction, Reduction::NotNeeded));
+        });
+
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        fs.as_fake()
+            .insert_file(util::path!("/root/swap.png"), wide_png())
+            .await;
+        cx.run_until_parked();
+
+        let width = gpui::MAX_RASTER_SIDE + 1;
+        image_item.read_with(cx, |item, _| {
+            let metadata = item.image_metadata.expect("metadata");
+            assert_eq!((metadata.width, metadata.height), (width, 1));
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.image_size, Some((width, 1)));
+            assert!(matches!(view.reduction, Reduction::Ready(_)));
+        });
     }
 
     #[gpui::test]

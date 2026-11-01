@@ -2027,11 +2027,11 @@ async fn entry_labels_use_the_installed_display_name_hook(cx: &mut gpui::TestApp
     let panel = workspace.update(cx, ProjectPanel::new).unwrap();
     cx.run_until_parked();
 
-    util::display_name::set_hook(std::sync::Arc::new(|name: &str| {
+    let hook = util::display_name::install_hook_for_test(std::sync::Arc::new(|name: &str| {
         std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
     }));
     let label = entry_label(name);
-    util::display_name::clear_hook();
+    drop(hook);
 
     assert_eq!(label, "READ<U+200B>ME.md");
     assert_eq!(entry_label(name), name, "no hook, no change");

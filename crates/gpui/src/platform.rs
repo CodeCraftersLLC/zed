@@ -2234,8 +2234,9 @@ impl Image {
     }
 
     /// Like [`Self::use_render_image`], but a decode failure is returned rather than dropped, so a
-    /// caller can say why nothing is drawn. `None` while the image is still loading, and the
-    /// current view is notified when it finishes.
+    /// caller can say why nothing is drawn. `None` while the image is still loading. The current
+    /// view is notified when the load finishes only if this call started it: a load that
+    /// [`Self::get_render_image`] started earlier notifies no one.
     pub fn use_render_image_result(
         self: Arc<Self>,
         window: &mut Window,

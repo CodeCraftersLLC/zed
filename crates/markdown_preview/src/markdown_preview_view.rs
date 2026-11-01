@@ -1087,6 +1087,14 @@ impl Item for MarkdownPreviewView {
             .unwrap_or_else(|| SharedString::from("Markdown Preview"))
     }
 
+    /// The real file name: Save As proposes what is on disk, not the preview's display title.
+    fn suggested_filename(&self, cx: &App) -> SharedString {
+        self.active_editor
+            .as_ref()
+            .map(|editor_state| editor_state.editor.read(cx).suggested_filename(cx))
+            .unwrap_or_else(|| self.tab_content_text(0, cx))
+    }
+
     fn telemetry_event_text(&self) -> Option<&'static str> {
         Some("Markdown Preview Opened")
     }
@@ -1799,6 +1807,59 @@ mod tests {
                 .unwrap(),
             "- [x] Finish work\n"
         );
+    }
+
+    #[gpui::test]
+    async fn save_as_proposes_the_real_file_name_not_the_display_title(cx: &mut TestAppContext) {
+        use workspace::Item as _;
+
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/dir"), json!({ "we\u{200B}ird.md": "# Title\n" }))
+            .await;
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/dir/we\u{200B}ird.md"))],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let preview = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let editor: Entity<Editor> = workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<Editor>(cx))
+                    .unwrap();
+                workspace.update(cx, |workspace, cx| {
+                    MarkdownPreviewView::create_markdown_view(workspace, editor, window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let hook = util::display_name::install_hook_for_test(Arc::new(|name: &str| {
+            std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+        }));
+        let (tab, suggested) = cx.update(|cx| {
+            let preview = preview.read(cx);
+            (
+                preview.tab_content_text(0, cx),
+                preview.suggested_filename(cx),
+            )
+        });
+        drop(hook);
+
+        assert_eq!(tab, "Preview we<U+200B>ird.md");
+        assert_eq!(suggested, "we\u{200B}ird.md");
     }
 
     #[gpui::test]

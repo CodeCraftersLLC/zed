@@ -201,7 +201,7 @@ fn parse_csv_with_positions(
                 if !in_quotes {
                     // Row separator (only when not inside quotes)
                     let field_end_offset = current_offset;
-                    if current_field.is_empty() && current_row.is_empty() {
+                    if current_field.is_empty() && current_row.is_empty() && !row_quoted {
                         field_start_offset = 0;
                     }
                     current_row.push((
@@ -498,6 +498,14 @@ Jane,"Simple name""#;
         let (content3, range3) = &parsed_cells[0][2];
         assert_eq!(content3.as_ref(), "third");
         assert_eq!(*range3, 16..21);
+    }
+
+    #[test]
+    fn a_retained_quoted_empty_record_spans_its_quotes() {
+        let (cells, _) = parse_csv_with_positions("header\n\"\"\n");
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[1][0].0.as_ref(), "");
+        assert_eq!(cells[1][0].1, 7..9);
     }
 
     #[test]
