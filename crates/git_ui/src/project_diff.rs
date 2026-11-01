@@ -6,7 +6,7 @@ use crate::{
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
@@ -30,7 +30,7 @@ use project::{
     ConflictSet, Project, ProjectPath,
     git_store::{
         Repository,
-        branch_diff::{self, BranchDiffEvent, DiffBase},
+        branch_diff::{self, BranchDiffEvent, DiffBase, RowNote},
     },
 };
 use settings::{Settings, SettingsStore};
@@ -85,6 +85,8 @@ pub struct ProjectDiff {
     editor: Entity<SplittableEditor>,
     options: ProjectDiffOptions,
     buffer_subscriptions: HashMap<Arc<RelPath>, BufferSubscriptions>,
+    /// The entries now shown that are a note, not the lines of a file.
+    note_paths: HashSet<PathKey>,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
@@ -107,6 +109,10 @@ pub struct ProjectDiffOptions {
     /// Whether the empty state says anything about the remote. Without a Git panel to ask, all
     /// it can say is "Remote up to date", which is false for a repository with no remote.
     pub show_remote_status: bool,
+    /// Load nothing until the host has said which rows are links to folders and
+    /// which must be held back ([`ProjectDiff::set_known_rows`]), so that no row
+    /// is drawn as text before the host has judged it.
+    pub wait_for_known_rows: bool,
 }
 
 impl ProjectDiffOptions {
@@ -118,6 +124,7 @@ impl ProjectDiffOptions {
             allow_index_mutations: false,
             enable_conflict_view: false,
             show_remote_status: false,
+            wait_for_known_rows: true,
         }
     }
 }
@@ -131,6 +138,7 @@ impl Default for ProjectDiffOptions {
             allow_index_mutations: true,
             enable_conflict_view: true,
             show_remote_status: true,
+            wait_for_known_rows: false,
         }
     }
 }
@@ -639,6 +647,9 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        if options.wait_for_known_rows {
+            branch_diff.update(cx, |branch_diff, _| branch_diff.await_known_rows());
+        }
         let focus_handle = cx.focus_handle();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
@@ -671,7 +682,11 @@ impl ProjectDiff {
                             workspace: workspace.downgrade(),
                         });
                     }
-                    DiffBase::Head => {}
+                    DiffBase::Head => {
+                        editor.register_addon(RowNoteAddon {
+                            branch_diff: branch_diff.clone(),
+                        });
+                    }
                     DiffBase::Merge { .. } => {
                         editor.register_addon(BranchDiffAddon {
                             branch_diff: branch_diff.clone(),
@@ -748,6 +763,7 @@ impl ProjectDiff {
             options,
             multibuffer,
             buffer_subscriptions: Default::default(),
+            note_paths: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
             _task: task,
@@ -957,12 +973,18 @@ impl ProjectDiff {
         &mut self,
         path_key: PathKey,
         file_status: FileStatus,
+        is_note: bool,
         buffer: Entity<Buffer>,
         diff: Entity<BufferDiff>,
         conflict_set: Entity<ConflictSet>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<BufferId> {
+        if is_note {
+            self.note_paths.insert(path_key.clone());
+        } else {
+            self.note_paths.remove(&path_key);
+        }
         let diff_subscription = cx.subscribe_in(&diff, window, {
             let path_key = path_key.clone();
             let buffer = buffer.clone();
@@ -973,6 +995,7 @@ impl ProjectDiff {
                     this.buffer_ranges_changed(
                         path_key.clone(),
                         file_status,
+                        is_note,
                         buffer.clone(),
                         diff.clone(),
                         conflict_set.clone(),
@@ -984,7 +1007,7 @@ impl ProjectDiff {
                 | buffer_diff::BufferDiffEvent::HunksStagedOrUnstaged(_) => {}
             }
         });
-        let conflict_set_subscription = if self.options.enable_conflict_view {
+        let conflict_set_subscription = if self.options.enable_conflict_view && !is_note {
             Some(cx.subscribe_in(&conflict_set, window, {
                 let path_key = path_key.clone();
                 let buffer = buffer.clone();
@@ -994,6 +1017,7 @@ impl ProjectDiff {
                     this.buffer_ranges_changed(
                         path_key.clone(),
                         file_status,
+                        is_note,
                         buffer.clone(),
                         diff.clone(),
                         conflict_set.clone(),
@@ -1018,8 +1042,11 @@ impl ProjectDiff {
         let snapshot = buffer.read(cx).snapshot();
         let diff_snapshot = diff.read(cx).snapshot(cx);
 
-        let enable_conflict_view = self.options.enable_conflict_view;
-        let excerpt_ranges = {
+        let enable_conflict_view = self.options.enable_conflict_view && !is_note;
+        let excerpt_ranges = if is_note {
+            // A note has no hunks: the whole of its one line is the entry.
+            vec![language::Point::zero()..snapshot.max_point()]
+        } else {
             let diff_hunk_ranges = diff_snapshot
                 .hunks_intersecting_range(
                     Anchor::min_max_range_for_buffer(snapshot.remote_id()),
@@ -1079,6 +1106,7 @@ impl ProjectDiff {
                     );
                 }
                 if is_excerpt_newly_added
+                    && !is_note
                     && (file_status.is_deleted()
                         || (file_status.is_untracked()
                             && GitPanelSettings::get_global(cx).collapse_untracked_diff))
@@ -1112,6 +1140,7 @@ impl ProjectDiff {
         &mut self,
         path_key: PathKey,
         file_status: FileStatus,
+        is_note: bool,
         buffer: Entity<Buffer>,
         diff: Entity<BufferDiff>,
         conflict_set: Entity<ConflictSet>,
@@ -1124,6 +1153,7 @@ impl ProjectDiff {
         self.register_buffer(
             path_key,
             file_status,
+            is_note,
             buffer,
             diff,
             conflict_set,
@@ -1158,7 +1188,18 @@ impl ProjectDiff {
                         sort_prefix,
                         diff_buffer.repo_path.as_ref().clone(),
                     );
-                    previous_paths.remove(&path_key);
+                    let shown = previous_paths.remove(&path_key);
+                    // A path that was the lines of a file and is now a note (it has
+                    // just been held back, or is behind a link) loses those lines
+                    // now, not when its replacement is registered: the loads are
+                    // awaited one after another and a slow one ahead of it would
+                    // leave the lines on screen meanwhile.
+                    if let Some(buffer_id) = shown
+                        && diff_buffer.is_note
+                        && !this.note_paths.contains(&path_key)
+                    {
+                        previous_paths.insert(path_key.clone(), buffer_id);
+                    }
                     entries.insert(path_key, diff_buffer);
                 }
             }
@@ -1167,6 +1208,7 @@ impl ProjectDiff {
             this.editor.update(cx, |editor, cx| {
                 for (path, buffer_id) in previous_paths {
                     this.buffer_subscriptions.remove(&path.path);
+                    this.note_paths.remove(&path);
                     if enable_conflict_view {
                         editor.rhs_editor().update(cx, |editor, cx| {
                             conflict_view::buffers_removed(editor, &[buffer_id], cx);
@@ -1193,6 +1235,7 @@ impl ProjectDiff {
                         if let Some(buffer_id) = this.register_buffer(
                             path_key,
                             entry.file_status,
+                            entry.is_note,
                             buffer,
                             diff,
                             conflict_set,
@@ -1221,7 +1264,33 @@ impl ProjectDiff {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    /// Replace the notes of the changed paths (see [`RowNote`]). The entries are
+    /// read again when they differ from the ones held.
+    pub fn set_row_notes(
+        &mut self,
+        notes: impl IntoIterator<Item = (RepoPath, RowNote)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.branch_diff
+            .update(cx, |branch_diff, cx| branch_diff.set_row_notes(notes, cx));
+    }
+
+    /// Say which changed paths are links to folders and which rows must be held
+    /// back from being drawn as text, each with what is said of it (see
+    /// [`branch_diff::BranchDiff::set_known_rows`]). The first call ends the wait
+    /// of [`ProjectDiffOptions::wait_for_known_rows`].
+    pub fn set_known_rows(
+        &mut self,
+        links: impl IntoIterator<Item = (RepoPath, SharedString)>,
+        held: impl IntoIterator<Item = (RepoPath, SharedString)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.branch_diff.update(cx, |branch_diff, cx| {
+            branch_diff.set_known_rows(links, held, cx)
+        });
+    }
+
+    /// The paths of the entries now shown, in order.
     pub fn excerpt_paths(&self, cx: &App) -> Vec<std::sync::Arc<util::rel_path::RelPath>> {
         let snapshot = self
             .editor()
@@ -2164,6 +2233,36 @@ impl Render for BranchDiffToolbar {
                     ),
                 )
             })
+    }
+}
+
+/// Says in the header of a renamed path's entry what a note says of it, beside the hunks.
+struct RowNoteAddon {
+    branch_diff: Entity<branch_diff::BranchDiff>,
+}
+
+impl Addon for RowNoteAddon {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn render_buffer_header_controls(
+        &self,
+        excerpt: &multi_buffer::ExcerptBoundaryInfo,
+        _: &language::BufferSnapshot,
+        _: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let text = self
+            .branch_diff
+            .read(cx)
+            .note_text_for_buffer_id(excerpt.buffer_id(), cx)?;
+        Some(
+            Label::new(text)
+                .color(Color::Muted)
+                .single_line()
+                .into_any_element(),
+        )
     }
 }
 
@@ -3396,5 +3495,811 @@ mod tests {
         let paths_b = diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
         assert_eq!(paths_b.len(), 1);
         assert_eq!(*paths_b[0], *"b.txt");
+    }
+
+    async fn open_diff<'a>(
+        cx: &'a mut TestAppContext,
+        fs: &Arc<FakeFs>,
+    ) -> (Entity<ProjectDiff>, &'a mut gpui::VisualTestContext) {
+        let (diff, cx) = open_gated_diff(cx, fs).await;
+        diff.update(cx, |diff, cx| diff.set_known_rows([], [], cx));
+        cx.run_until_parked();
+        (diff, cx)
+    }
+
+    /// The embedded diff as the host opens it: it loads nothing until it has been
+    /// told which rows are links and which are held.
+    async fn open_gated_diff<'a>(
+        cx: &'a mut TestAppContext,
+        fs: &Arc<FakeFs>,
+    ) -> (Entity<ProjectDiff>, &'a mut gpui::VisualTestContext) {
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new_with_options(
+                project.clone(),
+                workspace,
+                ProjectDiffOptions::embedded_view_only(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        (diff, cx)
+    }
+
+    fn note_paths(
+        diff: &Entity<ProjectDiff>,
+        cx: &mut gpui::VisualTestContext,
+        notes: &[(&str, RowNote)],
+    ) {
+        let notes = notes
+            .iter()
+            .map(|(path, note)| (RepoPath::new(path).unwrap(), note.clone()))
+            .collect::<Vec<_>>();
+        diff.update(cx, |diff, cx| diff.set_row_notes(notes, cx));
+        cx.run_until_parked();
+    }
+
+    fn shown(
+        diff: &Entity<ProjectDiff>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (Vec<String>, String) {
+        diff.read_with(cx, |diff, cx| {
+            let paths = diff
+                .excerpt_paths(cx)
+                .iter()
+                .map(|path| path.as_unix_str().to_string())
+                .collect();
+            let text = diff
+                .editor()
+                .read(cx)
+                .rhs_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text();
+            (paths, text)
+        })
+    }
+
+    fn sentence(text: &str) -> RowNote {
+        RowNote::Sentence {
+            text: text.to_string().into(),
+            renamed_from: None,
+        }
+    }
+
+    #[gpui::test]
+    async fn a_noted_path_shows_its_note_not_hunks(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "after-edit\n",
+                "x.dat": "after-bytes\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("a.txt", "before-edit\n".to_string()),
+                ("x.dat", "before-bytes\n".to_string()),
+            ],
+        );
+
+        let (diff, cx) = open_diff(cx, &fs).await;
+        note_paths(
+            &diff,
+            cx,
+            &[("x.dat", sentence("File marked -diff changed, 13 B to 12 B"))],
+        );
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["a.txt", "x.dat"]);
+        assert!(text.contains("after-edit"), "{text}");
+        assert!(
+            text.contains("File marked -diff changed, 13 B to 12 B"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("after-bytes"),
+            "the noted path's lines are not drawn: {text}"
+        );
+        assert_eq!(
+            diff.read_with(cx, |diff, cx| diff.calculate_changed_lines(cx)),
+            (1, 1),
+            "only a.txt has hunks"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_note_is_replaced_by_the_text_diff_when_the_path_is_no_longer_noted(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "x.dat": "after-bytes\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("x.dat", "before-bytes\n".to_string())],
+        );
+        let (diff, cx) = open_diff(cx, &fs).await;
+        note_paths(&diff, cx, &[("x.dat", sentence("A note"))]);
+        assert_eq!(shown(&diff, cx).1, "A note");
+
+        diff.update(cx, |diff, cx| diff.set_row_notes([], cx));
+        cx.run_until_parked();
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["x.dat"]);
+        assert!(text.contains("after-bytes"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn a_renamed_path_is_one_entry_diffed_against_the_old_path(cx: &mut TestAppContext) {
+        init_test(cx);
+        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+        let new = old.replace("three", "THREE");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "new.txt": new }))
+            .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("old.txt", old.to_string())],
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("old.txt", old.to_string())],
+        );
+        let base = git::Oid::from_bytes("1".repeat(20).as_bytes()).unwrap();
+
+        let (diff, cx) = open_diff(cx, &fs).await;
+        assert_eq!(
+            shown(&diff, cx).0,
+            ["old.txt", "new.txt"],
+            "without the note: a deletion and an addition"
+        );
+
+        note_paths(
+            &diff,
+            cx,
+            &[(
+                "new.txt",
+                RowNote::Renamed {
+                    from: RepoPath::new("old.txt").unwrap(),
+                    base,
+                    text: "Renamed from old.txt".into(),
+                },
+            )],
+        );
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["new.txt"], "the old path is not listed");
+        assert!(text.contains("THREE"), "{text}");
+        assert_eq!(
+            diff.read_with(cx, |diff, cx| diff.calculate_changed_lines(cx)),
+            (1, 1),
+            "only the real change is a hunk, not the whole file as added"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_renamed_path_with_a_note_is_one_entry_with_that_note(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "new.txt": "same\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("old.txt", "same\n".to_string())],
+        );
+
+        let (diff, cx) = open_diff(cx, &fs).await;
+        note_paths(
+            &diff,
+            cx,
+            &[(
+                "new.txt",
+                RowNote::Sentence {
+                    text: "Renamed from old.txt".into(),
+                    renamed_from: Some(RepoPath::new("old.txt").unwrap()),
+                },
+            )],
+        );
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["new.txt"]);
+        assert_eq!(text, "Renamed from old.txt");
+    }
+
+    fn link_to(sentence: &str) -> SharedString {
+        sentence.to_string().into()
+    }
+
+    fn link_paths(
+        diff: &Entity<ProjectDiff>,
+        cx: &mut gpui::VisualTestContext,
+        links: &[(&str, &str)],
+    ) {
+        let links = links
+            .iter()
+            .map(|(path, sentence)| (RepoPath::new(path).unwrap(), link_to(sentence)))
+            .collect::<Vec<_>>();
+        diff.update(cx, |diff, cx| diff.set_known_rows(links, [], cx));
+        cx.run_until_parked();
+    }
+
+    async fn fs_with_a_link(cx: &mut TestAppContext) -> Arc<FakeFs> {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "kept.txt": "kept\n",
+                "link": { "inside.txt": "reached through the link\n" },
+                "links": { "other.txt": "next to it, not under it\n" },
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("kept.txt", "before\n".to_string())],
+        );
+        fs
+    }
+
+    #[gpui::test]
+    async fn a_folder_link_hides_what_is_beneath_it_before_any_note_has_arrived(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = fs_with_a_link(cx).await;
+        let (diff, cx) = open_diff(cx, &fs).await;
+        assert_eq!(
+            shown(&diff, cx).0,
+            ["kept.txt", "link/inside.txt", "links/other.txt"]
+        );
+
+        // No note is set, as while the notes are still being read.
+        link_paths(
+            &diff,
+            cx,
+            &[("link", "A link to a folder \u{2192} /elsewhere")],
+        );
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(
+            paths,
+            ["kept.txt", "link", "links/other.txt"],
+            "status lists only what is beneath the link: the link is still one entry"
+        );
+        assert!(
+            text.contains("A link to a folder \u{2192} /elsewhere"),
+            "{text}"
+        );
+        assert!(!text.contains("reached through the link"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn a_path_beneath_a_symlinked_folder_is_not_loaded_whatever_the_host_has_said(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "kept.txt": "kept\n" }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/outside"),
+            json!({ "inside.txt": "behind the link\n" }),
+        )
+        .await;
+        project::Fs::create_symlink(
+            fs.as_ref(),
+            Path::new(path!("/project/link")),
+            std::path::PathBuf::from(path!("/outside")),
+        )
+        .await
+        .unwrap();
+        // HEAD holds a file beneath the link, so status lists it.
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("kept.txt", "before\n".to_string()),
+                ("link/inside.txt", "before-the-link\n".to_string()),
+            ],
+        );
+
+        // No link has been set by the host, as before the shell's status arrives.
+        let (diff, cx) = open_diff(cx, &fs).await;
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["kept.txt"], "{text}");
+        assert!(!text.contains("before-the-link"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn nothing_is_loaded_until_the_host_has_said_which_rows_are_held(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "a.txt": "after-edit\n", "x.dat": "after-bytes\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("a.txt", "before-edit\n".to_string()),
+                ("x.dat", "before-bytes\n".to_string()),
+            ],
+        );
+        let (diff, cx) = open_gated_diff(cx, &fs).await;
+        assert_eq!(
+            shown(&diff, cx).0,
+            Vec::<String>::new(),
+            "the host has not spoken"
+        );
+
+        diff.update(cx, |diff, cx| {
+            diff.set_known_rows(
+                [],
+                [(
+                    RepoPath::new("x.dat").unwrap(),
+                    link_to("File marked -diff"),
+                )],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["a.txt", "x.dat"]);
+        assert!(text.contains("File marked -diff"), "{text}");
+        assert!(
+            !text.contains("before-bytes") && !text.contains("after-bytes"),
+            "the held row was never drawn as text, not even in the first load: {text}"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_held_row_gives_way_to_the_note_that_follows_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "x.dat": "after-bytes\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("x.dat", "before-bytes\n".to_string())],
+        );
+        let (diff, cx) = open_gated_diff(cx, &fs).await;
+        diff.update(cx, |diff, cx| {
+            diff.set_known_rows(
+                [],
+                [(
+                    RepoPath::new("x.dat").unwrap(),
+                    link_to("File marked -diff"),
+                )],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(shown(&diff, cx).1, "File marked -diff");
+
+        note_paths(
+            &diff,
+            cx,
+            &[("x.dat", sentence("File marked -diff changed, 13 B to 12 B"))],
+        );
+
+        assert_eq!(
+            shown(&diff, cx).1,
+            "File marked -diff changed, 13 B to 12 B"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_hold_outranks_a_rename_note_computed_before_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "new.dat": old.replace("three", "THREE") }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("old.dat", old.to_string())],
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("old.dat", old.to_string())],
+        );
+        let base = git::Oid::from_bytes("1".repeat(20).as_bytes()).unwrap();
+        let (diff, cx) = open_diff(cx, &fs).await;
+        note_paths(
+            &diff,
+            cx,
+            &[(
+                "new.dat",
+                RowNote::Renamed {
+                    from: RepoPath::new("old.dat").unwrap(),
+                    base,
+                    text: "Renamed from old.dat".into(),
+                },
+            )],
+        );
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["new.dat"]);
+        assert!(
+            text.contains("THREE"),
+            "the edited rename is drawn as text: {text}"
+        );
+
+        // `.gitattributes` now marks `*.dat` `-diff`: the next status says so,
+        // and no new note has been read.
+        diff.update(cx, |diff, cx| {
+            diff.set_known_rows(
+                [],
+                [(
+                    RepoPath::new("new.dat").unwrap(),
+                    link_to("File marked -diff"),
+                )],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["new.dat"], "the old name stays out of the list");
+        assert_eq!(
+            text, "File marked -diff",
+            "not the lines of a file git does not diff"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_file_that_has_just_been_held_loses_its_lines_before_any_load_is_awaited(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "a.txt": "after-edit\n", "x.dat": "after-bytes\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("a.txt", "before-edit\n".to_string()),
+                ("x.dat", "before-bytes\n".to_string()),
+            ],
+        );
+        let (diff, cx) = open_diff(cx, &fs).await;
+        assert!(
+            shown(&diff, cx).1.contains("after-bytes"),
+            "drawn as text so far"
+        );
+
+        // `a.txt` is loaded ahead of `x.dat`, which is now held: run the refresh
+        // one step at a time and look at the view between steps.
+        diff.update(cx, |diff, cx| {
+            diff.set_known_rows(
+                [],
+                [(
+                    RepoPath::new("x.dat").unwrap(),
+                    link_to("File marked -diff"),
+                )],
+                cx,
+            )
+        });
+        let mut lines_gone_before_the_note = false;
+        while cx.executor().tick() {
+            let (_, text) = shown(&diff, cx);
+            if !text.contains("after-bytes") {
+                lines_gone_before_the_note = !text.contains("File marked -diff");
+                break;
+            }
+        }
+
+        assert!(
+            lines_gone_before_the_note,
+            "the lines of the held file stayed on screen until its note was registered"
+        );
+        cx.run_until_parked();
+        assert_eq!(shown(&diff, cx).0, ["a.txt", "x.dat"]);
+        assert!(shown(&diff, cx).1.contains("File marked -diff"));
+    }
+
+    #[test]
+    fn a_path_is_admitted_on_what_the_worktree_says_of_each_folder_above_it() {
+        use project::git_store::branch_diff::{Admission, Ancestor, admission};
+        let path = rel_path("a/b/c.txt");
+        let known = |a: Option<Ancestor>, b: Option<Ancestor>| {
+            move |above: &RelPath| match above.as_unix_str() {
+                "a/b" => a,
+                "a" => b,
+                _ => Some(Ancestor::Plain),
+            }
+        };
+        let plain = Some(Ancestor::Plain);
+        let link = Some(Ancestor::Link);
+
+        assert_eq!(admission(path, false, known(plain, plain)), Admission::Read);
+        assert_eq!(
+            admission(path, false, known(plain, link)),
+            Admission::Behind
+        );
+        assert_eq!(
+            admission(path, false, known(link, plain)),
+            Admission::Behind
+        );
+        assert_eq!(
+            admission(path, false, known(None, plain)),
+            Admission::NotScanned,
+            "a folder the worktree has not reached yet"
+        );
+        assert_eq!(
+            admission(path, false, known(None, link)),
+            Admission::Behind,
+            "a link above is a link whatever is unknown below"
+        );
+        assert_eq!(
+            admission(path, true, known(None, None)),
+            Admission::Read,
+            "a deleted file in a deleted folder has nothing to follow"
+        );
+        assert_eq!(
+            admission(rel_path("top.txt"), false, |_| Some(Ancestor::Plain)),
+            Admission::Read
+        );
+    }
+
+    #[gpui::test]
+    async fn a_path_in_a_folder_the_worktree_has_not_reached_waits_and_loads_when_it_has(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "kept.txt": "after\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("kept.txt", "before\n".to_string())],
+        );
+        let (diff, cx) = open_diff(cx, &fs).await;
+        assert_eq!(shown(&diff, cx).0, ["kept.txt"]);
+
+        // The folder appears on disk and in status, but the worktree is not told.
+        fs.pause_events();
+        fs.insert_tree(path!("/project/fresh"), json!({ "new.txt": "brand new\n" }))
+            .await;
+        let (git_store, worktree_id) = diff.read_with(cx, |diff, cx| {
+            let project = diff.project.read(cx);
+            (
+                project.git_store().clone(),
+                project.worktrees(cx).next().unwrap().read(cx).id(),
+            )
+        });
+        git_store.update(cx, |git_store, cx| {
+            git_store.refresh_status_for_project_paths(
+                [ProjectPath {
+                    worktree_id,
+                    path: rel_path("fresh/new.txt").into(),
+                }],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let listed = diff.read_with(cx, |diff, cx| {
+            diff.branch_diff
+                .read(cx)
+                .repo()
+                .unwrap()
+                .read(cx)
+                .cached_status()
+                .count()
+        });
+        assert_eq!(listed, 2, "status lists the new file");
+        assert_eq!(
+            shown(&diff, cx).0,
+            ["kept.txt"],
+            "its folder is not known to the worktree yet, so it is not loaded"
+        );
+
+        fs.unpause_events_and_flush();
+        cx.run_until_parked();
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["kept.txt", "fresh/new.txt"]);
+        assert!(text.contains("brand new"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn a_file_that_only_the_tree_diff_lists_is_admitted_like_any_other(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        // `.svn` is not scanned (`file_scan_exclusions`): the worktree has no
+        // entry for the folder, though the file is on disk and tracked, so status
+        // is clean and only the tree diff lists it.
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "d.txt": "created-in-head",
+                ".svn": { "in-head.txt": "created-in-head" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                ProjectDiff::new_with_default_branch(project.clone(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("d.txt", "created-in-head".into()),
+                (".svn/in-head.txt", "created-in-head".into()),
+            ],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(Path::new(path!("/project/.git")), &[]);
+        cx.run_until_parked();
+
+        let (paths, _) = shown(&diff, cx);
+
+        assert_eq!(
+            paths,
+            ["d.txt"],
+            "the tree-only loop loads what it may and passes the same admission as status"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_folder_link_stays_whatever_the_notes_come_to_hold(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = fs_with_a_link(cx).await;
+        let (diff, cx) = open_diff(cx, &fs).await;
+        link_paths(&diff, cx, &[("link", "A link to a folder")]);
+        let before = shown(&diff, cx).0;
+
+        // A pass whose budget ran out before it reached the link holds other
+        // notes, or none.
+        note_paths(&diff, cx, &[("kept.txt", sentence("Binary file changed"))]);
+        assert_eq!(shown(&diff, cx).0, before);
+        note_paths(&diff, cx, &[]);
+        assert_eq!(shown(&diff, cx).0, before);
+        assert!(!shown(&diff, cx).1.contains("reached through the link"));
+    }
+
+    #[gpui::test]
+    async fn a_folder_link_with_its_own_status_entry_is_listed_once(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "kept.txt": "kept\n", "link": "stands in for the link\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("kept.txt", "before\n".to_string())],
+        );
+        let (diff, cx) = open_diff(cx, &fs).await;
+
+        link_paths(&diff, cx, &[("link", "A link to a folder")]);
+
+        let (paths, text) = shown(&diff, cx);
+        assert_eq!(paths, ["kept.txt", "link"]);
+        assert!(!text.contains("stands in for the link"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn an_edited_rename_says_where_it_came_from_beside_its_hunks(cx: &mut TestAppContext) {
+        init_test(cx);
+        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "new.txt": old.replace("three", "THREE") }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("old.txt", old.to_string())],
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("old.txt", old.to_string())],
+        );
+        let base = git::Oid::from_bytes("1".repeat(20).as_bytes()).unwrap();
+        let (diff, cx) = open_diff(cx, &fs).await;
+        note_paths(
+            &diff,
+            cx,
+            &[(
+                "new.txt",
+                RowNote::Renamed {
+                    from: RepoPath::new("old.txt").unwrap(),
+                    base,
+                    text: "Renamed from old.txt".into(),
+                },
+            )],
+        );
+
+        assert_eq!(
+            diff.read_with(cx, |diff, cx| diff.calculate_changed_lines(cx)),
+            (1, 1),
+            "the hunks"
+        );
+        let said = diff.update_in(cx, |diff, window, cx| {
+            let editor = diff.editor().read(cx).rhs_editor().clone();
+            let multibuffer = editor.read(cx).buffer().clone();
+            let snapshot = multibuffer.read(cx).snapshot(cx);
+            let excerpt = snapshot.excerpts().next().expect("one entry");
+            let buffer = snapshot
+                .buffer_for_id(excerpt.context.start.buffer_id)
+                .expect("its buffer")
+                .clone();
+            let info = multi_buffer::ExcerptBoundaryInfo {
+                start_anchor: multi_buffer::Anchor::Min,
+                range: excerpt,
+                end_row: multi_buffer::MultiBufferRow(0),
+            };
+            let addon = editor
+                .read(cx)
+                .addon::<RowNoteAddon>()
+                .expect("the embedded diff registers it");
+            (
+                addon
+                    .branch_diff
+                    .read(cx)
+                    .note_text_for_buffer_id(info.buffer_id(), cx),
+                addon
+                    .render_buffer_header_controls(&info, &buffer, window, cx)
+                    .is_some(),
+            )
+        });
+        assert_eq!(
+            said.0.as_deref(),
+            Some("Renamed from old.txt"),
+            "the notice"
+        );
+        assert!(said.1, "the header draws it");
     }
 }

@@ -1051,7 +1051,7 @@ mod tests {
         );
         let reduced = BinaryBlob {
             size: 775 * 1024 + 205,
-            image: shown.image.clone(),
+            image: shown.image,
             dimensions: Some((16_000, 16_000)),
             reason: Some(NoPreviewReason::TooManyPixels {
                 width: 16_000,
