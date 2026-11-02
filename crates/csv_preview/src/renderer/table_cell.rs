@@ -1,7 +1,5 @@
 //! Table Cell Rendering
 
-use std::sync::Arc;
-
 use gpui::{AnyElement, ElementId};
 use ui::{SharedString, Tooltip, div, prelude::*};
 
@@ -16,7 +14,7 @@ impl CsvPreviewView {
     pub fn create_selectable_cell(
         display_cell_id: DisplayCellId,
         cell_content: SharedString,
-        drawn_lines: Arc<[SharedString]>,
+        drawn_lines: &[SharedString],
         vertical_alignment: VerticalAlignment,
         cx: &Context<CsvPreviewView>,
     ) -> AnyElement {
@@ -36,7 +34,7 @@ impl CsvPreviewView {
 fn create_table_cell(
     display_cell_id: DisplayCellId,
     cell_content: SharedString,
-    drawn_lines: Arc<[SharedString]>,
+    drawn_lines: &[SharedString],
     vertical_alignment: VerticalAlignment,
     cx: &Context<'_, CsvPreviewView>,
 ) -> gpui::Stateful<Div> {
@@ -65,5 +63,5 @@ fn create_table_cell(
         })
         .font_buffer(cx)
         .tooltip(Tooltip::text(cell_content))
-        .child(cell_lines(&drawn_lines))
+        .child(cell_lines(drawn_lines))
 }

@@ -525,9 +525,12 @@ impl RemoteImageStore {
     pub fn wait_for_remote_image(
         &mut self,
         id: ImageId,
+        opened: Option<Entity<ImageItem>>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<ImageItem>>> {
-        if let Some(image) = self.loaded_images.remove(&id) {
+        // `opened` is the store's live item for `id`: an earlier open of the same path may have
+        // claimed the handoff already, and this wait must still resolve.
+        if let Some(image) = self.loaded_images.remove(&id).or(opened) {
             return Task::ready(Ok(image));
         }
 
@@ -719,7 +722,7 @@ impl ImageStoreImpl for Entity<RemoteImageStore> {
         };
         let remote_store = self.clone();
 
-        cx.spawn(async move |_image_store, cx| {
+        cx.spawn(async move |image_store, cx| {
             let response = client
                 .request(rpc::proto::OpenImageByPath {
                     project_id,
@@ -732,9 +735,10 @@ impl ImageStoreImpl for Entity<RemoteImageStore> {
                 NonZeroU64::new(response.image_id).context("invalid image_id in response")?,
             );
 
+            let opened = image_store.read_with(cx, |store, _| store.get(image_id))?;
             remote_store
                 .update(cx, |remote_store, cx| {
-                    remote_store.wait_for_remote_image(image_id, cx)
+                    remote_store.wait_for_remote_image(image_id, opened, cx)
                 })
                 .await
         })
@@ -975,6 +979,7 @@ mod tests {
 
     async fn remote_store(
         cx: &mut TestAppContext,
+        client: AnyProtoClient,
     ) -> (Entity<ImageStore>, Entity<RemoteImageStore>, ImageId) {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
@@ -1005,16 +1010,49 @@ mod tests {
             )
         });
         worktree_store.update(cx, |store, cx| store.add(&remote_worktree, cx));
-        let store = cx.new(|cx| {
-            ImageStore::remote(
-                worktree_store,
-                AnyProtoClient::new(NoopProtoClient::new()),
-                0,
-                cx,
-            )
-        });
+        let store = cx.new(|cx| ImageStore::remote(worktree_store, client, 0, cx));
         let remote = store.read_with(cx, |store, _| store.state.as_remote().unwrap());
         (store, remote, ImageId::from(NonZeroU64::new(5).unwrap()))
+    }
+
+    /// Answers every request once `respond` is sent, so a test can deliver the image first.
+    struct GatedClient {
+        noop: Arc<NoopProtoClient>,
+        respond: parking_lot::Mutex<Vec<oneshot::Receiver<()>>>,
+    }
+
+    impl rpc::ProtoClient for GatedClient {
+        fn request(
+            &self,
+            _: proto::Envelope,
+            _: &'static str,
+        ) -> futures::future::BoxFuture<'static, Result<proto::Envelope>> {
+            let gate = self.respond.lock().pop().unwrap();
+            Box::pin(async move {
+                gate.await?;
+                Ok(rpc::proto::EnvelopedMessage::into_envelope(
+                    proto::OpenImageResponse { image_id: 5 },
+                    0,
+                    None,
+                    None,
+                ))
+            })
+        }
+        fn send(&self, _: proto::Envelope, _: &'static str) -> Result<()> {
+            Ok(())
+        }
+        fn send_response(&self, _: proto::Envelope, _: &'static str) -> Result<()> {
+            Ok(())
+        }
+        fn message_handler_set(&self) -> &parking_lot::Mutex<rpc::ProtoMessageHandlerSet> {
+            self.noop.message_handler_set()
+        }
+        fn is_via_collab(&self) -> bool {
+            false
+        }
+        fn has_wsl_interop(&self) -> bool {
+            false
+        }
     }
 
     fn deliver_image(store: &Entity<ImageStore>, cx: &mut TestAppContext) {
@@ -1062,7 +1100,8 @@ mod tests {
     async fn an_image_opened_by_path_after_delivery_is_not_kept_by_the_store(
         cx: &mut TestAppContext,
     ) {
-        let (store, _remote, _image_id) = remote_store(cx).await;
+        let (store, _remote, _image_id) =
+            remote_store(cx, AnyProtoClient::new(NoopProtoClient::new())).await;
         deliver_image(&store, cx);
         let path = ProjectPath {
             worktree_id: WorktreeId::from_proto(77),
@@ -1082,12 +1121,48 @@ mod tests {
         );
     }
 
+    /// A second open of a path, made after the image arrived but before the first open's response,
+    /// must not strand the first.
+    #[gpui::test]
+    async fn two_opens_of_one_path_across_delivery_and_response_both_resolve(
+        cx: &mut TestAppContext,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let client = AnyProtoClient::new(Arc::new(GatedClient {
+            noop: NoopProtoClient::new(),
+            respond: parking_lot::Mutex::new(vec![rx]),
+        }));
+        let (store, _remote, _image_id) = remote_store(cx, client).await;
+        let path = ProjectPath {
+            worktree_id: WorktreeId::from_proto(77),
+            path: RelPath::unix("a.png").unwrap().into(),
+        };
+        let first = store.update(cx, |store, cx| store.open_image(path.clone(), cx));
+        cx.run_until_parked();
+        deliver_image(&store, cx);
+        let second = store
+            .update(cx, |store, cx| store.open_image(path, cx))
+            .await
+            .unwrap();
+        tx.send(()).unwrap();
+        let first = first.await.unwrap();
+        assert_eq!(first, second);
+
+        let weak = first.downgrade();
+        drop((first, second));
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "the store kept the item");
+    }
+
     /// An item handed to a waiter is held by the waiter and its views alone: the store keeps no
     /// second strong reference, so closing the last view releases it.
     #[gpui::test]
     async fn an_image_delivered_to_a_waiter_is_not_kept_by_the_store(cx: &mut TestAppContext) {
-        let (store, remote, image_id) = remote_store(cx).await;
-        let waiting = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        let (store, remote, image_id) =
+            remote_store(cx, AnyProtoClient::new(NoopProtoClient::new())).await;
+        let waiting = remote.update(cx, |remote, cx| {
+            remote.wait_for_remote_image(image_id, None, cx)
+        });
         deliver_image(&store, cx);
         let item = waiting.await.unwrap();
 
@@ -1104,13 +1179,18 @@ mod tests {
     /// for the next one that asks.
     #[gpui::test]
     async fn an_image_no_waiter_received_is_kept_for_the_next_one(cx: &mut TestAppContext) {
-        let (store, remote, image_id) = remote_store(cx).await;
-        let abandoned = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        let (store, remote, image_id) =
+            remote_store(cx, AnyProtoClient::new(NoopProtoClient::new())).await;
+        let abandoned = remote.update(cx, |remote, cx| {
+            remote.wait_for_remote_image(image_id, None, cx)
+        });
         drop(abandoned);
         cx.run_until_parked();
         deliver_image(&store, cx);
 
-        let later = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        let later = remote.update(cx, |remote, cx| {
+            remote.wait_for_remote_image(image_id, None, cx)
+        });
         later.await.unwrap();
     }
 }

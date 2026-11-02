@@ -11,6 +11,14 @@ pub struct CellContentSpan {
     pub end: Anchor,
 }
 
+/// What drawing a cell with a line break needs, worked out once while parsing so drawing copies
+/// nothing.
+#[derive(Clone, Debug)]
+pub struct MultilineCell {
+    lines: Arc<[SharedString]>,
+    flattened: SharedString,
+}
+
 /// A table cell with its content and position in the source buffer
 #[derive(Clone, Debug)]
 pub enum TableCell {
@@ -20,12 +28,9 @@ pub enum TableCell {
         position: CellContentSpan,
         /// Cached display value (for performance)
         cached_value: SharedString,
-        /// `cached_value` split into its lines, worked out once while parsing so drawing a
-        /// variable row copies nothing.
-        lines: Arc<[SharedString]>,
-        /// `cached_value` on one line, as the single element of a shared slice, worked out once
-        /// while parsing so drawing a uniform row copies nothing.
-        single_line: Arc<[SharedString]>,
+        /// Prepared only for a cell with a line break, so a single-line cell holds nothing but
+        /// its content.
+        multiline: Option<MultilineCell>,
     },
     /// Virtual cell, created to pad malformed row
     Virtual,
@@ -47,27 +52,55 @@ impl TableCell {
                 start: start_anchor,
                 end: end_anchor,
             },
-            lines: split_lines(&content),
-            single_line: Arc::from([single_line_text(&content)]),
+            multiline: content.contains(['\n', '\r']).then(|| MultilineCell {
+                lines: split_lines(&content),
+                flattened: single_line_text(&content),
+            }),
             cached_value: content,
         }
     }
 
-    /// The cell's text on one line, as drawn, as a shared slice of one element. `display_value`
-    /// is the full text.
-    pub fn single_line(&self) -> Option<&Arc<[SharedString]>> {
+    /// The cell's text on one line, as drawn, as a slice of one element. `display_value` is the
+    /// full text.
+    pub fn single_line(&self) -> Option<&[SharedString]> {
         match self {
-            TableCell::Real { single_line, .. } => Some(single_line),
+            TableCell::Real {
+                cached_value,
+                multiline,
+                ..
+            } => Some(match multiline {
+                Some(multiline) => std::slice::from_ref(&multiline.flattened),
+                None => std::slice::from_ref(cached_value),
+            }),
             TableCell::Virtual => None,
         }
     }
 
     /// Every line of the cell's text.
-    pub fn lines(&self) -> Option<&Arc<[SharedString]>> {
+    pub fn lines(&self) -> Option<&[SharedString]> {
         match self {
-            TableCell::Real { lines, .. } => Some(lines),
+            TableCell::Real {
+                cached_value,
+                multiline,
+                ..
+            } => Some(match multiline {
+                Some(multiline) => &multiline.lines,
+                None => std::slice::from_ref(cached_value),
+            }),
             TableCell::Virtual => None,
         }
+    }
+
+    /// Whether drawing this cell needed prepared data beyond its content.
+    #[cfg(test)]
+    pub(crate) fn has_prepared_lines(&self) -> bool {
+        matches!(
+            self,
+            TableCell::Real {
+                multiline: Some(_),
+                ..
+            }
+        )
     }
 
     /// Get the display value for this cell
@@ -80,9 +113,6 @@ impl TableCell {
 }
 
 fn split_lines(content: &SharedString) -> Arc<[SharedString]> {
-    if !content.contains('\n') {
-        return Arc::from([content.clone()]);
-    }
     content
         .split('\n')
         .map(|line| SharedString::from(line.to_owned()))
@@ -122,7 +152,6 @@ mod tests {
             lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
             ["a", "bb", ""]
         );
-        assert_eq!(split_lines(&"plain".into())[..], ["plain"]);
     }
 
     #[test]

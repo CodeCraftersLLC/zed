@@ -452,6 +452,16 @@ Jane,"Simple name""#;
     }
 
     #[test]
+    fn a_single_line_cell_holds_no_prepared_lines_and_a_multiline_cell_does() {
+        let parsed = TableLikeContent::from_str("h\n\"a\nb\",c\n".to_string());
+        assert!(!parsed.rows[0][1].has_prepared_lines());
+        assert_eq!(parsed.rows[0][1].lines().unwrap(), ["c"]);
+        assert_eq!(parsed.rows[0][1].single_line().unwrap(), ["c"]);
+        assert!(parsed.rows[0][0].has_prepared_lines());
+        assert_eq!(parsed.rows[0][0].lines().unwrap(), ["a", "b"]);
+    }
+
+    #[test]
     fn a_multiline_cell_carries_its_one_line_text_from_parsing() {
         let parsed = TableLikeContent::from_str("h\n\"a\nb\"\n".to_string());
         let cell = &parsed.rows[0][0];

@@ -1,5 +1,4 @@
 use gpui::{ParentElement as _, Styled as _};
-use std::sync::Arc;
 
 #[derive(Default, Clone, Copy, PartialEq)]
 pub enum RowRenderMechanism {
@@ -14,14 +13,14 @@ pub enum RowRenderMechanism {
 impl RowRenderMechanism {
     /// A uniform row has one fixed height, so a multi-line cell is drawn flattened; a variable
     /// row grows to fit, so it draws every line. Both are shared, never copied.
-    pub(crate) fn drawn_lines(
+    pub(crate) fn drawn_lines<'a>(
         self,
-        lines: &Arc<[ui::SharedString]>,
-        single_line: &Arc<[ui::SharedString]>,
-    ) -> Arc<[ui::SharedString]> {
+        lines: &'a [ui::SharedString],
+        single_line: &'a [ui::SharedString],
+    ) -> &'a [ui::SharedString] {
         match self {
-            Self::VariableList => lines.clone(),
-            Self::UniformList => single_line.clone(),
+            Self::VariableList => lines,
+            Self::UniformList => single_line,
         }
     }
 }
@@ -70,6 +69,7 @@ pub(crate) struct CsvPreviewSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// Draws `text` in a 60px-wide cell and returns the text GPUI laid out.
     fn drawn_in_narrow_cell(text: &'static str) -> Vec<ui::SharedString> {
@@ -116,13 +116,13 @@ mod tests {
     fn a_row_draws_the_cells_shared_lines_without_copying_them() {
         let lines: Arc<[ui::SharedString]> = Arc::from(["a".into(), "b".into()]);
         let single_line: Arc<[ui::SharedString]> = Arc::from(["a↵b".into()]);
-        assert!(Arc::ptr_eq(
-            &RowRenderMechanism::VariableList.drawn_lines(&lines, &single_line),
-            &lines
+        assert!(std::ptr::eq(
+            RowRenderMechanism::VariableList.drawn_lines(&lines, &single_line),
+            &*lines
         ));
-        assert!(Arc::ptr_eq(
-            &RowRenderMechanism::UniformList.drawn_lines(&lines, &single_line),
-            &single_line
+        assert!(std::ptr::eq(
+            RowRenderMechanism::UniformList.drawn_lines(&lines, &single_line),
+            &*single_line
         ));
     }
 }

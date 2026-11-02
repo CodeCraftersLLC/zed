@@ -1,6 +1,6 @@
 use crate::types::TableCell;
 use gpui::{AnyElement, Entity};
-use std::{ops::Range, sync::Arc};
+use std::ops::Range;
 use ui::{ColumnWidthConfig, ResizableColumnsState, Table, UncheckedTableRow, div, prelude::*};
 
 use crate::{
@@ -130,7 +130,7 @@ impl CsvPreviewView {
                 (Some(lines), Some(single_line)) => {
                     this.settings.rendering_with.drawn_lines(lines, single_line)
                 }
-                _ => Arc::default(),
+                _ => &[],
             };
 
             let display_cell_id = DisplayCellId::new(display_row, col);
