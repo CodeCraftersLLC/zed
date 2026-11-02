@@ -113,8 +113,10 @@ impl TableCell {
 }
 
 fn split_lines(content: &SharedString) -> Arc<[SharedString]> {
+    // `\r\n` is one break, as in `single_line_text`.
     content
-        .split('\n')
+        .split("\r\n")
+        .flat_map(|line| line.split(['\r', '\n']))
         .map(|line| SharedString::from(line.to_owned()))
         .collect()
 }
@@ -143,6 +145,19 @@ fn single_line_text(content: &SharedString) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_kind_of_line_break_splits_a_cell_with_crlf_as_one() {
+        let lines = |value: &str| {
+            split_lines(&value.into())
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines("a\rb"), ["a", "b"]);
+        assert_eq!(lines("a\r\nb"), ["a", "b"]);
+        assert_eq!(lines("a\nb\r\r\nc"), ["a", "b", "", "c"]);
+    }
 
     #[test]
     fn a_cell_splits_into_its_lines_once() {

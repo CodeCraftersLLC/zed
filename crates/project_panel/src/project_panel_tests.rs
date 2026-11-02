@@ -2025,15 +2025,28 @@ async fn entry_labels_use_the_installed_display_name_hook(cx: &mut gpui::TestApp
     let workspace = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
     let panel = workspace.update(cx, ProjectPanel::new).unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<ProjectPanel>(window, cx);
+        })
+        .unwrap();
     cx.run_until_parked();
 
     let hook = util::display_name::install_hook_for_test(std::sync::Arc::new(|name: &str| {
         std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
     }));
-    let label = entry_label(name);
+    assert_eq!(entry_label(name), "READ<U+200B>ME.md");
+    panel.update(cx, |_, cx| cx.notify());
+    let drawn = cx.redraw_text();
+    assert!(
+        drawn
+            .iter()
+            .any(|text| text.as_ref() == "READ<U+200B>ME.md"),
+        "the panel draws the hook's spelling: {drawn:?}"
+    );
     drop(hook);
 
-    assert_eq!(label, "READ<U+200B>ME.md");
     assert_eq!(entry_label(name), name, "no hook, no change");
     assert_eq!(
         visible_entries_as_strings(&panel, 0..2, cx),
