@@ -1616,6 +1616,53 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
     );
 }
 
+/// Requests the scanner takes together can name one unlisted folder many times, as when many
+/// files beneath it are asked for at once: it is listed once.
+#[gpui::test]
+async fn test_a_folder_named_many_times_in_one_scan_request_is_listed_once(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".gitignore": "vendor\n",
+            "vendor": { "a.js": "a", "b.js": "b" },
+        }),
+    )
+    .await;
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    let listings_before = fs.read_dir_call_count();
+
+    tree.read_with(cx, |tree, _| {
+        let vendor: Arc<RelPath> = rel_path("vendor").into();
+        drop(
+            tree.as_local()
+                .unwrap()
+                .refresh_entries_for_paths(vec![vendor; 20]),
+        );
+    });
+    cx.executor().run_until_parked();
+
+    tree.read_with(cx, |tree, _| {
+        assert!(tree.entry_for_path(rel_path("vendor/b.js")).is_some());
+    });
+    assert_eq!(fs.read_dir_call_count() - listings_before, 1);
+}
+
 #[gpui::test]
 async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
     init_test(cx);

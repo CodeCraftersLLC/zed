@@ -4908,11 +4908,18 @@ impl BackgroundScanner {
         {
             let mut state = self.state.lock().await;
             let root_path = state.snapshot.abs_path.clone();
+            // A folder stays unloaded until its job runs below, so requests taken together
+            // that name it many times would otherwise list it once per name.
+            let mut enqueued = HashSet::default();
             for path in paths {
                 for ancestor in path.ancestors() {
                     if let Some(entry) = state.snapshot.entry_for_path(ancestor)
                         && entry.kind == EntryKind::UnloadedDir
                     {
+                        if !enqueued.insert(entry.id) {
+                            state.paths_to_scan.insert(path.clone());
+                            break;
+                        }
                         let abs_path = if entry.is_external {
                             entry
                                 .canonical_path

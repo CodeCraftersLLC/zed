@@ -1017,9 +1017,9 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
-    /// The views waiting on a pending asset, by asset: a view redrawn while the asset loads
-    /// waits once, not once per frame.
-    asset_waiters: FxHashSet<(TypeId, u64, EntityId)>,
+    /// The views waiting on a pending asset load, by load: a view redrawn while the asset loads
+    /// waits once, not once per frame, and a load that replaces a removed one is waited on anew.
+    asset_waiters: FxHashSet<(u64, EntityId)>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -3353,16 +3353,21 @@ impl Window {
         task.clone().now_or_never().or_else(|| {
             // Every view waits, not only the one that started the load: a view that joins a
             // load already under way, such as a split of the same image, needs the redraw too.
-            let waiter = (TypeId::of::<A>(), crate::hash(source), self.current_view());
+            let mut load = std::hash::DefaultHasher::new();
+            task.ptr_hash(&mut load);
+            let waiter = (load.finish(), self.current_view());
             if self.asset_waiters.insert(waiter) {
                 self.spawn(cx, {
                     let task = task.clone();
                     async move |cx| {
-                        task.await;
+                        task.clone().await;
 
                         cx.on_next_frame(move |window, cx| {
+                            // Held to here: a new load cannot take this one's address while
+                            // the address is still a key.
+                            drop(task);
                             window.asset_waiters.remove(&waiter);
-                            cx.notify(waiter.2);
+                            cx.notify(waiter.1);
                         });
                     }
                 })
@@ -6414,6 +6419,29 @@ mod use_asset_tests {
         }
     }
 
+    static RELEASE_RELOADED: Mutex<Vec<oneshot::Receiver<u32>>> = Mutex::new(Vec::new());
+
+    struct ReloadedAsset;
+
+    impl Asset for ReloadedAsset {
+        type Source = u8;
+        type Output = u32;
+
+        fn load(_: u8, _: &mut App) -> impl Future<Output = u32> + Send + 'static {
+            let receiver = RELEASE_RELOADED.lock().unwrap().remove(0);
+            async move { receiver.await.unwrap_or(0) }
+        }
+    }
+
+    struct Reloaded;
+
+    impl Render for Reloaded {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            window.use_asset::<ReloadedAsset>(&0, cx);
+            div()
+        }
+    }
+
     struct Waiter;
 
     impl Render for Waiter {
@@ -6497,5 +6525,28 @@ mod use_asset_tests {
             waiting, 1,
             "one redraw is owed, however often the view was drawn"
         );
+    }
+
+    /// An asset removed while it loads (to be read again) starts a new load when the view next
+    /// asks; the view is redrawn when that load finishes, even if the old one never does first.
+    #[crate::test]
+    fn a_view_is_redrawn_by_the_load_that_replaced_a_removed_one(cx: &mut TestAppContext) {
+        let (first, first_receiver) = oneshot::channel();
+        let (second, second_receiver) = oneshot::channel();
+        *RELEASE_RELOADED.lock().unwrap() = vec![first_receiver, second_receiver];
+
+        let (view, cx) = cx.add_window_view(|_, _| Reloaded);
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            cx.remove_asset::<ReloadedAsset>(&0);
+            view.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+
+        second.send(2).unwrap();
+        cx.run_until_parked();
+        let waiting = cx.update(|window, _| window.next_frame_callbacks.borrow().len());
+        assert_eq!(waiting, 1, "the new load redraws the view");
+        drop(first);
     }
 }
