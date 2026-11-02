@@ -6,7 +6,8 @@ use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet, hash_map};
 use futures::{StreamExt, channel::oneshot};
 use gpui::{
-    App, AsyncApp, Context, Entity, EventEmitter, Img, Subscription, Task, WeakEntity, prelude::*,
+    App, AsyncApp, Context, Entity, EventEmitter, Global, Img, Subscription, Task, WeakEntity,
+    prelude::*,
 };
 use image::ExtendedColorType;
 pub use image::ImageFormat;
@@ -99,6 +100,13 @@ impl ImageColorInfo {
     }
 }
 
+/// How many live items hold an image of each id. An image's id comes from its bytes, so items
+/// with the same bytes share one decoded picture, and it may be dropped only when none holds it.
+#[derive(Default)]
+struct ImageHolders(HashMap<u64, usize>);
+
+impl Global for ImageHolders {}
+
 pub struct ImageItem {
     pub id: ImageId,
     pub file: Arc<worktree::File>,
@@ -108,6 +116,56 @@ pub struct ImageItem {
 }
 
 impl ImageItem {
+    fn new(
+        id: ImageId,
+        file: Arc<worktree::File>,
+        image: Arc<gpui::Image>,
+        image_metadata: Option<ImageMetadata>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::hold(&image, cx);
+        cx.on_release(|this, cx| Self::let_go(this.image.clone(), cx))
+            .detach();
+        Self {
+            id,
+            file,
+            image,
+            reload_task: None,
+            image_metadata,
+        }
+    }
+
+    fn hold(image: &gpui::Image, cx: &mut App) {
+        *cx.default_global::<ImageHolders>()
+            .0
+            .entry(image.id)
+            .or_default() += 1;
+    }
+
+    /// Gives up a hold. The picture is dropped once nothing holds an image with its id; that
+    /// waits for the end of the current effect cycle because a window being updated cannot be
+    /// reached from here, and by then a new holder may have taken the id.
+    fn let_go(image: Arc<gpui::Image>, cx: &mut App) {
+        let holders = &mut cx.default_global::<ImageHolders>().0;
+        let Some(count) = holders.get_mut(&image.id) else {
+            return;
+        };
+        *count -= 1;
+        if *count > 0 {
+            return;
+        }
+        holders.remove(&image.id);
+        cx.defer(move |cx| {
+            if !cx
+                .default_global::<ImageHolders>()
+                .0
+                .contains_key(&image.id)
+            {
+                image.release(None, cx);
+            }
+        });
+    }
+
     pub fn compute_metadata_from_bytes(image_bytes: &[u8]) -> Result<ImageMetadata> {
         let image_format = image::guess_format(image_bytes)?;
         // Only the header is read: no pixels are decoded, so a picture the decoder cannot draw
@@ -192,7 +250,9 @@ impl ImageItem {
                 .log_err()
             {
                 this.update(cx, |this, cx| {
-                    this.image = image;
+                    Self::hold(&image, cx);
+                    let displaced = std::mem::replace(&mut this.image, image);
+                    Self::let_go(displaced, cx);
                     this.image_metadata = image_metadata;
                     cx.emit(ImageItemEvent::Reloaded);
                 })
@@ -578,13 +638,8 @@ impl RemoteImageStore {
                             .context("invalid file in image state")?,
                     );
 
-                    let entity = cx.new(|_cx| ImageItem {
-                        id: image_id,
-                        file,
-                        image,
-                        image_metadata,
-                        reload_task: None,
-                    });
+                    let entity =
+                        cx.new(|cx| ImageItem::new(image_id, file, image, image_metadata, cx));
 
                     if let Some(listeners) = self.remote_image_listeners.remove(&image_id) {
                         for listener in listeners {
@@ -623,12 +678,14 @@ impl ImageStoreImpl for Entity<LocalImageStore> {
             let LoadedBinaryFile { file, content } = load_file.await?;
             let image = create_gpui_image(content)?;
 
-            let entity = cx.new(|cx| ImageItem {
-                id: cx.entity_id().as_non_zero_u64().into(),
-                file: file.clone(),
-                image,
-                image_metadata: None,
-                reload_task: None,
+            let entity = cx.new(|cx| {
+                ImageItem::new(
+                    cx.entity_id().as_non_zero_u64().into(),
+                    file.clone(),
+                    image,
+                    None,
+                    cx,
+                )
             });
 
             let image_id = cx.read_entity(&entity, |model, _| model.id);

@@ -2,7 +2,6 @@ mod image_info;
 mod image_viewer_settings;
 
 use std::{
-    collections::HashMap,
     mem,
     path::Path,
     sync::{Arc, atomic::AtomicBool},
@@ -12,11 +11,11 @@ use anyhow::Context as _;
 use editor::{EditorSettings, RevealInFileManager, items::entry_git_aware_label_color};
 use file_icons::FileIcons;
 use gpui::{
-    AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Font, Global, GlobalElementId, InspectorElementId,
-    InteractiveElement, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    Style, Styled, Task, WeakEntity, Window, actions, checkerboard, div, img, point, px, size,
+    AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, Font, GlobalElementId, InspectorElementId, InteractiveElement,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Style, Styled,
+    Task, WeakEntity, Window, actions, checkerboard, div, img, point, px, size,
 };
 use language::File as _;
 use persistence::ImageViewerDb;
@@ -124,13 +123,6 @@ enum Reduction {
     Failed(SharedString),
 }
 
-/// How many views show each image item. A split shares its item's picture with the view it came
-/// from, so only the last one to close may drop it.
-#[derive(Default)]
-struct ViewsPerItem(HashMap<EntityId, usize>);
-
-impl Global for ViewsPerItem {}
-
 pub struct ImageView {
     reduction: Reduction,
     image_item: Entity<ImageItem>,
@@ -182,21 +174,8 @@ impl ImageView {
     ) -> Self {
         cx.subscribe_in(&image_item, window, Self::on_image_event)
             .detach();
-        *cx.default_global::<ViewsPerItem>()
-            .0
-            .entry(image_item.entity_id())
-            .or_default() += 1;
-        cx.on_release_in(window, |this, window, cx| {
-            let views = &mut cx.default_global::<ViewsPerItem>().0;
-            let remaining = views.entry(this.image_item.entity_id()).or_default();
-            *remaining = remaining.saturating_sub(1);
-            if *remaining == 0 {
-                views.remove(&this.image_item.entity_id());
-                Self::release_image(this.image_item.read(cx).image.clone(), window, cx);
-            }
-            this.release_reduction(window, cx);
-        })
-        .detach();
+        cx.on_release(|this, cx| this.release_reduction(cx))
+            .detach();
 
         let mut view = Self {
             image_item,
@@ -209,23 +188,21 @@ impl ImageView {
             image_size,
             reduction: Reduction::NotNeeded,
         };
-        view.start_reduction(window, cx);
+        view.start_reduction(cx);
         view
     }
 
-    /// Drops the decoded picture and its asset, which GPUI otherwise keeps for the life of the app.
-    fn release_image(image: Arc<gpui::Image>, window: &mut Window, cx: &mut App) {
-        image.release(window, cx);
-    }
-
-    fn release_reduction(&mut self, window: &mut Window, cx: &mut App) {
+    /// Drops this view's own reduced picture. The full picture belongs to the `ImageItem`, which
+    /// releases it when the last holder of that image goes.
+    fn release_reduction(&mut self, cx: &mut App) {
         if let Reduction::Ready(image) = mem::replace(&mut self.reduction, Reduction::NotNeeded) {
-            Self::release_image(image, window, cx);
+            // Deferred so that no window is leased, and `None` reaches every window.
+            cx.defer(move |cx| image.release(None, cx));
         }
     }
 
-    fn start_reduction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.release_reduction(window, cx);
+    fn start_reduction(&mut self, cx: &mut Context<Self>) {
+        self.release_reduction(cx);
         let item = self.image_item.read(cx);
         let reduced = item
             .image_metadata
@@ -277,7 +254,7 @@ impl ImageView {
         &mut self,
         _: &Entity<ImageItem>,
         event: &ImageItemEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
@@ -289,7 +266,7 @@ impl ImageView {
                     .read(cx)
                     .image_metadata
                     .map(|m| (m.width, m.height));
-                self.start_reduction(window, cx);
+                self.start_reduction(cx);
                 cx.emit(ImageViewEvent::TitleChanged);
                 cx.notify();
             }
@@ -1420,11 +1397,141 @@ mod tests {
         });
 
         drop(view);
+        drop(image_item);
         window.update(|_, _| {});
         window.update(|_, cx| {
             assert!(
                 image.clone().decoded(cx).is_none(),
                 "the last view left the picture behind"
+            )
+        });
+    }
+
+    fn view_in(
+        window: &mut gpui::VisualTestContext,
+        item: &Entity<ImageItem>,
+        project: &Entity<Project>,
+    ) -> Entity<ImageView> {
+        window.update(|window, cx| {
+            cx.new(|cx| ImageView::new(item.clone(), project.clone(), window, cx))
+        })
+    }
+
+    fn decode(window: &mut gpui::VisualTestContext, image: &Arc<gpui::Image>) {
+        window.update(|window, cx| image.clone().get_render_image(window, cx));
+        window.run_until_parked();
+    }
+
+    fn decoded(
+        window: &mut gpui::VisualTestContext,
+        image: &Arc<gpui::Image>,
+    ) -> Option<Arc<gpui::RenderImage>> {
+        window.update(|_, cx| image.clone().decoded(cx))
+    }
+
+    #[gpui::test]
+    async fn the_picture_is_dropped_when_the_last_view_closes_after_another_window_closed(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, item) = open_image(cx, "two.png", small_png()).await;
+        let mut first_app = cx.clone();
+        let first_window = first_app.add_empty_window();
+        let first = view_in(first_window, &item, &project);
+        let second_window = cx.add_empty_window();
+        let second = view_in(second_window, &item, &project);
+        let image = item.read_with(second_window, |item, _| item.image.clone());
+        decode(second_window, &image);
+
+        first_window.update(|window, _| window.remove_window());
+        drop(first);
+        second_window.update(|_, _| {});
+        assert!(decoded(second_window, &image).is_some());
+
+        drop(second);
+        second_window.update(|_, _| {});
+        drop(item);
+        second_window.update(|_, _| {});
+        assert!(
+            decoded(second_window, &image).is_none(),
+            "the picture outlived every view"
+        );
+    }
+
+    #[gpui::test]
+    async fn closing_a_view_keeps_a_picture_another_item_with_the_same_bytes_shows(
+        cx: &mut TestAppContext,
+    ) {
+        let (project_a, item_a) = open_image(cx, "a.png", small_png()).await;
+        let (project_b, item_b) = open_image(cx, "b.png", small_png()).await;
+        let window = cx.add_empty_window();
+        let view_a = view_in(window, &item_a, &project_a);
+        let view_b = view_in(window, &item_b, &project_b);
+        let image = item_a.read_with(window, |item, _| item.image.clone());
+        decode(window, &image);
+        let before = decoded(window, &image).expect("decoded");
+
+        drop(view_b);
+        drop(item_b);
+        window.update(|_, _| {});
+        let after = decoded(window, &image);
+        assert!(
+            after.is_some_and(|after| Arc::ptr_eq(&after, &before)),
+            "closing one item dropped the picture the other still shows"
+        );
+        drop(view_a);
+    }
+
+    #[gpui::test]
+    async fn a_reload_with_other_bytes_releases_the_picture_it_displaced(cx: &mut TestAppContext) {
+        let (project, item) = open_image(cx, "swap2.png", small_png()).await;
+        let window = cx.add_empty_window();
+        let _view = view_in(window, &item, &project);
+        let displaced = item.read_with(window, |item, _| item.image.clone());
+        decode(window, &displaced);
+        assert!(decoded(window, &displaced).is_some());
+
+        let fs = project.read_with(window, |project, _| project.fs().clone());
+        fs.as_fake()
+            .insert_file(util::path!("/root/swap2.png"), wide_png())
+            .await;
+        window.run_until_parked();
+        window.update(|_, _| {});
+
+        let current = item.read_with(window, |item, _| item.image.clone());
+        assert!(
+            !Arc::ptr_eq(&current, &displaced),
+            "the file was not reloaded"
+        );
+        assert!(
+            decoded(window, &displaced).is_none(),
+            "the displaced picture stayed cached"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_reduction_is_released_when_its_window_closed_before_its_view(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, item) = open_image(cx, "wide2.png", wide_png()).await;
+        let mut app = cx.clone();
+        let window = app.add_empty_window();
+        let view = view_in(window, &item, &project);
+        window.run_until_parked();
+        let reduction = view.read_with(window, |view, _| match &view.reduction {
+            Reduction::Ready(image) => image.clone(),
+            _ => panic!("the picture was not reduced"),
+        });
+        decode(window, &reduction);
+        assert!(decoded(window, &reduction).is_some());
+
+        window.update(|window, _| window.remove_window());
+        drop(view);
+        cx.update(|_| {});
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                reduction.clone().decoded(cx).is_none(),
+                "the reduction was stranded by its closed window"
             )
         });
     }

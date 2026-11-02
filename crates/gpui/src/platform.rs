@@ -2250,10 +2250,11 @@ impl Image {
     }
 
     /// Drops this image's decoded picture from every window and removes its asset. An image that
-    /// was never drawn has neither, and is not decoded to find that out.
-    pub fn release(self: Arc<Self>, window: &mut Window, cx: &mut App) {
+    /// was never drawn has neither, and is not decoded to find that out. Pass the window you are
+    /// updating, if any: a window that is leased out cannot be reached through `cx`.
+    pub fn release(self: Arc<Self>, window: Option<&mut Window>, cx: &mut App) {
         if let Some(render_image) = self.clone().decoded(cx) {
-            cx.drop_image(render_image, Some(window));
+            cx.drop_image(render_image, window);
         }
         self.remove_asset(cx);
     }

@@ -760,7 +760,7 @@ mod tests {
     fn releasing_an_undrawn_image_starts_no_decode(cx: &mut TestAppContext) {
         let image = Arc::new(Image::from_bytes(ImageFormat::Png, vec![0]));
         let window = cx.add_empty_window();
-        window.update(|window, cx| image.release(window, cx));
+        window.update(|window, cx| image.release(Some(window), cx));
         assert!(
             !cx.executor().tick(),
             "releasing started a decode of the undrawn image"
@@ -787,7 +787,7 @@ mod tests {
         });
         window.run_until_parked();
         window.update(|_, cx| assert!(image.clone().decoded(cx).is_some()));
-        window.update(|window, cx| image.clone().release(window, cx));
+        window.update(|window, cx| image.clone().release(Some(window), cx));
         window.update(|_, cx| assert!(image.clone().decoded(cx).is_none()));
     }
 
