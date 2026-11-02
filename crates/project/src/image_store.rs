@@ -596,17 +596,19 @@ impl RemoteImageStore {
                     let entity =
                         cx.new(|cx| ImageItem::new(image_id, file, image, image_metadata, cx));
 
-                    // Kept only for a waiter that has not asked yet; one that already asked got the
-                    // item, and keeping it as well would hold it after its last view closed.
-                    match self.remote_image_listeners.remove(&image_id) {
-                        Some(listeners) => {
-                            for listener in listeners {
-                                listener.send(Ok(entity.clone())).ok();
-                            }
-                        }
-                        None => {
-                            self.loaded_images.insert(image_id, entity.clone());
-                        }
+                    // Kept unless a waiter received it: one that did holds it, and keeping it as
+                    // well would hold it after its last view closed. A waiter that was dropped
+                    // before delivery took nothing, so the item stays for the next one that asks.
+                    let delivered = self
+                        .remote_image_listeners
+                        .remove(&image_id)
+                        .into_iter()
+                        .flatten()
+                        .fold(false, |delivered, listener| {
+                            listener.send(Ok(entity.clone())).is_ok() || delivered
+                        });
+                    if !delivered {
+                        self.loaded_images.insert(image_id, entity.clone());
                     }
 
                     Ok(Some(entity))
@@ -967,10 +969,9 @@ mod tests {
         }
     }
 
-    /// An item handed to a waiter is held by the waiter and its views alone: the store keeps no
-    /// second strong reference, so closing the last view releases it.
-    #[gpui::test]
-    async fn an_image_delivered_to_a_waiter_is_not_kept_by_the_store(cx: &mut TestAppContext) {
+    async fn remote_store(
+        cx: &mut TestAppContext,
+    ) -> (Entity<ImageStore>, Entity<RemoteImageStore>, ImageId) {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
@@ -1009,9 +1010,10 @@ mod tests {
             )
         });
         let remote = store.read_with(cx, |store, _| store.state.as_remote().unwrap());
-        let image_id = ImageId::from(NonZeroU64::new(5).unwrap());
-        let waiting = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        (store, remote, ImageId::from(NonZeroU64::new(5).unwrap()))
+    }
 
+    fn deliver_image(store: &Entity<ImageStore>, cx: &mut TestAppContext) {
         let bytes = png();
         store
             .update(cx, |store, cx| {
@@ -1048,6 +1050,15 @@ mod tests {
                 )
             })
             .unwrap();
+    }
+
+    /// An item handed to a waiter is held by the waiter and its views alone: the store keeps no
+    /// second strong reference, so closing the last view releases it.
+    #[gpui::test]
+    async fn an_image_delivered_to_a_waiter_is_not_kept_by_the_store(cx: &mut TestAppContext) {
+        let (store, remote, image_id) = remote_store(cx).await;
+        let waiting = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        deliver_image(&store, cx);
         let item = waiting.await.unwrap();
 
         let weak = item.downgrade();
@@ -1057,5 +1068,19 @@ mod tests {
             weak.upgrade().is_none(),
             "the store kept an item it had already delivered"
         );
+    }
+
+    /// A waiter that was dropped before the image arrived took nothing, so the store keeps the item
+    /// for the next one that asks.
+    #[gpui::test]
+    async fn an_image_no_waiter_received_is_kept_for_the_next_one(cx: &mut TestAppContext) {
+        let (store, remote, image_id) = remote_store(cx).await;
+        let abandoned = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        drop(abandoned);
+        cx.run_until_parked();
+        deliver_image(&store, cx);
+
+        let later = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        later.await.unwrap();
     }
 }

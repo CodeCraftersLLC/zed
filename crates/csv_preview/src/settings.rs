@@ -1,4 +1,4 @@
-use gpui::Styled as _;
+use gpui::{ParentElement as _, Styled as _};
 
 #[derive(Default, Clone, Copy, PartialEq)]
 pub enum RowRenderMechanism {
@@ -23,17 +23,22 @@ impl RowRenderMechanism {
             Self::UniformList => single_line.clone(),
         }
     }
+}
 
-    /// The box a cell's text is drawn in. GPUI's ellipsis measures the whole string as one
-    /// line, so it would cut the later lines of a variable row that fit the column; only a
-    /// uniform row, which draws one flattened line, truncates.
-    pub(crate) fn cell_wrapper(self) -> ui::Div {
-        let wrapper = ui::div().size_full().whitespace_nowrap();
-        match self {
-            Self::VariableList => wrapper,
-            Self::UniformList => wrapper.text_ellipsis(),
-        }
-    }
+/// The box a cell's text is drawn in. Each line is its own child because GPUI's ellipsis
+/// measures one text run as a single line: a joined multi-line cell would be cut after its
+/// first line, while one child per line cuts only the lines that are too wide.
+pub(crate) fn cell_wrapper() -> ui::Div {
+    ui::div().size_full().whitespace_nowrap().text_ellipsis()
+}
+
+/// The lines of `drawn`, one child each, for [`cell_wrapper`] to cut on its own.
+pub(crate) fn cell_lines(drawn: &str) -> ui::Div {
+    ui::div().children(
+        drawn
+            .split('\n')
+            .map(|line| ui::div().child(ui::SharedString::from(line.to_owned()))),
+    )
 }
 
 #[derive(Default, Clone, Copy)]
@@ -68,13 +73,9 @@ pub(crate) struct CsvPreviewSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::ParentElement as _;
 
     /// Draws `text` in a 60px-wide cell and returns the text GPUI laid out.
-    fn drawn_in_narrow_cell(
-        mechanism: RowRenderMechanism,
-        text: &'static str,
-    ) -> Vec<ui::SharedString> {
+    fn drawn_in_narrow_cell(text: &'static str) -> Vec<ui::SharedString> {
         let mut cx = gpui::TestAppContext::single();
         let cx = cx.add_empty_window();
         cx.draw(
@@ -83,7 +84,7 @@ mod tests {
             |_, _| {
                 ui::div()
                     .w(gpui::px(60.))
-                    .child(mechanism.cell_wrapper().child(text))
+                    .child(cell_wrapper().child(cell_lines(text)))
             },
         );
         cx.update(|window, _| window.text_system().texts_of_last_frame())
@@ -92,15 +93,24 @@ mod tests {
     /// A variable row's second line fits the column; only the joined text is too wide.
     #[test]
     fn a_variable_row_keeps_every_line_of_a_cell_whose_joined_text_overflows() {
-        let drawn = drawn_in_narrow_cell(RowRenderMechanism::VariableList, "aaaaaa\nbb");
+        let drawn = drawn_in_narrow_cell("aaaaaa\nbb");
         assert!(drawn.iter().any(|t| t.as_ref() == "bb"), "{drawn:?}");
     }
 
     /// A uniform row draws one flattened line, which still ends in an ellipsis when too wide.
     #[test]
     fn a_uniform_row_ellipsizes_a_flattened_cell_that_overflows() {
-        let drawn = drawn_in_narrow_cell(RowRenderMechanism::UniformList, "aaaaaaaaaaaaaaaaaaaa");
+        let drawn = drawn_in_narrow_cell("aaaaaaaaaaaaaaaaaaaa");
         assert!(drawn.iter().any(|t| t.ends_with('…')), "{drawn:?}");
+    }
+
+    /// Each line of a variable row is cut on its own: a long line shows an ellipsis and the lines
+    /// after it are still drawn.
+    #[test]
+    fn a_variable_row_ellipsizes_each_long_line_and_keeps_the_rest() {
+        let drawn = drawn_in_narrow_cell("aaaaaaaaaaaaaaaaaaaa\nbb");
+        assert!(drawn.iter().any(|t| t.ends_with('…')), "{drawn:?}");
+        assert!(drawn.iter().any(|t| t.as_ref() == "bb"), "{drawn:?}");
     }
 
     #[test]

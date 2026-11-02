@@ -79,7 +79,8 @@ fn image_draw(metadata: &ImageMetadata) -> ImageDraw {
     let bytes_per_pixel = metadata.colors.map_or(4, |colors| {
         u64::from(colors.bits_per_pixel()).div_ceil(8).max(4)
     });
-    let decoded = u64::from(metadata.width) * u64::from(metadata.height) * bytes_per_pixel;
+    let decoded =
+        (u64::from(metadata.width) * u64::from(metadata.height)).saturating_mul(bytes_per_pixel);
     let within_limits = metadata.width <= gpui::MAX_RASTER_SIDE
         && metadata.height <= gpui::MAX_RASTER_SIDE
         && decoded <= gpui::MAX_RASTER_BYTES;
@@ -1112,6 +1113,20 @@ mod tests {
             }),
             format,
         }
+    }
+
+    /// Header dimensions whose decoded size does not fit in 64 bits must read as over the limit,
+    /// not wrap past it.
+    #[test]
+    fn a_decoded_size_that_overflows_is_over_the_limit() {
+        assert_eq!(
+            image_draw(&metadata(u32::MAX, u32::MAX, ImageFormat::Jpeg)),
+            ImageDraw::TooLarge
+        );
+        assert_eq!(
+            image_draw(&metadata(u32::MAX, u32::MAX, ImageFormat::Png)),
+            ImageDraw::Reduced
+        );
     }
 
     #[test]
