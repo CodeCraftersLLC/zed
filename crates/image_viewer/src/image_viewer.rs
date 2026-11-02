@@ -196,8 +196,7 @@ impl ImageView {
     /// releases it when the last holder of that image goes.
     fn release_reduction(&mut self, cx: &mut App) {
         if let Reduction::Ready(image) = mem::replace(&mut self.reduction, Reduction::NotNeeded) {
-            // Deferred so that no window is leased, and `None` reaches every window.
-            cx.defer(move |cx| image.release(None, cx));
+            image.let_go(cx);
         }
     }
 
@@ -220,7 +219,9 @@ impl ImageView {
             this.update(cx, |this, cx| {
                 this.reduction = match result {
                     Ok(png) => {
-                        Reduction::Ready(Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)))
+                        let image = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png));
+                        image.hold(cx);
+                        Reduction::Ready(image)
                     }
                     Err(error) => Reduction::Failed(
                         format!("The image is too large to display and could not be reduced: {error}")
@@ -1534,5 +1535,78 @@ mod tests {
                 "the reduction was stranded by its closed window"
             )
         });
+    }
+
+    fn reduction_of(
+        window: &mut gpui::VisualTestContext,
+        view: &Entity<ImageView>,
+    ) -> Arc<gpui::Image> {
+        window.run_until_parked();
+        view.read_with(window, |view, _| match &view.reduction {
+            Reduction::Ready(image) => image.clone(),
+            _ => panic!("the picture was not reduced"),
+        })
+    }
+
+    #[gpui::test]
+    async fn closing_a_view_keeps_the_reduction_another_view_with_the_same_bytes_shows(
+        cx: &mut TestAppContext,
+    ) {
+        let (project_a, item_a) = open_image(cx, "ra.png", wide_png()).await;
+        let (project_b, item_b) = open_image(cx, "rb.png", wide_png()).await;
+        let window = cx.add_empty_window();
+        let view_a = view_in(window, &item_a, &project_a);
+        let view_b = view_in(window, &item_b, &project_b);
+        let reduction = reduction_of(window, &view_a);
+        assert_eq!(reduction.id, reduction_of(window, &view_b).id);
+        decode(window, &reduction);
+        let before = decoded(window, &reduction).expect("decoded");
+
+        drop(view_b);
+        drop(item_b);
+        window.update(|_, _| {});
+        window.update(|_, _| {});
+        let after = decoded(window, &reduction);
+        assert!(
+            after.is_some_and(|after| Arc::ptr_eq(&after, &before)),
+            "closing one view dropped the reduction the other still shows"
+        );
+        drop(view_a);
+    }
+
+    #[gpui::test]
+    async fn a_reduction_and_a_full_picture_with_the_same_bytes_do_not_release_each_other(
+        cx: &mut TestAppContext,
+    ) {
+        let wide = wide_png();
+        let reduced = reduced_png(&wide).expect("reduced");
+        let (project_full, item_full) = open_image(cx, "full.png", reduced).await;
+        let (project_wide, item_wide) = open_image(cx, "wide3.png", wide).await;
+        let window = cx.add_empty_window();
+        let view_full = view_in(window, &item_full, &project_full);
+        let view_wide = view_in(window, &item_wide, &project_wide);
+        let reduction = reduction_of(window, &view_wide);
+        let full = item_full.read_with(window, |item, _| item.image.clone());
+        assert_eq!(reduction.id, full.id);
+        decode(window, &full);
+        let before = decoded(window, &full).expect("decoded");
+
+        drop(view_wide);
+        drop(item_wide);
+        window.update(|_, _| {});
+        window.update(|_, _| {});
+        let after = decoded(window, &full);
+        assert!(
+            after.is_some_and(|after| Arc::ptr_eq(&after, &before)),
+            "releasing the reduction dropped the full picture"
+        );
+
+        let view_wide = view_in(window, &item_full, &project_full);
+        drop(view_full);
+        drop(view_wide);
+        drop(item_full);
+        window.update(|_, _| {});
+        window.update(|_, _| {});
+        assert!(decoded(window, &full).is_none());
     }
 }

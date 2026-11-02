@@ -6,8 +6,7 @@ use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet, hash_map};
 use futures::{StreamExt, channel::oneshot};
 use gpui::{
-    App, AsyncApp, Context, Entity, EventEmitter, Global, Img, Subscription, Task, WeakEntity,
-    prelude::*,
+    App, AsyncApp, Context, Entity, EventEmitter, Img, Subscription, Task, WeakEntity, prelude::*,
 };
 use image::ExtendedColorType;
 pub use image::ImageFormat;
@@ -100,13 +99,6 @@ impl ImageColorInfo {
     }
 }
 
-/// How many live items hold an image of each id. An image's id comes from its bytes, so items
-/// with the same bytes share one decoded picture, and it may be dropped only when none holds it.
-#[derive(Default)]
-struct ImageHolders(HashMap<u64, usize>);
-
-impl Global for ImageHolders {}
-
 pub struct ImageItem {
     pub id: ImageId,
     pub file: Arc<worktree::File>,
@@ -123,8 +115,8 @@ impl ImageItem {
         image_metadata: Option<ImageMetadata>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::hold(&image, cx);
-        cx.on_release(|this, cx| Self::let_go(this.image.clone(), cx))
+        image.hold(cx);
+        cx.on_release(|this, cx| this.image.clone().let_go(cx))
             .detach();
         Self {
             id,
@@ -133,37 +125,6 @@ impl ImageItem {
             reload_task: None,
             image_metadata,
         }
-    }
-
-    fn hold(image: &gpui::Image, cx: &mut App) {
-        *cx.default_global::<ImageHolders>()
-            .0
-            .entry(image.id)
-            .or_default() += 1;
-    }
-
-    /// Gives up a hold. The picture is dropped once nothing holds an image with its id; that
-    /// waits for the end of the current effect cycle because a window being updated cannot be
-    /// reached from here, and by then a new holder may have taken the id.
-    fn let_go(image: Arc<gpui::Image>, cx: &mut App) {
-        let holders = &mut cx.default_global::<ImageHolders>().0;
-        let Some(count) = holders.get_mut(&image.id) else {
-            return;
-        };
-        *count -= 1;
-        if *count > 0 {
-            return;
-        }
-        holders.remove(&image.id);
-        cx.defer(move |cx| {
-            if !cx
-                .default_global::<ImageHolders>()
-                .0
-                .contains_key(&image.id)
-            {
-                image.release(None, cx);
-            }
-        });
     }
 
     pub fn compute_metadata_from_bytes(image_bytes: &[u8]) -> Result<ImageMetadata> {
@@ -250,9 +211,9 @@ impl ImageItem {
                 .log_err()
             {
                 this.update(cx, |this, cx| {
-                    Self::hold(&image, cx);
+                    image.hold(cx);
                     let displaced = std::mem::replace(&mut this.image, image);
-                    Self::let_go(displaced, cx);
+                    displaced.let_go(cx);
                     this.image_metadata = image_metadata;
                     cx.emit(ImageItemEvent::Reloaded);
                 })
@@ -548,12 +509,6 @@ impl ImageStore {
                 remote.handle_create_image_for_peer(envelope, &worktree_store, cx)
             })?;
             if let Some(image) = image {
-                remote.update(cx, |this, cx| {
-                    let image = image.clone();
-                    let image_id = image.read(cx).id;
-                    this.loaded_images.insert(image_id, image)
-                });
-
                 self.add_image(image, cx)?;
             }
         }
@@ -641,9 +596,16 @@ impl RemoteImageStore {
                     let entity =
                         cx.new(|cx| ImageItem::new(image_id, file, image, image_metadata, cx));
 
-                    if let Some(listeners) = self.remote_image_listeners.remove(&image_id) {
-                        for listener in listeners {
-                            listener.send(Ok(entity.clone())).ok();
+                    // Kept only for a waiter that has not asked yet; one that already asked got the
+                    // item, and keeping it as well would hold it after its last view closed.
+                    match self.remote_image_listeners.remove(&image_id) {
+                        Some(listeners) => {
+                            for listener in listeners {
+                                listener.send(Ok(entity.clone())).ok();
+                            }
+                        }
+                        None => {
+                            self.loaded_images.insert(image_id, entity.clone());
                         }
                     }
 
@@ -965,4 +927,135 @@ fn create_gpui_image(content: Vec<u8>) -> anyhow::Result<Arc<gpui::Image>> {
         },
         content,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clock::ReplicaId;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use rpc::{NoopProtoClient, TypedEnvelope};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    fn png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn envelope(
+        variant: proto::create_image_for_peer::Variant,
+    ) -> TypedEnvelope<proto::CreateImageForPeer> {
+        TypedEnvelope {
+            sender_id: proto::PeerId::default(),
+            original_sender_id: None,
+            message_id: 0,
+            payload: proto::CreateImageForPeer {
+                project_id: 0,
+                peer_id: None,
+                variant: Some(variant),
+            },
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    /// An item handed to a waiter is held by the waiter and its views alone: the store keeps no
+    /// second strong reference, so closing the last view releases it.
+    #[gpui::test]
+    async fn an_image_delivered_to_a_waiter_is_not_kept_by_the_store(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let project = crate::Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+        let metadata = project.read_with(cx, |project, cx| {
+            let mut metadata = project
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .metadata_proto();
+            metadata.id = 77;
+            metadata
+        });
+        let remote_worktree = cx.update(|cx| {
+            Worktree::remote(
+                0,
+                ReplicaId::REMOTE_SERVER,
+                metadata,
+                AnyProtoClient::new(NoopProtoClient::new()),
+                util::paths::PathStyle::local(),
+                cx,
+            )
+        });
+        worktree_store.update(cx, |store, cx| store.add(&remote_worktree, cx));
+        let store = cx.new(|cx| {
+            ImageStore::remote(
+                worktree_store,
+                AnyProtoClient::new(NoopProtoClient::new()),
+                0,
+                cx,
+            )
+        });
+        let remote = store.read_with(cx, |store, _| store.state.as_remote().unwrap());
+        let image_id = ImageId::from(NonZeroU64::new(5).unwrap());
+        let waiting = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+
+        let bytes = png();
+        store
+            .update(cx, |store, cx| {
+                store.handle_create_image_for_peer(
+                    envelope(proto::create_image_for_peer::Variant::State(
+                        proto::ImageState {
+                            id: 5,
+                            file: Some(proto::File {
+                                worktree_id: 77,
+                                entry_id: None,
+                                path: "a.png".into(),
+                                mtime: None,
+                                is_deleted: false,
+                                is_historic: false,
+                            }),
+                            content_size: bytes.len() as u64,
+                            format: "png".into(),
+                        },
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+        store
+            .update(cx, |store, cx| {
+                store.handle_create_image_for_peer(
+                    envelope(proto::create_image_for_peer::Variant::Chunk(
+                        proto::ImageChunk {
+                            image_id: 5,
+                            data: bytes,
+                        },
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+        let item = waiting.await.unwrap();
+
+        let weak = item.downgrade();
+        drop(item);
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "the store kept an item it had already delivered"
+        );
+    }
 }

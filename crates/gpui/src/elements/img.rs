@@ -755,21 +755,25 @@ mod tests {
         )
     }
 
-    /// Releasing an image that was never drawn must not start decoding it.
+    /// Letting go of an image that was never drawn must not start decoding it.
     #[gpui::test]
-    fn releasing_an_undrawn_image_starts_no_decode(cx: &mut TestAppContext) {
+    fn letting_go_of_an_undrawn_image_starts_no_decode(cx: &mut TestAppContext) {
         let image = Arc::new(Image::from_bytes(ImageFormat::Png, vec![0]));
         let window = cx.add_empty_window();
-        window.update(|window, cx| image.release(Some(window), cx));
+        window.update(|_, cx| {
+            image.hold(cx);
+            image.clone().let_go(cx);
+        });
+        window.update(|_, _| {});
         assert!(
             !cx.executor().tick(),
-            "releasing started a decode of the undrawn image"
+            "letting go started a decode of the undrawn image"
         );
     }
 
-    /// Releasing a drawn image drops its decoded picture and its asset.
+    /// The picture goes when the last holder of its id lets go, not before.
     #[gpui::test]
-    fn releasing_a_drawn_image_removes_its_asset(cx: &mut TestAppContext) {
+    fn a_drawn_image_is_dropped_by_its_last_holder(cx: &mut TestAppContext) {
         let png = {
             let mut bytes = Vec::new();
             image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
@@ -780,14 +784,19 @@ mod tests {
                 .unwrap();
             bytes
         };
-        let image = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, png.clone()));
+        let same_bytes = Arc::new(Image::from_bytes(ImageFormat::Png, png));
         let window = cx.add_empty_window();
         window.update(|window, cx| {
+            image.hold(cx);
+            same_bytes.hold(cx);
             image.clone().get_render_image(window, cx);
         });
         window.run_until_parked();
-        window.update(|_, cx| assert!(image.clone().decoded(cx).is_some()));
-        window.update(|window, cx| image.clone().release(Some(window), cx));
+
+        window.update(|_, cx| image.clone().let_go(cx));
+        window.update(|_, cx| assert!(same_bytes.clone().decoded(cx).is_some()));
+        window.update(|_, cx| same_bytes.clone().let_go(cx));
         window.update(|_, cx| assert!(image.clone().decoded(cx).is_none()));
     }
 

@@ -2174,6 +2174,12 @@ impl ImageFormat {
     }
 }
 
+/// How many holders each image id has; see [`Image::hold`].
+#[derive(Default)]
+struct ImageHolders(collections::HashMap<u64, usize>);
+
+impl crate::Global for ImageHolders {}
+
 /// An image, with a format and certain bytes
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image {
@@ -2249,14 +2255,39 @@ impl Image {
         ImageSource::Image(self).remove_asset(cx);
     }
 
-    /// Drops this image's decoded picture from every window and removes its asset. An image that
-    /// was never drawn has neither, and is not decoded to find that out. Pass the window you are
-    /// updating, if any: a window that is leased out cannot be reached through `cx`.
-    pub fn release(self: Arc<Self>, window: Option<&mut Window>, cx: &mut App) {
-        if let Some(render_image) = self.clone().decoded(cx) {
-            cx.drop_image(render_image, window);
+    /// Records a holder of this image's decoded picture. The picture and its asset are keyed by
+    /// the image id, which comes from the bytes, so every image with the same bytes shares one;
+    /// it is dropped only when the last holder lets go.
+    pub fn hold(self: &Arc<Self>, cx: &mut App) {
+        *cx.default_global::<ImageHolders>()
+            .0
+            .entry(self.id)
+            .or_default() += 1;
+    }
+
+    /// Gives up a hold taken with [`Self::hold`]. When none is left the picture is dropped from
+    /// every window and its asset removed, at the end of the current effect cycle: a window being
+    /// updated cannot be reached from here, and a new holder may arrive before then. An image that
+    /// was never drawn has neither, and is not decoded to find that out.
+    pub fn let_go(self: Arc<Self>, cx: &mut App) {
+        let holders = &mut cx.default_global::<ImageHolders>().0;
+        let Some(count) = holders.get_mut(&self.id) else {
+            return;
+        };
+        *count -= 1;
+        if *count > 0 {
+            return;
         }
-        self.remove_asset(cx);
+        holders.remove(&self.id);
+        cx.defer(move |cx| {
+            if cx.default_global::<ImageHolders>().0.contains_key(&self.id) {
+                return;
+            }
+            if let Some(render_image) = self.clone().decoded(cx) {
+                cx.drop_image(render_image, None);
+            }
+            self.remove_asset(cx);
+        });
     }
 
     /// The decoded picture if it has already been decoded, without starting a decode.
