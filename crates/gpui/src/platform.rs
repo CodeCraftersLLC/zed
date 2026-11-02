@@ -2249,6 +2249,22 @@ impl Image {
         ImageSource::Image(self).remove_asset(cx);
     }
 
+    /// Drops this image's decoded picture from every window and removes its asset. An image that
+    /// was never drawn has neither, and is not decoded to find that out.
+    pub fn release(self: Arc<Self>, window: &mut Window, cx: &mut App) {
+        if let Some(render_image) = self.clone().decoded(cx) {
+            cx.drop_image(render_image, Some(window));
+        }
+        self.remove_asset(cx);
+    }
+
+    /// The decoded picture if it has already been decoded, without starting a decode.
+    pub fn decoded(self: Arc<Self>, cx: &App) -> Option<Arc<RenderImage>> {
+        ImageSource::Image(self)
+            .peek_data(cx)
+            .and_then(|result| result.ok())
+    }
+
     /// Convert the clipboard image to an `ImageData` object.
     pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
         let frames = match self.format {

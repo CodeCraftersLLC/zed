@@ -1,3 +1,5 @@
+use gpui::Styled as _;
+
 #[derive(Default, Clone, Copy, PartialEq)]
 pub enum RowRenderMechanism {
     /// More correct for multiline content, but slower.
@@ -19,6 +21,17 @@ impl RowRenderMechanism {
         match self {
             Self::VariableList => full.clone(),
             Self::UniformList => single_line.clone(),
+        }
+    }
+
+    /// The box a cell's text is drawn in. GPUI's ellipsis measures the whole string as one
+    /// line, so it would cut the later lines of a variable row that fit the column; only a
+    /// uniform row, which draws one flattened line, truncates.
+    pub(crate) fn cell_wrapper(self) -> ui::Div {
+        let wrapper = ui::div().size_full().whitespace_nowrap();
+        match self {
+            Self::VariableList => wrapper,
+            Self::UniformList => wrapper.text_ellipsis(),
         }
     }
 }
@@ -55,6 +68,40 @@ pub(crate) struct CsvPreviewSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::ParentElement as _;
+
+    /// Draws `text` in a 60px-wide cell and returns the text GPUI laid out.
+    fn drawn_in_narrow_cell(
+        mechanism: RowRenderMechanism,
+        text: &'static str,
+    ) -> Vec<ui::SharedString> {
+        let mut cx = gpui::TestAppContext::single();
+        let cx = cx.add_empty_window();
+        cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(60.), gpui::px(200.)),
+            |_, _| {
+                ui::div()
+                    .w(gpui::px(60.))
+                    .child(mechanism.cell_wrapper().child(text))
+            },
+        );
+        cx.update(|window, _| window.text_system().texts_of_last_frame())
+    }
+
+    /// A variable row's second line fits the column; only the joined text is too wide.
+    #[test]
+    fn a_variable_row_keeps_every_line_of_a_cell_whose_joined_text_overflows() {
+        let drawn = drawn_in_narrow_cell(RowRenderMechanism::VariableList, "aaaaaa\nbb");
+        assert!(drawn.iter().any(|t| t.as_ref() == "bb"), "{drawn:?}");
+    }
+
+    /// A uniform row draws one flattened line, which still ends in an ellipsis when too wide.
+    #[test]
+    fn a_uniform_row_ellipsizes_a_flattened_cell_that_overflows() {
+        let drawn = drawn_in_narrow_cell(RowRenderMechanism::UniformList, "aaaaaaaaaaaaaaaaaaaa");
+        assert!(drawn.iter().any(|t| t.ends_with('…')), "{drawn:?}");
+    }
 
     #[test]
     fn a_variable_row_draws_every_line_and_a_uniform_row_the_flattened_cell() {

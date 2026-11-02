@@ -565,6 +565,15 @@ impl ImageSource {
         }
     }
 
+    pub(crate) fn peek_data(&self, cx: &App) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        match self {
+            ImageSource::Image(data) => cx.peek_asset::<AssetLogger<ImageDecoder>>(data),
+            ImageSource::Render(data) => Some(Ok(data.to_owned())),
+            ImageSource::Resource(resource) => cx.peek_asset::<ImgResourceLoader>(resource),
+            ImageSource::Custom(_) => None,
+        }
+    }
+
     /// Remove this image source from the asset system
     pub fn remove_asset(&self, cx: &mut App) {
         match self {
@@ -717,7 +726,7 @@ impl From<image::ImageError> for ImageCacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ParentElement as _, TestAppContext, canvas, div, point, px, size};
+    use crate::{ImageFormat, ParentElement as _, TestAppContext, canvas, div, point, px, size};
     use image::{Frame, ImageBuffer, Rgba};
     use smallvec::SmallVec;
 
@@ -744,6 +753,42 @@ mod tests {
                 });
             },
         )
+    }
+
+    /// Releasing an image that was never drawn must not start decoding it.
+    #[gpui::test]
+    fn releasing_an_undrawn_image_starts_no_decode(cx: &mut TestAppContext) {
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, vec![0]));
+        let window = cx.add_empty_window();
+        window.update(|window, cx| image.release(window, cx));
+        assert!(
+            !cx.executor().tick(),
+            "releasing started a decode of the undrawn image"
+        );
+    }
+
+    /// Releasing a drawn image drops its decoded picture and its asset.
+    #[gpui::test]
+    fn releasing_a_drawn_image_removes_its_asset(cx: &mut TestAppContext) {
+        let png = {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            bytes
+        };
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+        let window = cx.add_empty_window();
+        window.update(|window, cx| {
+            image.clone().get_render_image(window, cx);
+        });
+        window.run_until_parked();
+        window.update(|_, cx| assert!(image.clone().decoded(cx).is_some()));
+        window.update(|window, cx| image.clone().release(window, cx));
+        window.update(|_, cx| assert!(image.clone().decoded(cx).is_none()));
     }
 
     #[gpui::test]

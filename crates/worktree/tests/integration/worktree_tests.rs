@@ -1663,6 +1663,54 @@ async fn test_a_folder_named_many_times_in_one_scan_request_is_listed_once(
     assert_eq!(fs.read_dir_call_count() - listings_before, 1);
 }
 
+/// Different files that share one unlisted folder are different requests for it, and the folder is
+/// still listed once while each file is loaded.
+#[gpui::test]
+async fn test_distinct_files_in_one_unlisted_folder_list_it_once(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".gitignore": "vendor\n",
+            "vendor": { "a.js": "a", "b.js": "b", "c.js": "c" },
+        }),
+    )
+    .await;
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    let listings_before = fs.read_dir_call_count();
+
+    tree.read_with(cx, |tree, _| {
+        let paths = ["vendor/a.js", "vendor/b.js", "vendor/c.js", "vendor/a.js"]
+            .map(|path| -> Arc<RelPath> { rel_path(path).into() });
+        drop(
+            tree.as_local()
+                .unwrap()
+                .refresh_entries_for_paths(paths.to_vec()),
+        );
+    });
+    cx.executor().run_until_parked();
+
+    tree.read_with(cx, |tree, _| {
+        for file in ["vendor/a.js", "vendor/b.js", "vendor/c.js"] {
+            assert!(tree.entry_for_path(rel_path(file)).is_some(), "{file}");
+        }
+    });
+    assert_eq!(fs.read_dir_call_count() - listings_before, 1);
+}
+
 #[gpui::test]
 async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
     init_test(cx);

@@ -134,7 +134,7 @@ impl CsvPreviewView {
 
             let display_cell_id = DisplayCellId::new(display_row, col);
 
-            let cell = div().size_full().whitespace_nowrap().text_ellipsis().child(
+            let cell = this.settings.rendering_with.cell_wrapper().child(
                 CsvPreviewView::create_selectable_cell(
                     display_cell_id,
                     cell_content,

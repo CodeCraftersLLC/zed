@@ -2,6 +2,7 @@ mod image_info;
 mod image_viewer_settings;
 
 use std::{
+    collections::HashMap,
     mem,
     path::Path,
     sync::{Arc, atomic::AtomicBool},
@@ -11,11 +12,11 @@ use anyhow::Context as _;
 use editor::{EditorSettings, RevealInFileManager, items::entry_git_aware_label_color};
 use file_icons::FileIcons;
 use gpui::{
-    AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, Font, GlobalElementId, InspectorElementId, InteractiveElement,
-    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Style, Styled,
-    Task, WeakEntity, Window, actions, checkerboard, div, img, point, px, size,
+    AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, Font, Global, GlobalElementId, InspectorElementId,
+    InteractiveElement, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    Style, Styled, Task, WeakEntity, Window, actions, checkerboard, div, img, point, px, size,
 };
 use language::File as _;
 use persistence::ImageViewerDb;
@@ -123,6 +124,13 @@ enum Reduction {
     Failed(SharedString),
 }
 
+/// How many views show each image item. A split shares its item's picture with the view it came
+/// from, so only the last one to close may drop it.
+#[derive(Default)]
+struct ViewsPerItem(HashMap<EntityId, usize>);
+
+impl Global for ViewsPerItem {}
+
 pub struct ImageView {
     reduction: Reduction,
     image_item: Entity<ImageItem>,
@@ -174,8 +182,18 @@ impl ImageView {
     ) -> Self {
         cx.subscribe_in(&image_item, window, Self::on_image_event)
             .detach();
+        *cx.default_global::<ViewsPerItem>()
+            .0
+            .entry(image_item.entity_id())
+            .or_default() += 1;
         cx.on_release_in(window, |this, window, cx| {
-            Self::release_image(this.image_item.read(cx).image.clone(), window, cx);
+            let views = &mut cx.default_global::<ViewsPerItem>().0;
+            let remaining = views.entry(this.image_item.entity_id()).or_default();
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                views.remove(&this.image_item.entity_id());
+                Self::release_image(this.image_item.read(cx).image.clone(), window, cx);
+            }
             this.release_reduction(window, cx);
         })
         .detach();
@@ -197,10 +215,7 @@ impl ImageView {
 
     /// Drops the decoded picture and its asset, which GPUI otherwise keeps for the life of the app.
     fn release_image(image: Arc<gpui::Image>, window: &mut Window, cx: &mut App) {
-        if let Some(render_image) = image.clone().get_render_image(window, cx) {
-            cx.drop_image(render_image, Some(window));
-        }
-        image.remove_asset(cx);
+        image.release(window, cx);
     }
 
     fn release_reduction(&mut self, window: &mut Window, cx: &mut App) {
@@ -1371,6 +1386,46 @@ mod tests {
         cx.run_until_parked();
         split.read_with(cx, |split, _| {
             assert!(matches!(split.reduction, Reduction::Ready(_)))
+        });
+    }
+
+    #[gpui::test]
+    async fn the_picture_is_dropped_when_the_last_view_of_it_closes_and_not_before(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, image_item) = open_image(cx, "shared.png", small_png()).await;
+        let window = cx.add_empty_window();
+        let view = window.update(|window, cx| {
+            cx.new(|cx| ImageView::new(image_item.clone(), project.clone(), window, cx))
+        });
+        let split = view
+            .update_in(window, |view, window, cx| {
+                view.clone_on_split(None, window, cx)
+            })
+            .await
+            .unwrap();
+        let image = image_item.read_with(window, |item, _| item.image.clone());
+        window.update(|window, cx| image.clone().get_render_image(window, cx));
+        window.run_until_parked();
+        let decoded = window.update(|_, cx| image.clone().decoded(cx).expect("decoded"));
+
+        drop(split);
+        window.update(|_, _| {});
+        window.update(|_, cx| {
+            let still = image.clone().decoded(cx);
+            assert!(
+                still.is_some_and(|still| Arc::ptr_eq(&still, &decoded)),
+                "closing a split dropped the picture the other view shows, which decodes again"
+            )
+        });
+
+        drop(view);
+        window.update(|_, _| {});
+        window.update(|_, cx| {
+            assert!(
+                image.clone().decoded(cx).is_none(),
+                "the last view left the picture behind"
+            )
         });
     }
 }

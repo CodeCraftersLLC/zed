@@ -7,6 +7,11 @@ use std::{
     sync::{Arc, LazyLock, RwLock},
 };
 
+/// How a name is drawn. A hook must rewrite each character on its own, whatever surrounds it, so
+/// the drawn form of a prefix, a path component or a whole path are consistent with one another:
+/// callers draw whichever of those they hold, and [`display_name_with_positions`] relies on it to
+/// move highlight positions. A hook whose output for a character depends on its neighbours
+/// breaks both.
 pub type DisplayNameHook = Arc<dyn for<'a> Fn(&'a str) -> Cow<'a, str> + Send + Sync>;
 
 static HOOK: LazyLock<RwLock<Option<DisplayNameHook>>> = LazyLock::new(|| RwLock::new(None));
@@ -104,6 +109,27 @@ mod tests {
 
         drop(hook);
         assert_eq!(display_name("READ\u{200B}ME.md"), "READ\u{200B}ME.md");
+    }
+
+    /// The contract a hook must keep: the drawn form of a prefix starts the drawn form of the whole
+    /// name, and a path is drawn as its drawn components joined.
+    #[test]
+    fn a_hook_that_rewrites_each_character_draws_prefixes_and_components_consistently() {
+        let _hook = install_hook_for_test(Arc::new(escape_zero_width_space));
+        let path = "d\u{200B}ir/we\u{200B}ird\u{200B}/\u{200B}é.md";
+        let drawn = display_name(path);
+        for (end, _) in path.char_indices() {
+            assert!(
+                drawn.starts_with(display_name(&path[..end]).as_ref()),
+                "{end}"
+            );
+        }
+        let by_component = path
+            .split('/')
+            .map(display_name)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert_eq!(drawn, by_component);
     }
 
     #[test]

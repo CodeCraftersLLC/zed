@@ -18,6 +18,9 @@ workspace.workspace = true
 log.workspace = true
 text.workspace = true
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [features]
 dev-tools = []
 
