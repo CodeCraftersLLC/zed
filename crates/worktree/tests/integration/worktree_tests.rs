@@ -4996,6 +4996,65 @@ async fn write_file_refuses_when_the_worktree_root_is_gone(cx: &mut TestAppConte
     );
 }
 
+/// A save bound to a repository folder that was moved must not write into a different folder
+/// created at the old path.
+#[gpui::test]
+async fn write_file_refuses_when_another_folder_replaced_the_worktree_root(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({ "repo": { "src": { "lib.rs": "old" } } }))
+        .await;
+
+    let worktree = Worktree::local(
+        Path::new("/root/repo"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    fs.rename(
+        Path::new("/root/repo"),
+        Path::new("/root/moved"),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    fs.create_dir(Path::new("/root/repo")).await.unwrap();
+
+    let error = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("was replaced by another folder"),
+        "{error}"
+    );
+    assert!(!fs.is_file(Path::new("/root/repo/src/lib.rs")).await);
+    assert_eq!(
+        fs.load(Path::new("/root/moved/src/lib.rs")).await.unwrap(),
+        "old"
+    );
+}
+
 #[gpui::test]
 async fn test_write_file_encoding(cx: &mut gpui::TestAppContext) {
     init_test(cx);

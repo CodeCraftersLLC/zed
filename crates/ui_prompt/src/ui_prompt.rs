@@ -1,7 +1,7 @@
 use gpui::{
     App, Decorations, Entity, EventEmitter, FocusHandle, Focusable, PromptButton, PromptHandle,
-    PromptLevel, PromptResponse, RenderablePromptHandle, SharedString, TextStyleRefinement, Window,
-    div, prelude::*,
+    PromptLevel, PromptResponse, RenderablePromptHandle, Role, SharedString, TextStyleRefinement,
+    Window, div, prelude::*,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::{Settings, SettingsStore};
@@ -61,6 +61,21 @@ fn level_icon(level: PromptLevel) -> (IconName, Color) {
         PromptLevel::Warning => (IconName::Warning, Color::Warning),
         PromptLevel::Critical => (IconName::XCircle, Color::Error),
     }
+}
+
+/// The icon is the only visual cue to the level, so assistive technology gets the level as its name.
+fn level_badge(level: PromptLevel) -> impl IntoElement {
+    let (icon, color) = level_icon(level);
+    let name = match level {
+        PromptLevel::Info => "Information",
+        PromptLevel::Warning => "Warning",
+        PromptLevel::Critical => "Error",
+    };
+    div()
+        .id("prompt-level")
+        .role(Role::Image)
+        .aria_label(name)
+        .child(Icon::new(icon).size(IconSize::Medium).color(color))
 }
 
 pub struct ZedPromptRenderer {
@@ -139,12 +154,11 @@ impl Render for ZedPromptRenderer {
             .overflow_hidden()
             .font_family(settings.ui_font.family.clone())
             .child({
-                let (icon, color) = level_icon(self.level);
                 h_flex()
                     .w_full()
                     .gap_2()
                     .items_start()
-                    .child(Icon::new(icon).size(IconSize::Medium).color(color))
+                    .child(level_badge(self.level))
                     .child(div().flex_1().min_w_0().child(MarkdownElement::new(
                         self.message.clone(),
                         markdown_style(true, window, cx),
@@ -234,6 +248,39 @@ impl Focusable for ZedPromptRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    struct Badge(PromptLevel);
+
+    impl Render for Badge {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            level_badge(self.0)
+        }
+    }
+
+    /// The level icon is named for a screen reader, one name per level.
+    #[gpui::test]
+    async fn each_prompt_level_icon_has_an_accessible_name(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        for (level, expected) in [
+            (PromptLevel::Info, "Information"),
+            (PromptLevel::Warning, "Warning"),
+            (PromptLevel::Critical, "Error"),
+        ] {
+            let (_, cx): (_, &mut VisualTestContext) = cx.add_window_view(|_, _| Badge(level));
+            cx.enable_accessibility();
+            let tree = cx.a11y_tree().expect("accessibility tree");
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.role() == Role::Image && node.label() == Some(expected)),
+                "no image named {expected:?} for {level:?}"
+            );
+        }
+    }
 
     #[test]
     fn each_prompt_level_has_its_own_icon_and_the_warning_colour() {
