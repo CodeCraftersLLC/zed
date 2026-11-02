@@ -456,7 +456,7 @@ Jane,"Simple name""#;
         let parsed = TableLikeContent::from_str("h\n\"a\nb\"\n".to_string());
         let cell = &parsed.rows[0][0];
         assert_eq!(cell.display_value().unwrap().as_ref(), "a\nb");
-        assert_eq!(cell.single_line_value().unwrap().as_ref(), "a↵b");
+        assert_eq!(cell.single_line().unwrap()[0].as_ref(), "a↵b");
     }
 
     #[test]

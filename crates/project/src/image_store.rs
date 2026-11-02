@@ -400,6 +400,10 @@ impl ImageStore {
     ) -> Task<Result<Entity<ImageItem>>> {
         let existing_image = self.get_by_path(&project_path, cx);
         if let Some(existing_image) = existing_image {
+            if let Some(remote) = self.state.as_remote() {
+                let id = existing_image.read(cx).id;
+                remote.update(cx, |remote, _| remote.loaded_images.remove(&id));
+            }
             return Task::ready(Ok(existing_image));
         }
 
@@ -1050,6 +1054,32 @@ mod tests {
                 )
             })
             .unwrap();
+    }
+
+    /// An item delivered before anyone waited for it is handed over by opening its path, and
+    /// the store keeps nothing once the last view closes.
+    #[gpui::test]
+    async fn an_image_opened_by_path_after_delivery_is_not_kept_by_the_store(
+        cx: &mut TestAppContext,
+    ) {
+        let (store, _remote, _image_id) = remote_store(cx).await;
+        deliver_image(&store, cx);
+        let path = ProjectPath {
+            worktree_id: WorktreeId::from_proto(77),
+            path: RelPath::unix("a.png").unwrap().into(),
+        };
+        let item = store
+            .update(cx, |store, cx| store.open_image(path, cx))
+            .await
+            .unwrap();
+
+        let weak = item.downgrade();
+        drop(item);
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "the store kept an item it had handed over by path"
+        );
     }
 
     /// An item handed to a waiter is held by the waiter and its views alone: the store keeps no

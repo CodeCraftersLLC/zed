@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use text::Anchor;
 use ui::SharedString;
 
@@ -19,9 +20,12 @@ pub enum TableCell {
         position: CellContentSpan,
         /// Cached display value (for performance)
         cached_value: SharedString,
-        /// `cached_value` on one line, worked out once while parsing so drawing a cell does no
-        /// per-frame work on its text.
-        single_line_value: SharedString,
+        /// `cached_value` split into its lines, worked out once while parsing so drawing a
+        /// variable row copies nothing.
+        lines: Arc<[SharedString]>,
+        /// `cached_value` on one line, as the single element of a shared slice, worked out once
+        /// while parsing so drawing a uniform row copies nothing.
+        single_line: Arc<[SharedString]>,
     },
     /// Virtual cell, created to pad malformed row
     Virtual,
@@ -43,17 +47,25 @@ impl TableCell {
                 start: start_anchor,
                 end: end_anchor,
             },
-            single_line_value: single_line_text(&content),
+            lines: split_lines(&content),
+            single_line: Arc::from([single_line_text(&content)]),
             cached_value: content,
         }
     }
 
-    /// The cell's text on one line, as drawn. `display_value` is the full text.
-    pub fn single_line_value(&self) -> Option<&SharedString> {
+    /// The cell's text on one line, as drawn, as a shared slice of one element. `display_value`
+    /// is the full text.
+    pub fn single_line(&self) -> Option<&Arc<[SharedString]>> {
         match self {
-            TableCell::Real {
-                single_line_value, ..
-            } => Some(single_line_value),
+            TableCell::Real { single_line, .. } => Some(single_line),
+            TableCell::Virtual => None,
+        }
+    }
+
+    /// Every line of the cell's text.
+    pub fn lines(&self) -> Option<&Arc<[SharedString]>> {
+        match self {
+            TableCell::Real { lines, .. } => Some(lines),
             TableCell::Virtual => None,
         }
     }
@@ -65,6 +77,16 @@ impl TableCell {
             TableCell::Virtual => None,
         }
     }
+}
+
+fn split_lines(content: &SharedString) -> Arc<[SharedString]> {
+    if !content.contains('\n') {
+        return Arc::from([content.clone()]);
+    }
+    content
+        .split('\n')
+        .map(|line| SharedString::from(line.to_owned()))
+        .collect()
 }
 
 /// Line breaks become `↵` so a multi-line cell keeps the row height of its neighbours. The
@@ -91,6 +113,17 @@ fn single_line_text(content: &SharedString) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cell_splits_into_its_lines_once() {
+        let text: SharedString = "a\nbb\n".into();
+        let lines = split_lines(&text);
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            ["a", "bb", ""]
+        );
+        assert_eq!(split_lines(&"plain".into())[..], ["plain"]);
+    }
 
     #[test]
     fn line_breaks_in_a_cell_are_drawn_as_return_markers() {

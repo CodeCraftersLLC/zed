@@ -1,4 +1,5 @@
 use gpui::{ParentElement as _, Styled as _};
+use std::sync::Arc;
 
 #[derive(Default, Clone, Copy, PartialEq)]
 pub enum RowRenderMechanism {
@@ -12,14 +13,14 @@ pub enum RowRenderMechanism {
 
 impl RowRenderMechanism {
     /// A uniform row has one fixed height, so a multi-line cell is drawn flattened; a variable
-    /// row grows to fit, so it draws every line.
-    pub(crate) fn drawn_text(
+    /// row grows to fit, so it draws every line. Both are shared, never copied.
+    pub(crate) fn drawn_lines(
         self,
-        full: &ui::SharedString,
-        single_line: &ui::SharedString,
-    ) -> ui::SharedString {
+        lines: &Arc<[ui::SharedString]>,
+        single_line: &Arc<[ui::SharedString]>,
+    ) -> Arc<[ui::SharedString]> {
         match self {
-            Self::VariableList => full.clone(),
+            Self::VariableList => lines.clone(),
             Self::UniformList => single_line.clone(),
         }
     }
@@ -32,13 +33,9 @@ pub(crate) fn cell_wrapper() -> ui::Div {
     ui::div().size_full().whitespace_nowrap().text_ellipsis()
 }
 
-/// The lines of `drawn`, one child each, for [`cell_wrapper`] to cut on its own.
-pub(crate) fn cell_lines(drawn: &str) -> ui::Div {
-    ui::div().children(
-        drawn
-            .split('\n')
-            .map(|line| ui::div().child(ui::SharedString::from(line.to_owned()))),
-    )
+/// The lines, one child each, for [`cell_wrapper`] to cut on its own.
+pub(crate) fn cell_lines(lines: &[ui::SharedString]) -> ui::Div {
+    ui::div().children(lines.iter().map(|line| ui::div().child(line.clone())))
 }
 
 #[derive(Default, Clone, Copy)]
@@ -78,13 +75,14 @@ mod tests {
     fn drawn_in_narrow_cell(text: &'static str) -> Vec<ui::SharedString> {
         let mut cx = gpui::TestAppContext::single();
         let cx = cx.add_empty_window();
+        let lines: Vec<ui::SharedString> = text.split('\n').map(Into::into).collect();
         cx.draw(
             gpui::point(gpui::px(0.), gpui::px(0.)),
             gpui::size(gpui::px(60.), gpui::px(200.)),
             |_, _| {
                 ui::div()
                     .w(gpui::px(60.))
-                    .child(cell_wrapper().child(cell_lines(text)))
+                    .child(cell_wrapper().child(cell_lines(&lines)))
             },
         );
         cx.update(|window, _| window.text_system().texts_of_last_frame())
@@ -113,17 +111,18 @@ mod tests {
         assert!(drawn.iter().any(|t| t.as_ref() == "bb"), "{drawn:?}");
     }
 
+    /// Drawing hands out the cell's shared lines: nothing is split or copied per render.
     #[test]
-    fn a_variable_row_draws_every_line_and_a_uniform_row_the_flattened_cell() {
-        let full: ui::SharedString = "a\nb".into();
-        let single_line: ui::SharedString = "a↵b".into();
-        assert_eq!(
-            RowRenderMechanism::VariableList.drawn_text(&full, &single_line),
-            "a\nb"
-        );
-        assert_eq!(
-            RowRenderMechanism::UniformList.drawn_text(&full, &single_line),
-            "a↵b"
-        );
+    fn a_row_draws_the_cells_shared_lines_without_copying_them() {
+        let lines: Arc<[ui::SharedString]> = Arc::from(["a".into(), "b".into()]);
+        let single_line: Arc<[ui::SharedString]> = Arc::from(["a↵b".into()]);
+        assert!(Arc::ptr_eq(
+            &RowRenderMechanism::VariableList.drawn_lines(&lines, &single_line),
+            &lines
+        ));
+        assert!(Arc::ptr_eq(
+            &RowRenderMechanism::UniformList.drawn_lines(&lines, &single_line),
+            &single_line
+        ));
     }
 }
