@@ -884,6 +884,13 @@ impl Fs for RealFs {
     async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
+        // Nothing is read through a handle. `O_PATH` asks for no read access, so a folder that
+        // may be entered but not listed is still held, and its inode cannot be given to another.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_PATH);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;

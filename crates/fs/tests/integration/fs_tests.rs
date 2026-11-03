@@ -528,6 +528,34 @@ async fn test_realfs_identity_needs_no_read_access(
     assert_eq!(identity.unwrap(), opened);
 }
 
+/// A handle holds a folder that may be entered but not listed: it opens, names the folder, and
+/// keeps its inode from going to a folder made in its place.
+#[cfg(target_os = "linux")]
+#[gpui::test]
+async fn test_realfs_handle_holds_a_folder_it_may_not_list(executor: BackgroundExecutor) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let folder = temp_dir.path().join("repo");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let held = gpui::block_on(fs.open_handle(&folder)).unwrap();
+    let opened = held.identity().unwrap();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..64 {
+        std::fs::remove_dir(&folder).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let made = gpui::block_on(fs.open_handle(&folder))
+            .unwrap()
+            .identity()
+            .unwrap();
+        assert_ne!(made, opened, "a held folder's inode was given to another");
+    }
+    assert_eq!(held.identity().unwrap(), opened);
+}
+
 #[gpui::test]
 async fn test_copy_recursive_creates_nothing_when_the_source_itself_is_refused(
     executor: BackgroundExecutor,

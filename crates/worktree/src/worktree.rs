@@ -225,7 +225,8 @@ pub struct LocalWorktree {
 }
 
 /// A folder's identity and, when the folder could be opened, a handle on it that keeps the
-/// identity from being given to another folder after this one is deleted.
+/// identity from being given to another folder after this one is deleted (ext4 reuses a freed
+/// inode at once).
 struct RootBinding {
     identity: fs::FileIdentity,
     _pin: Option<Arc<dyn fs::FileHandle>>,
@@ -1812,8 +1813,9 @@ impl LocalWorktree {
                     }
                     let live_root = fs.identity(&root).await?;
                     if root_binding.get().is_none() {
-                        // The pin is best effort: a folder that may be entered but not listed
-                        // cannot be opened, and is bound by its identity alone.
+                        // The pin is best effort. On Linux any folder that can be entered is
+                        // held (`O_PATH`); elsewhere one that cannot be listed is bound by its
+                        // identity alone, which APFS never gives to another folder.
                         let pin = fs.open_handle(&root).await.ok().filter(|pin| {
                             pin.identity()
                                 .is_ok_and(|identity| identity == live_root)
