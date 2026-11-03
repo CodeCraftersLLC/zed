@@ -478,6 +478,32 @@ async fn test_realfs_atomic_write(executor: BackgroundExecutor) {
     assert_eq!(content, "World");
 }
 
+/// A handle names the folder it was opened on: after that folder moves and another takes its
+/// path, the handle still agrees with the moved folder and not with the one now at the path.
+#[gpui::test]
+async fn test_realfs_handle_identity_follows_its_folder_not_its_path(executor: BackgroundExecutor) {
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let original = temp_dir.path().join("repo");
+    let moved = temp_dir.path().join("moved");
+    std::fs::create_dir(&original).unwrap();
+
+    let held = gpui::block_on(fs.open_handle(&original)).unwrap();
+    let opened = held.identity().unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir(&original).unwrap();
+
+    let identity_at = |path: &Path| {
+        gpui::block_on(fs.open_handle(path))
+            .unwrap()
+            .identity()
+            .unwrap()
+    };
+    assert_eq!(held.identity().unwrap(), opened);
+    assert_eq!(identity_at(&moved), opened);
+    assert_ne!(identity_at(&original), opened);
+}
+
 #[gpui::test]
 async fn test_realfs_atomic_write_non_existing_file(executor: BackgroundExecutor) {
     let fs = RealFs::new(None, executor);

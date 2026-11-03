@@ -62,7 +62,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
     time::{Duration, Instant},
@@ -216,6 +216,11 @@ pub struct LocalWorktree {
     share_private_files: bool,
     scanning_enabled: bool,
     force_defer_watch: bool,
+    /// A handle on the folder saves below the root are bound to: the one this worktree was opened
+    /// on, or, when none could be opened then, the first one a save finds. It stays open, so its
+    /// identity is never given to another folder. The scanner re-reads whatever folder is at the
+    /// root's path, so only this tells the original from another folder created there.
+    root_binding: Arc<OnceLock<Arc<dyn fs::FileHandle>>>,
 }
 
 pub struct PathPrefixScanRequest {
@@ -494,6 +499,11 @@ impl Worktree {
             None
         };
 
+        let root_binding = Arc::new(OnceLock::new());
+        if let Some(handle) = root_file_handle.clone() {
+            root_binding.set(handle).ok();
+        }
+
         let root_repo_common_dir = if visible {
             discover_root_repo_common_dir(&abs_path, fs.as_ref())
                 .await
@@ -583,6 +593,7 @@ impl Worktree {
                 settings,
                 scanning_enabled,
                 force_defer_watch: false,
+                root_binding,
             };
             worktree.start_background_scanner(scan_requests_rx, path_prefixes_to_scan_rx, cx);
             Worktree::Local(worktree)
@@ -1764,32 +1775,32 @@ impl LocalWorktree {
         // A file below the root is saved with its parent folders created, which would rebuild a
         // repository folder that was moved or deleted while the file was open. A worktree that is
         // a single file has no folder to protect.
-        // The root is bound by identity, not only by path: a different folder created at the old
-        // path after the repository moved must not receive the save. A swap between this check and
+        // The root is bound to a folder (`root_binding`), not only to its path: a different
+        // folder created at the old path after the repository moved must not receive the save,
+        // even once the scanner has taken it as the root. A swap between this check and
         // the write remains possible, because closing it needs descriptor-relative writes through
         // `Fs` and a concurrent process to race it.
-        let root_to_keep = (!path.is_empty()).then(|| {
-            let scanned_inode = self.snapshot.root_entry().map(|entry| entry.inode);
-            (self.abs_path().to_path_buf(), scanned_inode)
-        });
+        let root_to_keep =
+            (!path.is_empty()).then(|| (self.abs_path().to_path_buf(), self.root_binding.clone()));
 
         let write = cx.background_spawn({
             let fs = fs.clone();
             let abs_path = abs_path.clone();
             async move {
-                if let Some((root, scanned_inode)) = root_to_keep {
-                    let Some(metadata) = fs.metadata(&root).await? else {
+                if let Some((root, root_binding)) = root_to_keep {
+                    if fs.metadata(&root).await?.is_none() {
                         anyhow::bail!(
                             "'{}' was moved or deleted. Your edits are kept in the editor; relocate the repository or use Save As elsewhere.",
                             root.display()
                         );
-                    };
-                    if scanned_inode.is_some_and(|inode| inode != metadata.inode) {
-                        anyhow::bail!(
-                            "'{}' was replaced by another folder. Your edits are kept in the editor; relocate the repository or use Save As elsewhere.",
-                            root.display()
-                        );
                     }
+                    let live_root = fs.open_handle(&root).await?;
+                    let bound_root = root_binding.get_or_init(|| live_root.clone());
+                    anyhow::ensure!(
+                        bound_root.identity()? == live_root.identity()?,
+                        "'{}' was replaced by another folder. Your edits are kept in the editor; relocate the repository or use Save As elsewhere.",
+                        root.display()
+                    );
                 }
                 // For UTF-8 text whose lines all end alike, use the optimized `fs.save` which
                 // writes Rope chunks directly to disk without allocating a contiguous string.

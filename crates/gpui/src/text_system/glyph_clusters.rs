@@ -15,7 +15,8 @@ pub struct GlyphCluster {
 ///
 /// DirectWrite hands the glyphs and the cluster map of a run in logical order, whatever the run's
 /// bidi level, so the map is non-decreasing for left-to-right and right-to-left runs alike. Only
-/// the placement differs; see [`glyph_run_positions`].
+/// the placement differs; see [`glyph_run_positions`]. The first cluster starts at the run's first
+/// glyph whatever the map says, so a damaged map leaves no glyph without a character.
 pub fn glyph_clusters(cluster_map: &[u16], glyph_count: usize) -> Vec<GlyphCluster> {
     let mut clusters: Vec<GlyphCluster> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
@@ -26,7 +27,11 @@ pub fn glyph_clusters(cluster_map: &[u16], glyph_count: usize) -> Vec<GlyphClust
             .iter()
             .take_while(|&&glyph| glyph == first_glyph)
             .count();
-        let start = (first_glyph as usize).min(glyph_count);
+        let start = if clusters.is_empty() {
+            0
+        } else {
+            (first_glyph as usize).min(glyph_count)
+        };
         starts.push(start);
         clusters.push(GlyphCluster {
             utf16_len,
@@ -156,6 +161,19 @@ mod tests {
             }
         }
         assert_eq!(owner, vec![1; 5]);
+    }
+
+    #[test]
+    fn every_glyph_of_a_damaged_map_still_belongs_to_a_cluster() {
+        for (map, glyph_count) in [(&[2u16, 2][..], 3), (&[3, 1, 0][..], 2), (&[0, 9][..], 2)] {
+            let mut covered = vec![false; glyph_count];
+            for cluster in glyph_clusters(map, glyph_count) {
+                for glyph in cluster.glyphs {
+                    covered[glyph] = true;
+                }
+            }
+            assert_eq!(covered, vec![true; glyph_count], "{map:?}");
+        }
     }
 
     #[test]

@@ -417,8 +417,19 @@ pub struct RealFs {
     is_case_sensitive: AtomicU8,
 }
 
+/// What a file system object is, apart from any path to it: the device or volume it lives on and
+/// its number there. Two handles with the same identity are open on the same object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
 pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn current_path(&self, fs: &Arc<dyn Fs>) -> Result<PathBuf>;
+    /// The identity of the object this handle is open on, read through the handle, so it names
+    /// that object even after its path has been given to another.
+    fn identity(&self) -> Result<FileIdentity>;
 }
 
 impl FileHandle for std::fs::File {
@@ -510,6 +521,34 @@ impl FileHandle for std::fs::File {
         let os_str: OsString = OsString::from_wide(&buf[..written as usize]);
         anyhow::ensure!(!os_str.is_empty(), "Could find a path for the file handle");
         Ok(PathBuf::from(os_str))
+    }
+
+    #[cfg(unix)]
+    fn identity(&self) -> Result<FileIdentity> {
+        let metadata = self.metadata()?;
+        Ok(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn identity(&self) -> Result<FileIdentity> {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle stays open for as long as `self` lives, and `info` is a valid,
+        // writable `BY_HANDLE_FILE_INFORMATION` for the call to fill.
+        unsafe { GetFileInformationByHandle(HANDLE(self.as_raw_handle() as _), &mut info)? };
+        Ok(FileIdentity {
+            device: u64::from(info.dwVolumeSerialNumber),
+            inode: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
     }
 }
 
@@ -2744,6 +2783,13 @@ impl FileHandle for FakeHandle {
             return Ok(target);
         }
         anyhow::bail!("fake fd target not found")
+    }
+
+    fn identity(&self) -> Result<FileIdentity> {
+        Ok(FileIdentity {
+            device: 0,
+            inode: self.inode,
+        })
     }
 }
 

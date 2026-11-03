@@ -1474,8 +1474,10 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         // DirectWrite hands every run's glyphs and cluster map in logical order. `ShapedRun` wants
         // them left to right, so `glyph_run_positions` returns them in drawing order, each with
         // its logical index.
-        let mut glyph_text_ix = vec![0; glyph_count];
+        // A run whose cluster map is empty still places its glyphs at the run's own text.
         let mut utf16_idx = desc.textPosition as usize;
+        context.index_converter.advance_to_utf16_ix(utf16_idx);
+        let mut glyph_text_ix = vec![context.index_converter.utf8_ix; glyph_count];
         for cluster in glyph_clusters(cluster_map, glyph_count) {
             context.index_converter.advance_to_utf16_ix(utf16_idx);
             utf16_idx += cluster.utf16_len;

@@ -4997,7 +4997,7 @@ async fn write_file_refuses_when_the_worktree_root_is_gone(cx: &mut TestAppConte
 }
 
 /// A save bound to a repository folder that was moved must not write into a different folder
-/// created at the old path.
+/// created at the old path, even after the worktree has scanned that folder as its root.
 #[gpui::test]
 async fn write_file_refuses_when_another_folder_replaced_the_worktree_root(
     cx: &mut TestAppContext,
@@ -5021,6 +5021,9 @@ async fn write_file_refuses_when_another_folder_replaced_the_worktree_root(
     cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
         .await;
 
+    // Both changes reach the scanner together, so it sees a folder at the root's path and scans
+    // it as the root instead of following the original folder to its new place.
+    fs.pause_events();
     fs.rename(
         Path::new("/root/repo"),
         Path::new("/root/moved"),
@@ -5029,6 +5032,23 @@ async fn write_file_refuses_when_another_folder_replaced_the_worktree_root(
     .await
     .unwrap();
     fs.create_dir(Path::new("/root/repo")).await.unwrap();
+    fs.unpause_events_and_flush();
+    cx.executor().run_until_parked();
+
+    let replacement = fs
+        .metadata(Path::new("/root/repo"))
+        .await
+        .unwrap()
+        .unwrap()
+        .inode;
+    worktree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.root_entry().map(|entry| entry.inode),
+            Some(replacement),
+            "the scanner has taken the replacement as the root"
+        );
+        assert_eq!(tree.abs_path().as_ref(), Path::new("/root/repo"));
+    });
 
     let error = worktree
         .update(cx, |tree, cx| {
@@ -5052,6 +5072,73 @@ async fn write_file_refuses_when_another_folder_replaced_the_worktree_root(
     assert_eq!(
         fs.load(Path::new("/root/moved/src/lib.rs")).await.unwrap(),
         "old"
+    );
+}
+
+/// A worktree opened before its folder existed binds its saves to the first folder a save finds
+/// there, and refuses another folder that later takes that one's place.
+#[gpui::test]
+async fn write_file_binds_a_root_created_after_opening_to_the_first_folder_it_saves_into(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({})).await;
+
+    let worktree = Worktree::local(
+        Path::new("/root/repo"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+    fs.create_dir(Path::new("/root/repo")).await.unwrap();
+    cx.executor().run_until_parked();
+
+    let save = |text: &'static str, cx: &mut TestAppContext| {
+        worktree.update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                text.into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+    };
+    save("first", cx).await.unwrap();
+    assert_eq!(
+        fs.load(Path::new("/root/repo/src/lib.rs")).await.unwrap(),
+        "first"
+    );
+
+    fs.pause_events();
+    fs.rename(
+        Path::new("/root/repo"),
+        Path::new("/root/moved"),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    fs.create_dir(Path::new("/root/repo")).await.unwrap();
+    fs.unpause_events_and_flush();
+    cx.executor().run_until_parked();
+
+    let error = save("second", cx).await.unwrap_err();
+    assert!(
+        error.to_string().contains("was replaced by another folder"),
+        "{error}"
+    );
+    assert!(!fs.is_file(Path::new("/root/repo/src/lib.rs")).await);
+    assert_eq!(
+        fs.load(Path::new("/root/moved/src/lib.rs")).await.unwrap(),
+        "first"
     );
 }
 
