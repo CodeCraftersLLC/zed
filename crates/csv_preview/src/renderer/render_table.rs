@@ -5,7 +5,7 @@ use ui::{ColumnWidthConfig, ResizableColumnsState, Table, UncheckedTableRow, div
 
 use crate::{
     CsvPreviewView,
-    settings::RowRenderMechanism,
+    settings::{RowRenderMechanism, cell_wrapper},
     types::{AnyColumn, DisplayCellId, DisplayRow},
 };
 
@@ -126,17 +126,22 @@ impl CsvPreviewView {
 
             // TODO: Introduce `<null>` cell type
             let cell_content = table_cell.display_value().cloned().unwrap_or_default();
+            let drawn_lines = match (table_cell.lines(), table_cell.single_line()) {
+                (Some(lines), Some(single_line)) => {
+                    this.settings.rendering_with.drawn_lines(lines, single_line)
+                }
+                _ => &[],
+            };
 
             let display_cell_id = DisplayCellId::new(display_row, col);
 
-            let cell = div().size_full().whitespace_nowrap().text_ellipsis().child(
-                CsvPreviewView::create_selectable_cell(
-                    display_cell_id,
-                    cell_content,
-                    this.settings.vertical_alignment,
-                    cx,
-                ),
-            );
+            let cell = cell_wrapper().child(CsvPreviewView::create_selectable_cell(
+                display_cell_id,
+                cell_content,
+                drawn_lines,
+                this.settings.vertical_alignment,
+                cx,
+            ));
 
             elements.push(
                 div()

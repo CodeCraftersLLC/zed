@@ -2370,6 +2370,17 @@ impl App {
         self.loading_assets.remove(&asset_id);
     }
 
+    /// The asset's output if it has already finished loading. Unlike [`Window::get_asset`] this
+    /// never starts a load, so asking about an asset nobody wanted costs nothing.
+    pub fn peek_asset<A: Asset>(&self, source: &A::Source) -> Option<A::Output> {
+        let asset_id = (TypeId::of::<A>(), hash(source));
+        self.loading_assets
+            .get(&asset_id)?
+            .downcast_ref::<Shared<Task<A::Output>>>()?
+            .clone()
+            .now_or_never()
+    }
+
     /// Asynchronously load an asset, if the asset hasn't finished loading this will return None.
     ///
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a

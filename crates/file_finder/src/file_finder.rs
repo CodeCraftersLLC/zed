@@ -62,6 +62,40 @@ actions!(
     ]
 );
 
+/// Byte offsets into `name` itself (not its lowercase form, whose characters can be longer) of
+/// the characters that spell `query_lower` in order, and how many query bytes were matched.
+///
+/// The match runs on the whole-string lowercase, as the query was made, so a contextual form
+/// (a final sigma) still matches. A character's lowercase is as long alone as in context (`σ` and
+/// `ς` are both two bytes), so each lowercase offset maps back through the lengths.
+fn channel_match_positions(name: &str, query_lower: &str) -> (Vec<usize>, usize) {
+    let name_lower = name.to_lowercase();
+    let mut original_of_lower = Vec::with_capacity(name.len());
+    for (name_idx, name_char) in name.char_indices() {
+        let lower_len: usize = name_char.to_lowercase().map(char::len_utf8).sum();
+        original_of_lower.extend(std::iter::repeat_n(name_idx, lower_len));
+    }
+    if original_of_lower.len() != name_lower.len() {
+        return (Vec::new(), 0);
+    }
+
+    let mut positions: Vec<usize> = Vec::new();
+    let mut query_idx = 0;
+    for (lower_idx, lower_char) in name_lower.char_indices() {
+        let Some(query_char) = query_lower[query_idx..].chars().next() else {
+            break;
+        };
+        if lower_char == query_char {
+            query_idx += query_char.len_utf8();
+            let original_idx = original_of_lower[lower_idx];
+            if positions.last() != Some(&original_idx) {
+                positions.push(original_idx);
+            }
+        }
+    }
+    (positions, query_idx)
+}
+
 impl ModalView for FileFinder {}
 
 /// Decides whether the name typed after "Create file" may be created, and says why when it may not.
@@ -1107,18 +1141,8 @@ impl FileFinderDelegate {
                         let channel_name = candidate.string;
                         let name_lower = channel_name.to_lowercase();
 
-                        let mut positions = Vec::new();
-                        let mut query_idx = 0;
-                        for (name_idx, name_char) in name_lower.char_indices() {
-                            if query_idx < query_lower.len() {
-                                let query_char =
-                                    query_lower[query_idx..].chars().next().unwrap_or_default();
-                                if name_char == query_char {
-                                    positions.push(name_idx);
-                                    query_idx += query_char.len_utf8();
-                                }
-                            }
-                        }
+                        let (positions, query_idx) =
+                            channel_match_positions(&channel_name, &query_lower);
 
                         if query_idx == query_lower.len() {
                             let channel = &channels[candidate.id];
@@ -1344,6 +1368,11 @@ impl FileFinderDelegate {
                 }
             }
         }
+
+        let (file_name, file_name_positions) =
+            util::display_name::display_name_with_positions(&file_name, &file_name_positions);
+        let (full_path, full_path_positions) =
+            util::display_name::display_name_with_positions(&full_path, &full_path_positions);
 
         (
             HighlightedLabel::new(file_name, file_name_positions),

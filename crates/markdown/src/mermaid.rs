@@ -555,9 +555,17 @@ fn render_mermaid_error_header(
             )
         })
         .child(
-            Label::new(reason)
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+            // `min_w_0` lets the reason shrink below its text width so it wraps inside the row
+            // instead of running past the right edge.
+            div()
+                .flex_1()
+                .min_w_0()
+                .debug_selector(|| "mermaid-failure-reason".into())
+                .child(
+                    Label::new(reason)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
         )
 }
 
@@ -941,6 +949,49 @@ mod tests {
     #[gpui::test]
     fn a_small_diagram_has_no_reason_line(cx: &mut TestAppContext) {
         assert!(mermaid_failures("flowchart TD\n  A --> B", cx).is_empty());
+    }
+
+    /// The QA report's narrow Mermaid preview cut the reason off at its right edge.
+    #[gpui::test]
+    fn a_long_failure_reason_wraps_inside_a_narrow_preview(cx: &mut TestAppContext) {
+        const REASON: &str = "This diagram could not be drawn: Parse error on line 2, the renderer \
+            expected a closing bracket before the arrow that follows it.";
+
+        struct NarrowPreview(&'static str);
+
+        impl Render for NarrowPreview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(260.))
+                    .debug_selector(|| "narrow-preview".into())
+                    .child(super::render_mermaid_error_header(0, self.0.into(), true))
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| NarrowPreview("Short."));
+        cx.run_until_parked();
+        let one_line = cx
+            .debug_bounds("mermaid-failure-reason")
+            .unwrap()
+            .size
+            .height;
+
+        let (_, cx) = cx.add_window_view(|_, _| NarrowPreview(REASON));
+        cx.run_until_parked();
+        let preview = cx.debug_bounds("narrow-preview").unwrap();
+        let reason = cx.debug_bounds("mermaid-failure-reason").unwrap();
+        assert!(
+            reason.right() <= preview.right(),
+            "the reason ends at {:?}, past the preview's right edge at {:?}",
+            reason.right(),
+            preview.right()
+        );
+        assert!(
+            reason.size.height > one_line,
+            "the reason is {:?} tall, as a one line text is {one_line:?}",
+            reason.size.height
+        );
     }
 
     #[test]

@@ -34,8 +34,8 @@ pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBu
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
-    PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
+    ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageCacheError, ImageSource, Keymap, LineLayout,
+    Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
     SystemWindowTab, Task, Window, WindowControlArea, decode_bgra_frames, hash, point, px, size,
 };
@@ -2174,6 +2174,12 @@ impl ImageFormat {
     }
 }
 
+/// How many holders each image id has; see [`Image::hold`].
+#[derive(Default)]
+struct ImageHolders(collections::HashMap<u64, usize>);
+
+impl crate::Global for ImageHolders {}
+
 /// An image, with a format and certain bytes
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image {
@@ -2233,9 +2239,62 @@ impl Image {
             .and_then(|result| result.ok())
     }
 
+    /// Like [`Self::use_render_image`], but a decode failure is returned rather than dropped, so a
+    /// caller can say why nothing is drawn. `None` while the image is still loading, and the
+    /// current view is notified when it finishes.
+    pub fn use_render_image_result(
+        self: Arc<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        ImageSource::Image(self).use_data(None, window, cx)
+    }
+
     /// Use the GPUI `remove_asset` API to drop this image, if possible.
     pub fn remove_asset(self: Arc<Self>, cx: &mut App) {
         ImageSource::Image(self).remove_asset(cx);
+    }
+
+    /// Records a holder of this image's decoded picture. The picture and its asset are keyed by
+    /// the image id, which comes from the bytes, so every image with the same bytes shares one;
+    /// it is dropped only when the last holder lets go.
+    pub fn hold(self: &Arc<Self>, cx: &mut App) {
+        *cx.default_global::<ImageHolders>()
+            .0
+            .entry(self.id)
+            .or_default() += 1;
+    }
+
+    /// Gives up a hold taken with [`Self::hold`]. When none is left the picture is dropped from
+    /// every window and its asset removed, at the end of the current effect cycle: a window being
+    /// updated cannot be reached from here, and a new holder may arrive before then. An image that
+    /// was never drawn has neither, and is not decoded to find that out.
+    pub fn let_go(self: Arc<Self>, cx: &mut App) {
+        let holders = &mut cx.default_global::<ImageHolders>().0;
+        let Some(count) = holders.get_mut(&self.id) else {
+            return;
+        };
+        *count -= 1;
+        if *count > 0 {
+            return;
+        }
+        holders.remove(&self.id);
+        cx.defer(move |cx| {
+            if cx.default_global::<ImageHolders>().0.contains_key(&self.id) {
+                return;
+            }
+            if let Some(render_image) = self.clone().decoded(cx) {
+                cx.drop_image(render_image, None);
+            }
+            self.remove_asset(cx);
+        });
+    }
+
+    /// The decoded picture if it has already been decoded, without starting a decode.
+    pub fn decoded(self: Arc<Self>, cx: &App) -> Option<Arc<RenderImage>> {
+        ImageSource::Image(self)
+            .peek_data(cx)
+            .and_then(|result| result.ok())
     }
 
     /// Convert the clipboard image to an `ImageData` object.

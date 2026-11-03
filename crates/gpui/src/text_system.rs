@@ -1,11 +1,13 @@
 mod font_fallbacks;
 mod font_features;
+mod glyph_clusters;
 mod line;
 mod line_layout;
 mod line_wrapper;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
+pub use glyph_clusters::*;
 pub use line::*;
 pub use line_layout::*;
 pub use line_wrapper::*;
@@ -636,6 +638,15 @@ impl WindowTextSystem {
 
     pub(crate) fn finish_frame(&self) {
         self.line_layout_cache.finish_frame()
+    }
+
+    /// The text of the lines this window laid out from text for its most recently drawn frame
+    /// ([`Self::layout_line`] and [`Self::layout_wrapped_line`]), which is what a test can read of
+    /// what was drawn: labels, tooltips and the like. A line shaped by a hash of its text
+    /// ([`Self::shape_line_by_hash`]) keeps no text and is not listed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn texts_of_last_frame(&self) -> Vec<SharedString> {
+        self.line_layout_cache.texts_of_last_frame()
     }
 
     /// Layout the given line of text, at the given font_size.

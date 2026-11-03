@@ -73,6 +73,36 @@ async fn test_fake_fs(executor: BackgroundExecutor) {
 }
 
 #[gpui::test]
+async fn test_copy_recursive_creates_nothing_when_a_nested_source_is_refused(
+    executor: BackgroundExecutor,
+) {
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/outer"),
+        json!({ "tree": { "a": "A", "nested": { "link": "L", "z": "Z" } } }),
+    )
+    .await;
+    fs.refuse_copy_source(
+        path!("/outer/tree/nested/link"),
+        "link points outside the repository".into(),
+    );
+
+    let target = Path::new(path!("/outer/copy"));
+    let error = copy_recursive(
+        fs.as_ref(),
+        Path::new(path!("/outer/tree")),
+        target,
+        Default::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("outside the repository"));
+    assert!(fs.metadata(target).await.unwrap().is_none());
+    assert_eq!(fs.files().len(), 3);
+}
+
+#[gpui::test]
 async fn test_copy_recursive_with_single_file(executor: BackgroundExecutor) {
     let fs = FakeFs::new(executor.clone());
     fs.insert_tree(
@@ -446,6 +476,118 @@ async fn test_realfs_atomic_write(executor: BackgroundExecutor) {
     gpui::block_on(fs.atomic_write(file_to_be_replaced.clone(), "World".into())).unwrap();
     let content = std::fs::read_to_string(&file_to_be_replaced).unwrap();
     assert_eq!(content, "World");
+}
+
+/// A handle names the folder it was opened on: after that folder moves and another takes its
+/// path, the handle still agrees with the moved folder and not with the one now at the path.
+#[gpui::test]
+async fn test_realfs_handle_identity_follows_its_folder_not_its_path(executor: BackgroundExecutor) {
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let original = temp_dir.path().join("repo");
+    let moved = temp_dir.path().join("moved");
+    std::fs::create_dir(&original).unwrap();
+
+    let held = gpui::block_on(fs.open_handle(&original)).unwrap();
+    let opened = held.identity().unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir(&original).unwrap();
+
+    let identity_at = |path: &Path| {
+        gpui::block_on(fs.open_handle(path))
+            .unwrap()
+            .identity()
+            .unwrap()
+    };
+    assert_eq!(held.identity().unwrap(), opened);
+    assert_eq!(identity_at(&moved), opened);
+    assert_ne!(identity_at(&original), opened);
+}
+
+/// A folder that may be entered but not listed still has an identity, and it is the one a handle
+/// opened on the folder reads.
+#[cfg(unix)]
+#[gpui::test]
+async fn test_realfs_identity_needs_no_read_access(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    cx.executor().allow_parking();
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let folder = temp_dir.path().join("repo");
+    std::fs::create_dir(&folder).unwrap();
+    let opened = fs.open_handle(&folder).await.unwrap().identity().unwrap();
+
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let identity = fs.identity(&folder).await;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(identity.unwrap(), opened);
+}
+
+/// A handle holds a folder that may be entered but not listed: it opens, names the folder, and
+/// keeps its inode from going to a folder made in its place.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[gpui::test]
+async fn test_realfs_handle_holds_a_folder_it_may_not_list(executor: BackgroundExecutor) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, executor));
+    let temp_dir = TempDir::new().unwrap();
+    let folder = temp_dir.path().join("repo");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let held = gpui::block_on(fs.open_handle(&folder)).unwrap();
+    let opened = held.identity().unwrap();
+    let named = held.current_path(&fs);
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(named.unwrap()).unwrap(),
+        std::fs::canonicalize(&folder).unwrap()
+    );
+    for _ in 0..64 {
+        std::fs::remove_dir(&folder).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let made = gpui::block_on(fs.open_handle(&folder))
+            .unwrap()
+            .identity()
+            .unwrap();
+        assert_ne!(made, opened, "a held folder's inode was given to another");
+    }
+    assert_eq!(held.identity().unwrap(), opened);
+}
+
+#[gpui::test]
+async fn test_copy_recursive_creates_nothing_when_the_source_itself_is_refused(
+    executor: BackgroundExecutor,
+) {
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/outer"),
+        json!({ "tree": { "a": "A", "nested": { "z": "Z" } } }),
+    )
+    .await;
+    fs.refuse_copy_source(
+        path!("/outer/tree"),
+        "link points outside the repository".into(),
+    );
+
+    let target = Path::new(path!("/outer/copy"));
+    let error = copy_recursive(
+        fs.as_ref(),
+        Path::new(path!("/outer/tree")),
+        target,
+        Default::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("outside the repository"));
+    assert!(fs.metadata(target).await.unwrap().is_none());
 }
 
 #[gpui::test]

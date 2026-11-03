@@ -108,6 +108,25 @@ pub struct ImageItem {
 }
 
 impl ImageItem {
+    fn new(
+        id: ImageId,
+        file: Arc<worktree::File>,
+        image: Arc<gpui::Image>,
+        image_metadata: Option<ImageMetadata>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        image.hold(cx);
+        cx.on_release(|this, cx| this.image.clone().let_go(cx))
+            .detach();
+        Self {
+            id,
+            file,
+            image,
+            reload_task: None,
+            image_metadata,
+        }
+    }
+
     pub fn compute_metadata_from_bytes(image_bytes: &[u8]) -> Result<ImageMetadata> {
         let image_format = image::guess_format(image_bytes)?;
         // Only the header is read: no pixels are decoded, so a picture the decoder cannot draw
@@ -182,14 +201,20 @@ impl ImageItem {
 
         let content = local_file.load_bytes(cx);
         self.reload_task = Some(cx.spawn(async move |this, cx| {
-            if let Some(image) = content
+            if let Some((image, image_metadata)) = content
                 .await
                 .context("Failed to load image content")
-                .and_then(create_gpui_image)
+                .and_then(|bytes| {
+                    let image_metadata = Self::compute_metadata_from_bytes(&bytes).log_err();
+                    Ok((create_gpui_image(bytes)?, image_metadata))
+                })
                 .log_err()
             {
                 this.update(cx, |this, cx| {
-                    this.image = image;
+                    image.hold(cx);
+                    let displaced = std::mem::replace(&mut this.image, image);
+                    displaced.let_go(cx);
+                    this.image_metadata = image_metadata;
                     cx.emit(ImageItemEvent::Reloaded);
                 })
                 .log_err();
@@ -277,6 +302,11 @@ struct RemoteImageStore {
     loading_remote_images_by_id: HashMap<ImageId, LoadingRemoteImage>,
     remote_image_listeners:
         HashMap<ImageId, Vec<oneshot::Sender<anyhow::Result<Entity<ImageItem>>>>>,
+    /// Images delivered with no waiter yet. The server sends an image only in reply to an
+    /// `OpenImageByPath` (`headless_project.rs`, `handle_open_image_by_path`), and that request's
+    /// response makes it call `wait_for_remote_image` for the same id, which is the only claim.
+    /// Residual: if the request fails after the delivery, its id is unknown here and the item
+    /// stays until the store is dropped.
     loaded_images: HashMap<ImageId, Entity<ImageItem>>,
 }
 
@@ -484,12 +514,6 @@ impl ImageStore {
                 remote.handle_create_image_for_peer(envelope, &worktree_store, cx)
             })?;
             if let Some(image) = image {
-                remote.update(cx, |this, cx| {
-                    let image = image.clone();
-                    let image_id = image.read(cx).id;
-                    this.loaded_images.insert(image_id, image)
-                });
-
                 self.add_image(image, cx)?;
             }
         }
@@ -574,18 +598,22 @@ impl RemoteImageStore {
                             .context("invalid file in image state")?,
                     );
 
-                    let entity = cx.new(|_cx| ImageItem {
-                        id: image_id,
-                        file,
-                        image,
-                        image_metadata,
-                        reload_task: None,
-                    });
+                    let entity =
+                        cx.new(|cx| ImageItem::new(image_id, file, image, image_metadata, cx));
 
-                    if let Some(listeners) = self.remote_image_listeners.remove(&image_id) {
-                        for listener in listeners {
-                            listener.send(Ok(entity.clone())).ok();
-                        }
+                    // Kept unless a waiter received it: one that did holds it, and keeping it as
+                    // well would hold it after its last view closed. A waiter that was dropped
+                    // before delivery took nothing, so the item stays for the next one that asks.
+                    let delivered = self
+                        .remote_image_listeners
+                        .remove(&image_id)
+                        .into_iter()
+                        .flatten()
+                        .fold(false, |delivered, listener| {
+                            listener.send(Ok(entity.clone())).is_ok() || delivered
+                        });
+                    if !delivered {
+                        self.loaded_images.insert(image_id, entity.clone());
                     }
 
                     Ok(Some(entity))
@@ -619,12 +647,14 @@ impl ImageStoreImpl for Entity<LocalImageStore> {
             let LoadedBinaryFile { file, content } = load_file.await?;
             let image = create_gpui_image(content)?;
 
-            let entity = cx.new(|cx| ImageItem {
-                id: cx.entity_id().as_non_zero_u64().into(),
-                file: file.clone(),
-                image,
-                image_metadata: None,
-                reload_task: None,
+            let entity = cx.new(|cx| {
+                ImageItem::new(
+                    cx.entity_id().as_non_zero_u64().into(),
+                    file.clone(),
+                    image,
+                    None,
+                    cx,
+                )
             });
 
             let image_id = cx.read_entity(&entity, |model, _| model.id);
@@ -904,4 +934,293 @@ fn create_gpui_image(content: Vec<u8>) -> anyhow::Result<Arc<gpui::Image>> {
         },
         content,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clock::ReplicaId;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use rpc::{NoopProtoClient, TypedEnvelope};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    fn png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn envelope(
+        variant: proto::create_image_for_peer::Variant,
+    ) -> TypedEnvelope<proto::CreateImageForPeer> {
+        TypedEnvelope {
+            sender_id: proto::PeerId::default(),
+            original_sender_id: None,
+            message_id: 0,
+            payload: proto::CreateImageForPeer {
+                project_id: 0,
+                peer_id: None,
+                variant: Some(variant),
+            },
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    async fn remote_store(
+        cx: &mut TestAppContext,
+        client: AnyProtoClient,
+    ) -> (Entity<ImageStore>, Entity<RemoteImageStore>, ImageId) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let project = crate::Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+        let metadata = project.read_with(cx, |project, cx| {
+            let mut metadata = project
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .metadata_proto();
+            metadata.id = 77;
+            metadata
+        });
+        let remote_worktree = cx.update(|cx| {
+            Worktree::remote(
+                0,
+                ReplicaId::REMOTE_SERVER,
+                metadata,
+                AnyProtoClient::new(NoopProtoClient::new()),
+                util::paths::PathStyle::local(),
+                cx,
+            )
+        });
+        worktree_store.update(cx, |store, cx| store.add(&remote_worktree, cx));
+        let store = cx.new(|cx| ImageStore::remote(worktree_store, client, 0, cx));
+        let remote = store.read_with(cx, |store, _| store.state.as_remote().unwrap());
+        (store, remote, ImageId::from(NonZeroU64::new(5).unwrap()))
+    }
+
+    /// Answers every request once `respond` is sent, so a test can deliver the image first.
+    struct GatedClient {
+        noop: Arc<NoopProtoClient>,
+        respond: parking_lot::Mutex<Vec<oneshot::Receiver<()>>>,
+    }
+
+    impl rpc::ProtoClient for GatedClient {
+        fn request(
+            &self,
+            _: proto::Envelope,
+            _: &'static str,
+        ) -> futures::future::BoxFuture<'static, Result<proto::Envelope>> {
+            let gate = self.respond.lock().pop().unwrap();
+            Box::pin(async move {
+                gate.await?;
+                Ok(rpc::proto::EnvelopedMessage::into_envelope(
+                    proto::OpenImageResponse { image_id: 5 },
+                    0,
+                    None,
+                    None,
+                ))
+            })
+        }
+        fn send(&self, _: proto::Envelope, _: &'static str) -> Result<()> {
+            Ok(())
+        }
+        fn send_response(&self, _: proto::Envelope, _: &'static str) -> Result<()> {
+            Ok(())
+        }
+        fn message_handler_set(&self) -> &parking_lot::Mutex<rpc::ProtoMessageHandlerSet> {
+            self.noop.message_handler_set()
+        }
+        fn is_via_collab(&self) -> bool {
+            false
+        }
+        fn has_wsl_interop(&self) -> bool {
+            false
+        }
+    }
+
+    fn deliver_image(store: &Entity<ImageStore>, path: &str, cx: &mut TestAppContext) {
+        let bytes = png();
+        store
+            .update(cx, |store, cx| {
+                store.handle_create_image_for_peer(
+                    envelope(proto::create_image_for_peer::Variant::State(
+                        proto::ImageState {
+                            id: 5,
+                            file: Some(proto::File {
+                                worktree_id: 77,
+                                entry_id: None,
+                                path: path.into(),
+                                mtime: None,
+                                is_deleted: false,
+                                is_historic: false,
+                            }),
+                            content_size: bytes.len() as u64,
+                            format: "png".into(),
+                        },
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+        store
+            .update(cx, |store, cx| {
+                store.handle_create_image_for_peer(
+                    envelope(proto::create_image_for_peer::Variant::Chunk(
+                        proto::ImageChunk {
+                            image_id: 5,
+                            data: bytes,
+                        },
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+    }
+
+    /// A second open of a path, made after the image arrived but before the first open's response,
+    /// must not strand the first.
+    #[gpui::test]
+    async fn two_opens_of_one_path_across_delivery_and_response_both_resolve(
+        cx: &mut TestAppContext,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let client = AnyProtoClient::new(Arc::new(GatedClient {
+            noop: NoopProtoClient::new(),
+            respond: parking_lot::Mutex::new(vec![rx]),
+        }));
+        let (store, _remote, _image_id) = remote_store(cx, client).await;
+        let path = ProjectPath {
+            worktree_id: WorktreeId::from_proto(77),
+            path: RelPath::unix("a.png").unwrap().into(),
+        };
+        let first = store.update(cx, |store, cx| store.open_image(path.clone(), cx));
+        cx.run_until_parked();
+        deliver_image(&store, "a.png", cx);
+        let second = store
+            .update(cx, |store, cx| store.open_image(path, cx))
+            .await
+            .unwrap();
+        tx.send(()).unwrap();
+        let first = first.await.unwrap();
+        assert_eq!(first, second);
+
+        let weak = first.downgrade();
+        drop((first, second));
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "the store kept the item");
+    }
+
+    /// Only the request's own wait claims the handoff, so dropping a second handle before the
+    /// response cannot strand the first.
+    #[gpui::test]
+    async fn a_second_open_dropped_before_the_response_does_not_strand_the_first(
+        cx: &mut TestAppContext,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let client = AnyProtoClient::new(Arc::new(GatedClient {
+            noop: NoopProtoClient::new(),
+            respond: parking_lot::Mutex::new(vec![rx]),
+        }));
+        let (store, _remote, _image_id) = remote_store(cx, client).await;
+        let path = ProjectPath {
+            worktree_id: WorktreeId::from_proto(77),
+            path: RelPath::unix("a.png").unwrap().into(),
+        };
+        let first = store.update(cx, |store, cx| store.open_image(path.clone(), cx));
+        cx.run_until_parked();
+        deliver_image(&store, "a.png", cx);
+        let second = store
+            .update(cx, |store, cx| store.open_image(path, cx))
+            .await
+            .unwrap();
+        drop(second);
+        cx.run_until_parked();
+        tx.send(()).unwrap();
+        let first = first.await.unwrap();
+
+        let weak = first.downgrade();
+        drop(first);
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "the store kept the item");
+    }
+
+    /// The server names the image by the path it resolved, which may differ from the requested
+    /// one; an open of that other path meanwhile must not take the first request's handoff.
+    #[gpui::test]
+    async fn a_request_whose_image_names_another_path_still_resolves(cx: &mut TestAppContext) {
+        let (tx, rx) = oneshot::channel();
+        let client = AnyProtoClient::new(Arc::new(GatedClient {
+            noop: NoopProtoClient::new(),
+            respond: parking_lot::Mutex::new(vec![rx]),
+        }));
+        let (store, _remote, _image_id) = remote_store(cx, client).await;
+        let project_path = |name: &str| ProjectPath {
+            worktree_id: WorktreeId::from_proto(77),
+            path: RelPath::unix(name).unwrap().into(),
+        };
+        let first = store.update(cx, |store, cx| store.open_image(project_path("a.png"), cx));
+        cx.run_until_parked();
+        deliver_image(&store, "b.png", cx);
+        let other = store
+            .update(cx, |store, cx| store.open_image(project_path("b.png"), cx))
+            .await
+            .unwrap();
+        drop(other);
+        cx.run_until_parked();
+        tx.send(()).unwrap();
+        let first = first.await.unwrap();
+
+        let weak = first.downgrade();
+        drop(first);
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "the store kept the item");
+    }
+
+    /// An item handed to a waiter is held by the waiter and its views alone: the store keeps no
+    /// second strong reference, so closing the last view releases it.
+    #[gpui::test]
+    async fn an_image_delivered_to_a_waiter_is_not_kept_by_the_store(cx: &mut TestAppContext) {
+        let (store, remote, image_id) =
+            remote_store(cx, AnyProtoClient::new(NoopProtoClient::new())).await;
+        let waiting = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        deliver_image(&store, "a.png", cx);
+        let item = waiting.await.unwrap();
+
+        let weak = item.downgrade();
+        drop(item);
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "the store kept an item it had already delivered"
+        );
+    }
+
+    /// A waiter that was dropped before the image arrived took nothing, so the store keeps the item
+    /// for the next one that asks.
+    #[gpui::test]
+    async fn an_image_no_waiter_received_is_kept_for_the_next_one(cx: &mut TestAppContext) {
+        let (store, remote, image_id) =
+            remote_store(cx, AnyProtoClient::new(NoopProtoClient::new())).await;
+        let abandoned = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        drop(abandoned);
+        cx.run_until_parked();
+        deliver_image(&store, "a.png", cx);
+
+        let later = remote.update(cx, |remote, cx| remote.wait_for_remote_image(image_id, cx));
+        later.await.unwrap();
+    }
 }

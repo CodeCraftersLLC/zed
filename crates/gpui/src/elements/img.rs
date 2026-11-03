@@ -565,6 +565,15 @@ impl ImageSource {
         }
     }
 
+    pub(crate) fn peek_data(&self, cx: &App) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        match self {
+            ImageSource::Image(data) => cx.peek_asset::<AssetLogger<ImageDecoder>>(data),
+            ImageSource::Render(data) => Some(Ok(data.to_owned())),
+            ImageSource::Resource(resource) => cx.peek_asset::<ImgResourceLoader>(resource),
+            ImageSource::Custom(_) => None,
+        }
+    }
+
     /// Remove this image source from the asset system
     pub fn remove_asset(&self, cx: &mut App) {
         match self {
@@ -717,7 +726,7 @@ impl From<image::ImageError> for ImageCacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ParentElement as _, TestAppContext, canvas, div, point, px, size};
+    use crate::{ImageFormat, ParentElement as _, TestAppContext, canvas, div, point, px, size};
     use image::{Frame, ImageBuffer, Rgba};
     use smallvec::SmallVec;
 
@@ -744,6 +753,51 @@ mod tests {
                 });
             },
         )
+    }
+
+    /// Letting go of an image that was never drawn must not start decoding it.
+    #[gpui::test]
+    fn letting_go_of_an_undrawn_image_starts_no_decode(cx: &mut TestAppContext) {
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, vec![0]));
+        let window = cx.add_empty_window();
+        window.update(|_, cx| {
+            image.hold(cx);
+            image.clone().let_go(cx);
+        });
+        window.update(|_, _| {});
+        assert!(
+            !cx.executor().tick(),
+            "letting go started a decode of the undrawn image"
+        );
+    }
+
+    /// The picture goes when the last holder of its id lets go, not before.
+    #[gpui::test]
+    fn a_drawn_image_is_dropped_by_its_last_holder(cx: &mut TestAppContext) {
+        let png = {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            bytes
+        };
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, png.clone()));
+        let same_bytes = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+        let window = cx.add_empty_window();
+        window.update(|window, cx| {
+            image.hold(cx);
+            same_bytes.hold(cx);
+            image.clone().get_render_image(window, cx);
+        });
+        window.run_until_parked();
+
+        window.update(|_, cx| image.clone().let_go(cx));
+        window.update(|_, cx| assert!(same_bytes.clone().decoded(cx).is_some()));
+        window.update(|_, cx| same_bytes.clone().let_go(cx));
+        window.update(|_, cx| assert!(image.clone().decoded(cx).is_none()));
     }
 
     #[gpui::test]

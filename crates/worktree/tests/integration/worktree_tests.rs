@@ -1616,6 +1616,101 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
     );
 }
 
+/// Requests the scanner takes together can name one unlisted folder many times, as when many
+/// files beneath it are asked for at once: it is listed once.
+#[gpui::test]
+async fn test_a_folder_named_many_times_in_one_scan_request_is_listed_once(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".gitignore": "vendor\n",
+            "vendor": { "a.js": "a", "b.js": "b" },
+        }),
+    )
+    .await;
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    let listings_before = fs.read_dir_call_count();
+
+    tree.read_with(cx, |tree, _| {
+        let vendor: Arc<RelPath> = rel_path("vendor").into();
+        drop(
+            tree.as_local()
+                .unwrap()
+                .refresh_entries_for_paths(vec![vendor; 20]),
+        );
+    });
+    cx.executor().run_until_parked();
+
+    tree.read_with(cx, |tree, _| {
+        assert!(tree.entry_for_path(rel_path("vendor/b.js")).is_some());
+    });
+    assert_eq!(fs.read_dir_call_count() - listings_before, 1);
+}
+
+/// Different files that share one unlisted folder are different requests for it, and the folder is
+/// still listed once while each file is loaded.
+#[gpui::test]
+async fn test_distinct_files_in_one_unlisted_folder_list_it_once(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".gitignore": "vendor\n",
+            "vendor": { "a.js": "a", "b.js": "b", "c.js": "c" },
+        }),
+    )
+    .await;
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    let listings_before = fs.read_dir_call_count();
+
+    tree.read_with(cx, |tree, _| {
+        let paths = ["vendor/a.js", "vendor/b.js", "vendor/c.js", "vendor/a.js"]
+            .map(|path| -> Arc<RelPath> { rel_path(path).into() });
+        drop(
+            tree.as_local()
+                .unwrap()
+                .refresh_entries_for_paths(paths.to_vec()),
+        );
+    });
+    cx.executor().run_until_parked();
+
+    tree.read_with(cx, |tree, _| {
+        for file in ["vendor/a.js", "vendor/b.js", "vendor/c.js"] {
+            assert!(tree.entry_for_path(rel_path(file)).is_some(), "{file}");
+        }
+    });
+    assert_eq!(fs.read_dir_call_count() - listings_before, 1);
+}
+
 #[gpui::test]
 async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
     init_test(cx);
@@ -4847,6 +4942,364 @@ async fn test_load_file_encoding(cx: &mut TestAppContext) {
         let err_msg = loaded.unwrap_err().to_string();
         println!("Got expected error for {}: {}", case.name, err_msg);
     }
+}
+
+#[gpui::test]
+async fn write_file_refuses_when_the_worktree_root_is_gone(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    let dir = TempTree::new(json!({ "repo": { "src": { "lib.rs": "old" } } }));
+    let root = dir.path().join("repo");
+
+    let worktree = Worktree::local(
+        root.as_path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    let moved = dir.path().join("repo-moved");
+    std::fs::rename(&root, &moved).unwrap();
+
+    let error = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("was moved or deleted")
+            && error
+                .to_string()
+                .contains("Your edits are kept in the editor"),
+        "{error}"
+    );
+    assert!(!root.exists(), "the vanished root must not be recreated");
+    assert_eq!(
+        std::fs::read_to_string(moved.join("src/lib.rs")).unwrap(),
+        "old"
+    );
+}
+
+/// A save below a repository folder that may be entered but not listed still lands: telling the
+/// folder from a replacement must not need to read it.
+#[cfg(unix)]
+#[gpui::test]
+async fn write_file_saves_below_a_root_that_cannot_be_listed(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+    let dir = TempTree::new(json!({ "repo": { "src": { "lib.rs": "old" } } }));
+    let root = dir.path().join("repo");
+
+    let worktree = Worktree::local(
+        root.as_path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let saved = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    saved.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        "new"
+    );
+}
+
+/// A repository folder that could not be opened when the worktree was opened is still told from a
+/// replacement: it is identified without being read.
+#[cfg(unix)]
+#[gpui::test]
+async fn write_file_refuses_a_replacement_of_a_root_that_could_not_be_opened(
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+    let dir = TempTree::new(json!({ "repo": { "src": { "lib.rs": "old" } } }));
+    let root = dir.path().join("repo");
+    let moved = dir.path().join("moved");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let worktree = Worktree::local(
+        root.as_path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    std::fs::rename(&root, &moved).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    let saved = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await;
+    std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error = saved.unwrap_err();
+    assert!(
+        error.to_string().contains("was replaced by another folder"),
+        "{error}"
+    );
+    assert!(!root.join("src/lib.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(moved.join("src/lib.rs")).unwrap(),
+        "old"
+    );
+}
+
+/// A repository folder that was there when the worktree was opened but could not be identified
+/// gives a save nothing to check against, so the save is refused rather than bound to whatever
+/// folder is there now.
+#[gpui::test]
+async fn write_file_refuses_below_a_root_that_could_not_be_identified(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({ "repo": { "src": { "lib.rs": "old" } } }))
+        .await;
+    fs.refuse_identity("/root/repo", "identity unavailable".into());
+
+    let worktree = Worktree::local(
+        Path::new("/root/repo"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    fs.allow_identity("/root/repo");
+
+    let error = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be confirmed as the folder that was opened"),
+        "{error}"
+    );
+    assert_eq!(
+        fs.load(Path::new("/root/repo/src/lib.rs")).await.unwrap(),
+        "old"
+    );
+}
+
+/// A save bound to a repository folder that was moved must not write into a different folder
+/// created at the old path, even after the worktree has scanned that folder as its root.
+#[gpui::test]
+async fn write_file_refuses_when_another_folder_replaced_the_worktree_root(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({ "repo": { "src": { "lib.rs": "old" } } }))
+        .await;
+
+    let worktree = Worktree::local(
+        Path::new("/root/repo"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    // Both changes reach the scanner together, so it sees a folder at the root's path and scans
+    // it as the root instead of following the original folder to its new place.
+    fs.pause_events();
+    fs.rename(
+        Path::new("/root/repo"),
+        Path::new("/root/moved"),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    fs.create_dir(Path::new("/root/repo")).await.unwrap();
+    fs.unpause_events_and_flush();
+    cx.executor().run_until_parked();
+
+    let replacement = fs
+        .metadata(Path::new("/root/repo"))
+        .await
+        .unwrap()
+        .unwrap()
+        .inode;
+    worktree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.root_entry().map(|entry| entry.inode),
+            Some(replacement),
+            "the scanner has taken the replacement as the root"
+        );
+        assert_eq!(tree.abs_path().as_ref(), Path::new("/root/repo"));
+    });
+
+    let error = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("was replaced by another folder"),
+        "{error}"
+    );
+    assert!(!fs.is_file(Path::new("/root/repo/src/lib.rs")).await);
+    assert_eq!(
+        fs.load(Path::new("/root/moved/src/lib.rs")).await.unwrap(),
+        "old"
+    );
+}
+
+/// A worktree opened before its folder existed binds its saves to the first folder a save finds
+/// there, and refuses another folder that later takes that one's place.
+#[gpui::test]
+async fn write_file_binds_a_root_created_after_opening_to_the_first_folder_it_saves_into(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({})).await;
+
+    let worktree = Worktree::local(
+        Path::new("/root/repo"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+    fs.create_dir(Path::new("/root/repo")).await.unwrap();
+    cx.executor().run_until_parked();
+
+    let save = |text: &'static str, cx: &mut TestAppContext| {
+        worktree.update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                text.into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+    };
+    save("first", cx).await.unwrap();
+    assert_eq!(
+        fs.load(Path::new("/root/repo/src/lib.rs")).await.unwrap(),
+        "first"
+    );
+    assert!(
+        worktree.read_with(cx, |tree, _| tree.as_local().unwrap().root_is_pinned()),
+        "the folder bound by the first save is held open, so its identity cannot be reused"
+    );
+
+    fs.pause_events();
+    fs.rename(
+        Path::new("/root/repo"),
+        Path::new("/root/moved"),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    fs.create_dir(Path::new("/root/repo")).await.unwrap();
+    fs.unpause_events_and_flush();
+    cx.executor().run_until_parked();
+
+    let error = save("second", cx).await.unwrap_err();
+    assert!(
+        error.to_string().contains("was replaced by another folder"),
+        "{error}"
+    );
+    assert!(!fs.is_file(Path::new("/root/repo/src/lib.rs")).await);
+    assert_eq!(
+        fs.load(Path::new("/root/moved/src/lib.rs")).await.unwrap(),
+        "first"
+    );
 }
 
 #[gpui::test]

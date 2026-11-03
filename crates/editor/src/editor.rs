@@ -10850,7 +10850,7 @@ impl Editor {
                     })
             });
             vec![HighlightedText {
-                text: text.into(),
+                text: util::display_name::display_name(&text).into_owned().into(),
                 highlights: vec![],
             }]
         } else {

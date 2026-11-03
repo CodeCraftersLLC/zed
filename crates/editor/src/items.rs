@@ -687,18 +687,16 @@ impl Item for Editor {
             .and_then(|buffer| buffer.read(cx).file())
             .and_then(|file| File::from_dyn(Some(file)))
         {
+            let path = file.worktree.read(cx).absolutize(&file.path);
             Some(
-                file.worktree
-                    .read(cx)
-                    .absolutize(&file.path)
-                    .compact()
-                    .to_string_lossy()
+                util::display_name::display_name(&path.compact().to_string_lossy())
                     .into_owned()
                     .into(),
             )
         } else {
             let title = multi_buffer.title(cx);
-            (!title.is_empty()).then(|| title.to_string().into())
+            (!title.is_empty())
+                .then(|| util::display_name::display_name(&title).into_owned().into())
         }
     }
 
@@ -707,14 +705,16 @@ impl Item for Editor {
     }
 
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
-        if let Some(path) = path_for_buffer(&self.buffer, detail, true, cx) {
-            path.to_string().into()
+        let title = if let Some(path) = path_for_buffer(&self.buffer, detail, true, cx) {
+            path.to_string()
         } else {
             // Use the same logic as the displayed title for consistency
-            self.buffer.read(cx).title(cx).to_string().into()
-        }
+            self.buffer.read(cx).title(cx).to_string()
+        };
+        util::display_name::display_name(&title).into_owned().into()
     }
 
+    /// The real name: Save As proposes what is on disk, not what the display hook draws.
     fn suggested_filename(&self, cx: &App) -> SharedString {
         self.buffer.read(cx).title(cx).to_string().into()
     }
@@ -767,7 +767,7 @@ impl Item for Editor {
             }
 
             Some(util::truncate_and_trailoff(
-                description,
+                &util::display_name::display_name(description),
                 params.max_title_len.unwrap_or(MAX_TAB_TITLE_LEN),
             ))
         });
@@ -787,10 +787,10 @@ impl Item for Editor {
             })
             .child(
                 Label::new(if params.truncate_title_middle {
-                    self.title(cx).to_string()
+                    util::display_name::display_name(&self.title(cx)).into_owned()
                 } else {
                     util::truncate_and_trailoff(
-                        &self.title(cx),
+                        &util::display_name::display_name(&self.title(cx)),
                         params.max_title_len.unwrap_or(MAX_TAB_TITLE_LEN),
                     )
                 })
@@ -2775,6 +2775,186 @@ mod tests {
                 "buffer path must reflect the renamed file, got {path:?}"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn tab_text_and_tooltip_use_the_display_name_but_save_as_keeps_the_real_name(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({ "we\u{200B}ird.rs": "fn main() {}" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/we\u{200B}ird.rs"), cx)
+            })
+            .await
+            .unwrap();
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            Editor::for_buffer(buffer, Some(project.clone()), window, cx)
+        });
+
+        let hook = util::display_name::install_hook_for_test(Arc::new(|name: &str| {
+            std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+        }));
+        let (tab_text, tooltip, suggested) = editor.read_with(cx, |editor, cx| {
+            (
+                editor.tab_content_text(0, cx),
+                editor.tab_tooltip_text(cx).unwrap(),
+                editor.suggested_filename(cx),
+            )
+        });
+        drop(hook);
+
+        assert_eq!(tab_text, "we<U+200B>ird.rs");
+        assert!(tooltip.ends_with("we<U+200B>ird.rs"), "{tooltip}");
+        assert_eq!(suggested, "we\u{200B}ird.rs");
+    }
+
+    /// A workspace window whose pane shows `dir/we<ZWSP>ird.rs` and has a breadcrumbs toolbar
+    /// item, while a display name hook that escapes the zero width space is installed.
+    async fn weird_file_in_a_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) -> (&mut VisualTestContext, util::display_name::TestHook) {
+        init_test(cx, |_| {});
+        let hook = util::display_name::install_hook_for_test(Arc::new(|name: &str| {
+            std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+        }));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({ "dir": { "we\u{200B}ird.rs": "fn main() {}" } }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/dir/we\u{200B}ird.rs"), cx)
+            })
+            .await
+            .unwrap();
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            let breadcrumbs = cx.new(|_| breadcrumbs::Breadcrumbs::new());
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.toolbar()
+                    .update(cx, |toolbar, cx| toolbar.add_item(breadcrumbs, window, cx))
+            });
+            let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project), window, cx));
+            workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        (cx, hook)
+    }
+
+    fn assert_no_raw_zero_width_space(drawn: &[gpui::SharedString]) {
+        assert!(
+            !drawn.iter().any(|text| text.contains('\u{200B}')),
+            "{drawn:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_drawn_tab_title_is_the_display_name(cx: &mut gpui::TestAppContext) {
+        let (cx, _hook) = weird_file_in_a_workspace(cx).await;
+        let drawn = cx.redraw_text();
+        assert!(
+            drawn.iter().any(|text| text == "we<U+200B>ird.rs"),
+            "{drawn:?}"
+        );
+        assert_no_raw_zero_width_space(&drawn);
+    }
+
+    #[gpui::test]
+    async fn the_drawn_tab_tooltip_is_the_display_name(cx: &mut gpui::TestAppContext) {
+        let (cx, _hook) = weird_file_in_a_workspace(cx).await;
+        let tab = cx.debug_bounds("TAB-0").expect("the tab was drawn");
+        cx.simulate_mouse_move(tab.center(), None, gpui::Modifiers::none());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let drawn = cx.redraw_text();
+        assert!(
+            drawn
+                .iter()
+                .any(|text| text == path!("/root/dir/we<U+200B>ird.rs")),
+            "{drawn:?}"
+        );
+        assert_no_raw_zero_width_space(&drawn);
+    }
+
+    #[gpui::test]
+    async fn the_drawn_breadcrumb_is_the_display_name(cx: &mut gpui::TestAppContext) {
+        let (cx, _hook) = weird_file_in_a_workspace(cx).await;
+        let drawn = cx.redraw_text();
+        assert!(
+            drawn
+                .iter()
+                .any(|text| text.ends_with("dir/we<U+200B>ird.rs")),
+            "{drawn:?}"
+        );
+        assert_no_raw_zero_width_space(&drawn);
+    }
+
+    /// The file header above each file of a multibuffer, as the combined Local
+    /// Changes diff draws them, names a file the way the tab does.
+    #[gpui::test]
+    async fn the_drawn_buffer_header_is_the_display_name(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let hook = util::display_name::install_hook_for_test(Arc::new(|name: &str| {
+            std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+        }));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({ "d\u{200B}ir": { "we\u{200B}ird.rs": "fn main() {}\n" } }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/d\u{200B}ir/we\u{200B}ird.rs"), cx)
+            })
+            .await
+            .unwrap();
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(language::Capability::ReadWrite);
+            let path = multi_buffer::PathKey::for_buffer(&buffer, cx);
+            multibuffer.set_excerpts_for_path(
+                path,
+                buffer.clone(),
+                [text::Point::new(0, 0)..text::Point::new(0, 12)],
+                0,
+                cx,
+            );
+            multibuffer
+        });
+        let (_editor, cx) = cx.add_window_view(|window, cx| {
+            Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        let drawn = cx.redraw_text();
+        drop(hook);
+
+        assert!(
+            drawn.iter().any(|text| text == "we<U+200B>ird.rs"),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|text| text.contains("d<U+200B>ir")),
+            "{drawn:?}"
+        );
+        assert_no_raw_zero_width_space(&drawn);
     }
 
     // Regression test for https://github.com/zed-industries/zed/issues/35947

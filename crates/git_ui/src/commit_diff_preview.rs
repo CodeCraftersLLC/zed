@@ -69,6 +69,9 @@ pub enum NoPreviewReason {
 pub struct BinaryBlob {
     pub size: u64,
     pub image: Option<Arc<gpui::Image>>,
+    /// The picture's real width and height in pixels, when its header was read. A reduced
+    /// picture keeps the size of the image it was reduced from.
+    pub dimensions: Option<(u32, u32)>,
     pub reason: Option<NoPreviewReason>,
 }
 
@@ -804,16 +807,21 @@ fn status_label(status: &CommitDiffPreviewStatus) -> &'static str {
     }
 }
 
-/// What the "before" or "after" half of a card says: the size, and when there is
-/// no picture, why. A side the card shows but knows nothing about says so.
-fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
+/// What the "before" or "after" half of a card says: the size, the pixel size of a picture, and
+/// when nothing is drawn, why. A side the card shows but knows nothing about says so. This is the
+/// one caption for a picture, wherever it is drawn.
+pub fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
     let Some(blob) = blob else {
         return "Binary file, size unknown".to_string();
     };
     let size = format_binary_size(blob.size);
-    let reduced = matches!(blob.reason, Some(NoPreviewReason::TooManyPixels { .. }));
-    if blob.image.is_some() && !reduced {
-        return size;
+    let pixels = |width: u32, height: u32| format!("Image, {size}, {width} \u{d7} {height} px");
+    let drawn = blob.image.is_some();
+    if drawn && !matches!(blob.reason, Some(NoPreviewReason::TooManyPixels { .. })) {
+        return match blob.dimensions {
+            Some((width, height)) => pixels(width, height),
+            None => size,
+        };
     }
     match blob.reason {
         Some(NoPreviewReason::TooLargeToPreview { limit: Some(limit) }) => {
@@ -829,7 +837,12 @@ fn binary_blob_caption(blob: Option<&BinaryBlob>) -> String {
             format!("{size} \u{2014} not previewed (preview limit reached)")
         }
         Some(NoPreviewReason::TooManyPixels { width, height }) => {
-            format!("Image, {size}, {width} \u{d7} {height} px (too large to preview)")
+            let note = if drawn {
+                "reduced for preview"
+            } else {
+                "too large to preview"
+            };
+            format!("{} ({note})", pixels(width, height))
         }
         Some(NoPreviewReason::Undecodable) => format!("Image, {size} (could not be decoded)"),
         Some(NoPreviewReason::NotAnImage) => format!("Binary, {size} (no preview)"),
@@ -1016,18 +1029,30 @@ mod tests {
         let shown = BinaryBlob {
             size: 2048,
             image: Some(image),
+            dimensions: None,
             reason: None,
         };
         let binary = BinaryBlob {
             size: 30 * 1024 * 1024,
             image: None,
+            dimensions: None,
             reason: Some(NoPreviewReason::NotAnImage),
         };
         assert_eq!(binary_blob_caption(None), "Binary file, size unknown");
         assert_eq!(binary_blob_caption(Some(&shown)), "2.0 KB");
+        let sized = BinaryBlob {
+            dimensions: Some((640, 480)),
+            ..shown.clone()
+        };
+        assert_eq!(
+            binary_blob_caption(Some(&sized)),
+            "Image, 2.0 KB, 640 \u{d7} 480 px",
+            "a drawn picture names its pixel size"
+        );
         let reduced = BinaryBlob {
             size: 775 * 1024 + 205,
             image: shown.image,
+            dimensions: Some((16_000, 16_000)),
             reason: Some(NoPreviewReason::TooManyPixels {
                 width: 16_000,
                 height: 16_000,
@@ -1035,8 +1060,8 @@ mod tests {
         };
         assert_eq!(
             binary_blob_caption(Some(&reduced)),
-            "Image, 775.2 KB, 16000 \u{d7} 16000 px (too large to preview)",
-            "a picture reduced from an image too large to decode still says so"
+            "Image, 775.2 KB, 16000 \u{d7} 16000 px (reduced for preview)",
+            "a reduced picture is not called too large to preview"
         );
         assert_eq!(
             binary_blob_caption(Some(&binary)),
@@ -1048,6 +1073,7 @@ mod tests {
         BinaryBlob {
             size,
             image: None,
+            dimensions: None,
             reason,
         }
     }

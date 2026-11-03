@@ -1,7 +1,7 @@
 use gpui::{
     App, Decorations, Entity, EventEmitter, FocusHandle, Focusable, PromptButton, PromptHandle,
-    PromptLevel, PromptResponse, RenderablePromptHandle, SharedString, TextStyleRefinement, Window,
-    div, prelude::*,
+    PromptLevel, PromptResponse, RenderablePromptHandle, Role, SharedString, TextStyleRefinement,
+    Window, div, prelude::*,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::{Settings, SettingsStore};
@@ -39,7 +39,7 @@ fn zed_prompt_renderer(
 ) -> RenderablePromptHandle {
     let renderer = cx.new({
         |cx| ZedPromptRenderer {
-            _level: level,
+            level,
             message: cx.new(|cx| Markdown::new(SharedString::new(message), None, None, cx)),
             actions: actions.iter().map(|a| a.label().to_string()).collect(),
             focus: cx.focus_handle(),
@@ -53,8 +53,33 @@ fn zed_prompt_renderer(
     handle.with_view(renderer, window, cx)
 }
 
+/// Info, warning and critical prompts must not look alike: the icon carries the severity that the
+/// text alone does not.
+fn level_icon(level: PromptLevel) -> (IconName, Color) {
+    match level {
+        PromptLevel::Info => (IconName::Info, Color::Info),
+        PromptLevel::Warning => (IconName::Warning, Color::Warning),
+        PromptLevel::Critical => (IconName::XCircle, Color::Error),
+    }
+}
+
+/// The icon is the only visual cue to the level, so assistive technology gets the level as its name.
+fn level_badge(level: PromptLevel) -> impl IntoElement {
+    let (icon, color) = level_icon(level);
+    let name = match level {
+        PromptLevel::Info => "Information",
+        PromptLevel::Warning => "Warning",
+        PromptLevel::Critical => "Error",
+    };
+    div()
+        .id("prompt-level")
+        .role(Role::Image)
+        .aria_label(name)
+        .child(Icon::new(icon).size(IconSize::Medium).color(color))
+}
+
 pub struct ZedPromptRenderer {
-    _level: PromptLevel,
+    level: PromptLevel,
     message: Entity<Markdown>,
     actions: Vec<String>,
     focus: FocusHandle,
@@ -128,10 +153,17 @@ impl Render for ZedPromptRenderer {
             .elevation_3(cx)
             .overflow_hidden()
             .font_family(settings.ui_font.family.clone())
-            .child(div().w_full().child(MarkdownElement::new(
-                self.message.clone(),
-                markdown_style(true, window, cx),
-            )))
+            .child({
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_start()
+                    .child(level_badge(self.level))
+                    .child(div().flex_1().min_w_0().child(MarkdownElement::new(
+                        self.message.clone(),
+                        markdown_style(true, window, cx),
+                    )))
+            })
             .children(self.detail.clone().map(|detail| {
                 div().w_full().text_xs().child(MarkdownElement::new(
                     detail,
@@ -210,5 +242,56 @@ impl EventEmitter<PromptResponse> for ZedPromptRenderer {}
 impl Focusable for ZedPromptRenderer {
     fn focus_handle(&self, _: &crate::App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    struct Badge(PromptLevel);
+
+    impl Render for Badge {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            level_badge(self.0)
+        }
+    }
+
+    /// The level icon is named for a screen reader, one name per level.
+    #[gpui::test]
+    async fn each_prompt_level_icon_has_an_accessible_name(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        for (level, expected) in [
+            (PromptLevel::Info, "Information"),
+            (PromptLevel::Warning, "Warning"),
+            (PromptLevel::Critical, "Error"),
+        ] {
+            let (_, cx): (_, &mut VisualTestContext) = cx.add_window_view(|_, _| Badge(level));
+            cx.enable_accessibility();
+            let tree = cx.a11y_tree().expect("accessibility tree");
+            assert!(
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.role() == Role::Image && node.label() == Some(expected)),
+                "no image named {expected:?} for {level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_prompt_level_has_its_own_icon_and_the_warning_colour() {
+        assert_eq!(level_icon(PromptLevel::Info), (IconName::Info, Color::Info));
+        assert_eq!(
+            level_icon(PromptLevel::Warning),
+            (IconName::Warning, Color::Warning)
+        );
+        assert_eq!(
+            level_icon(PromptLevel::Critical),
+            (IconName::XCircle, Color::Error)
+        );
     }
 }

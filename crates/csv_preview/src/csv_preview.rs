@@ -270,10 +270,10 @@ impl Item for CsvPreviewView {
             .and_then(|b| {
                 let file = b.read(cx).file()?;
                 let local_file = file.as_local()?;
-                local_file
-                    .abs_path(cx)
-                    .file_name()
-                    .map(|name| format!("Preview {}", name.to_string_lossy()).into())
+                local_file.abs_path(cx).file_name().map(|name| {
+                    let name = name.to_string_lossy();
+                    format!("Preview {}", util::display_name::display_name(&name)).into()
+                })
             })
             .unwrap_or_else(|| SharedString::from("CSV Preview"))
     }

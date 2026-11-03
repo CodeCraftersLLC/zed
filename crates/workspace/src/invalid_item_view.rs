@@ -62,6 +62,16 @@ const PROGRAM_OR_SHORTCUT_EXTENSIONS: &[&str] = &[
     "pkg",
     "desktop",
     "appimage",
+    "msc",
+    "msix",
+    "msixbundle",
+    "appx",
+    "appxbundle",
+    "appinstaller",
+    "application",
+    "chm",
+    "scf",
+    "wsc",
 ];
 
 fn has_program_extension(path: &Path) -> bool {
@@ -185,7 +195,7 @@ impl Item for InvalidItemView {
             path.strip_prefix(prefix).unwrap_or(path)
         };
 
-        SharedString::new(path.to_string_lossy())
+        SharedString::new(util::display_name::display_name(&path.to_string_lossy()))
     }
 
     fn added_to_workspace(
@@ -280,6 +290,16 @@ mod tests {
             "x.pyw",
             "x.pyc",
             "dir/sub/tool.cmd",
+            "x.msc",
+            "x.MSIX",
+            "x.msixbundle",
+            "x.appx",
+            "x.appxbundle",
+            "x.appinstaller",
+            "x.application",
+            "x.chm",
+            "x.scf",
+            "x.wsc",
         ] {
             assert!(has_program_extension(Path::new(name)), "{name}");
         }
@@ -314,6 +334,33 @@ mod tests {
         std::fs::write(&document, "hello").unwrap();
         assert!(!is_program_or_shortcut(&document));
         assert!(!is_program_or_shortcut(&dir.path().join("missing.txt")));
+    }
+
+    #[gpui::test]
+    fn the_tab_title_is_drawn_through_the_display_name_hook(cx: &mut gpui::TestAppContext) {
+        let error = anyhow::anyhow!("binary file");
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let view = cx.add_window(|window, cx| {
+            InvalidItemView::new(
+                Path::new("/dir/we\u{200B}ird.bin"),
+                true,
+                &error,
+                window,
+                cx,
+            )
+        });
+        let hook = util::display_name::install_hook_for_test(Arc::new(|name: &str| {
+            std::borrow::Cow::Owned(name.replace('\u{200B}', "<U+200B>"))
+        }));
+        let title = view
+            .read_with(cx, |view, cx| view.tab_content_text(0, cx))
+            .unwrap();
+        drop(hook);
+        assert_eq!(title, "we<U+200B>ird.bin");
     }
 
     #[gpui::test]

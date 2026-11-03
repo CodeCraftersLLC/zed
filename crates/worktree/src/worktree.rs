@@ -62,7 +62,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
     time::{Duration, Instant},
@@ -216,6 +216,20 @@ pub struct LocalWorktree {
     share_private_files: bool,
     scanning_enabled: bool,
     force_defer_watch: bool,
+    /// The folder saves below the root are bound to. It is set when the worktree is opened on a
+    /// folder (`None` when that folder could not be identified, which refuses saves), and, when
+    /// nothing was there, by the first save, to the folder it finds. The scanner re-reads
+    /// whatever folder is at the root's path, so only this tells the original from another
+    /// folder created there.
+    root_binding: Arc<OnceLock<Option<RootBinding>>>,
+}
+
+/// A folder's identity and, when the folder could be opened, a handle on it that keeps the
+/// identity from being given to another folder after this one is deleted (ext4 reuses a freed
+/// inode at once).
+struct RootBinding {
+    identity: fs::FileIdentity,
+    _pin: Option<Arc<dyn fs::FileHandle>>,
 }
 
 pub struct PathPrefixScanRequest {
@@ -494,6 +508,19 @@ impl Worktree {
             None
         };
 
+        let root_binding = Arc::new(OnceLock::new());
+        if metadata.is_some() {
+            let identity = match root_file_handle.as_ref().map(|handle| handle.identity()) {
+                Some(Ok(identity)) => Ok(identity),
+                _ => fs.identity(&abs_path).await,
+            };
+            let binding = identity.map(|identity| RootBinding {
+                identity,
+                _pin: root_file_handle.clone(),
+            });
+            root_binding.set(binding.warn_on_err()).ok();
+        }
+
         let root_repo_common_dir = if visible {
             discover_root_repo_common_dir(&abs_path, fs.as_ref())
                 .await
@@ -583,6 +610,7 @@ impl Worktree {
                 settings,
                 scanning_enabled,
                 force_defer_watch: false,
+                root_binding,
             };
             worktree.start_background_scanner(scan_requests_rx, path_prefixes_to_scan_rx, cx);
             Worktree::Local(worktree)
@@ -1761,11 +1789,55 @@ impl LocalWorktree {
         let fs = self.fs.clone();
         let is_private = self.is_path_private(&path);
         let abs_path = self.absolutize(&path);
+        // A file below the root is saved with its parent folders created, which would rebuild a
+        // repository folder that was moved or deleted while the file was open. A worktree that is
+        // a single file has no folder to protect.
+        // The root is bound to a folder (`root_binding`), not only to its path: a different
+        // folder created at the old path after the repository moved must not receive the save,
+        // even once the scanner has taken it as the root. A swap between this check and
+        // the write remains possible, because closing it needs descriptor-relative writes through
+        // `Fs` and a concurrent process to race it.
+        let root_to_keep =
+            (!path.is_empty()).then(|| (self.abs_path().to_path_buf(), self.root_binding.clone()));
 
         let write = cx.background_spawn({
             let fs = fs.clone();
             let abs_path = abs_path.clone();
             async move {
+                if let Some((root, root_binding)) = root_to_keep {
+                    if fs.metadata(&root).await?.is_none() {
+                        anyhow::bail!(
+                            "'{}' was moved or deleted. Your edits are kept in the editor; relocate the repository or use Save As elsewhere.",
+                            root.display()
+                        );
+                    }
+                    let live_root = fs.identity(&root).await?;
+                    if root_binding.get().is_none() {
+                        // The pin is best effort: a folder that cannot be opened even without
+                        // read access (`Fs::open_handle`) is bound by its identity alone.
+                        let pin = fs.open_handle(&root).await.ok().filter(|pin| {
+                            pin.identity()
+                                .is_ok_and(|identity| identity == live_root)
+                        });
+                        root_binding.get_or_init(|| {
+                            Some(RootBinding {
+                                identity: live_root,
+                                _pin: pin,
+                            })
+                        });
+                    }
+                    match root_binding.get().and_then(Option::as_ref) {
+                        Some(bound_root) if bound_root.identity == live_root => {}
+                        Some(_) => anyhow::bail!(
+                            "'{}' was replaced by another folder. Your edits are kept in the editor; relocate the repository or use Save As elsewhere.",
+                            root.display()
+                        ),
+                        None => anyhow::bail!(
+                            "'{}' cannot be confirmed as the folder that was opened. Your edits are kept in the editor; reopen the folder or use Save As elsewhere.",
+                            root.display()
+                        ),
+                    }
+                }
                 // For UTF-8 text whose lines all end alike, use the optimized `fs.save` which
                 // writes Rope chunks directly to disk without allocating a contiguous string.
                 if encoding == encoding_rs::UTF_8 && !has_bom && line_endings.is_uniform() {
@@ -2196,6 +2268,15 @@ impl LocalWorktree {
     pub fn set_defer_watch(&mut self, defer: bool, cx: &mut Context<Worktree>) {
         self.force_defer_watch = defer;
         self.restart_background_scanners(cx);
+    }
+
+    /// Whether the folder saves below the root are bound to is held open.
+    #[cfg(feature = "test-support")]
+    pub fn root_is_pinned(&self) -> bool {
+        self.root_binding
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(|binding| binding._pin.is_some())
     }
 
     #[cfg(feature = "test-support")]
@@ -4896,11 +4977,18 @@ impl BackgroundScanner {
         {
             let mut state = self.state.lock().await;
             let root_path = state.snapshot.abs_path.clone();
+            // A folder stays unloaded until its job runs below, so requests taken together
+            // that name it many times would otherwise list it once per name.
+            let mut enqueued = HashSet::default();
             for path in paths {
                 for ancestor in path.ancestors() {
                     if let Some(entry) = state.snapshot.entry_for_path(ancestor)
                         && entry.kind == EntryKind::UnloadedDir
                     {
+                        if !enqueued.insert(entry.id) {
+                            state.paths_to_scan.insert(path.clone());
+                            break;
+                        }
                         let abs_path = if entry.is_external {
                             entry
                                 .canonical_path

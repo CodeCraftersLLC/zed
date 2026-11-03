@@ -4561,6 +4561,7 @@ dependencies = [
  "log",
  "text",
  "ui",
+ "util",
  "workspace",
 ]
 
@@ -8937,15 +8938,20 @@ name = "image_viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "breadcrumbs",
  "db",
  "editor",
  "file_icons",
+ "fs",
  "gpui",
+ "image",
  "language",
  "log",
  "project",
  "serde",
+ "serde_json",
  "settings",
+ "theme",
  "theme_settings",
  "ui",
  "util",
@@ -17734,6 +17740,7 @@ dependencies = [
  "language",
  "multi_buffer",
  "ui",
+ "util",
  "workspace",
  "zed_actions",
 ]

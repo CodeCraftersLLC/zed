@@ -1367,62 +1367,6 @@ struct RendererContext<'t, 'a, 'b> {
     width: f32,
 }
 
-#[derive(Debug)]
-struct ClusterAnalyzer<'t> {
-    utf16_idx: usize,
-    glyph_idx: usize,
-    glyph_count: usize,
-    cluster_map: &'t [u16],
-}
-
-impl<'t> ClusterAnalyzer<'t> {
-    fn new(cluster_map: &'t [u16], glyph_count: usize) -> Self {
-        ClusterAnalyzer {
-            utf16_idx: 0,
-            glyph_idx: 0,
-            glyph_count,
-            cluster_map,
-        }
-    }
-}
-
-impl Iterator for ClusterAnalyzer<'_> {
-    type Item = (usize, usize);
-
-    fn next(&mut self) -> Option<(usize, usize)> {
-        if self.utf16_idx >= self.cluster_map.len() {
-            return None; // No more clusters
-        }
-        let start_utf16_idx = self.utf16_idx;
-        let current_glyph = self.cluster_map[start_utf16_idx] as usize;
-
-        // Find the end of current cluster (where glyph index changes)
-        let mut end_utf16_idx = start_utf16_idx + 1;
-        while end_utf16_idx < self.cluster_map.len()
-            && self.cluster_map[end_utf16_idx] as usize == current_glyph
-        {
-            end_utf16_idx += 1;
-        }
-
-        let utf16_len = end_utf16_idx - start_utf16_idx;
-
-        // Calculate glyph count for this cluster
-        let next_glyph = if end_utf16_idx < self.cluster_map.len() {
-            self.cluster_map[end_utf16_idx] as usize
-        } else {
-            self.glyph_count
-        };
-
-        let glyph_count = next_glyph - current_glyph;
-
-        // Update state for next call
-        self.utf16_idx = end_utf16_idx;
-        self.glyph_idx = next_glyph;
-
-        Some((utf16_len, glyph_count))
-    }
-}
-
 #[allow(non_snake_case)]
 impl IDWritePixelSnapping_Impl for TextRenderer_Impl {
     fn IsPixelSnappingDisabled(
@@ -1527,35 +1471,38 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         let cluster_map =
             unsafe { std::slice::from_raw_parts(desc.clusterMap, desc.stringLength as usize) };
 
-        let cluster_analyzer = ClusterAnalyzer::new(cluster_map, glyph_count);
+        // DirectWrite hands every run's glyphs and cluster map in logical order. `ShapedRun` wants
+        // them left to right, so `glyph_run_positions` returns them in drawing order, each with
+        // its logical index.
+        // A run whose cluster map is empty still places its glyphs at the run's own text.
         let mut utf16_idx = desc.textPosition as usize;
-        let mut glyph_idx = 0;
-        let mut glyphs = Vec::with_capacity(glyph_count);
-        for (cluster_utf16_len, cluster_glyph_count) in cluster_analyzer {
+        context.index_converter.advance_to_utf16_ix(utf16_idx);
+        let mut glyph_text_ix = vec![context.index_converter.utf8_ix; glyph_count];
+        for cluster in glyph_clusters(cluster_map, glyph_count) {
             context.index_converter.advance_to_utf16_ix(utf16_idx);
-            utf16_idx += cluster_utf16_len;
-            for (cluster_glyph_idx, glyph_id) in glyph_ids
-                [glyph_idx..(glyph_idx + cluster_glyph_count)]
-                .iter()
-                .enumerate()
-            {
-                let id = GlyphId(*glyph_id as u32);
-                let is_emoji =
-                    color_font && is_color_glyph(font_face, id, &context.components.factory);
-                let this_glyph_idx = glyph_idx + cluster_glyph_idx;
-                glyphs.push(ShapedGlyph {
-                    id,
-                    position: point(
-                        px(context.width + glyph_offsets[this_glyph_idx].advanceOffset),
-                        px(-glyph_offsets[this_glyph_idx].ascenderOffset),
-                    ),
-                    index: context.index_converter.utf8_ix,
-                    is_emoji,
-                });
-                context.width += glyph_advances[this_glyph_idx];
-            }
-            glyph_idx += cluster_glyph_count;
+            utf16_idx += cluster.utf16_len;
+            glyph_text_ix[cluster.glyphs].fill(context.index_converter.utf8_ix);
         }
+
+        let advance_offsets: Vec<f32> = glyph_offsets.iter().map(|o| o.advanceOffset).collect();
+        let (placed_glyphs, run_width) = glyph_run_positions(
+            glyph_advances,
+            &advance_offsets,
+            context.width,
+            glyphrun.bidiLevel & 1 == 1,
+        );
+        let mut glyphs = Vec::with_capacity(glyph_count);
+        for PlacedGlyph { glyph, x } in placed_glyphs {
+            let id = GlyphId(glyph_ids[glyph] as u32);
+            let is_emoji = color_font && is_color_glyph(font_face, id, &context.components.factory);
+            glyphs.push(ShapedGlyph {
+                id,
+                position: point(px(x), px(-glyph_offsets[glyph].ascenderOffset)),
+                index: glyph_text_ix[glyph],
+                is_emoji,
+            });
+        }
+        context.width += run_width;
         context.runs.push(ShapedRun { font_id, glyphs });
         Ok(())
     }
@@ -1879,42 +1826,92 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 
 #[cfg(test)]
 mod tests {
-    use crate::direct_write::ClusterAnalyzer;
+    // Not `super::*`: its `gpui::*` glob brings in `gpui::test`, which would shadow `#[test]`.
+    use super::DirectWriteTextSystem;
+    use crate::DirectXDevices;
+    use gpui::{FontRun, LineLayout, PlatformTextSystem, ShapedGlyph, font, px};
 
+    fn lay_out(text: &str) -> LineLayout {
+        let devices = DirectXDevices::new().expect("a Direct3D device");
+        let system = DirectWriteTextSystem::new(&devices).expect("DirectWrite");
+        let font_id = system.font_id(&font("Segoe UI")).expect("Segoe UI");
+        system.layout_line(
+            text,
+            px(16.),
+            &[FontRun {
+                len: text.len(),
+                font_id,
+            }],
+        )
+    }
+
+    /// DirectWrite itself, not a fixture: a Hebrew word between Latin words is drawn
+    /// left to right on screen, its letters in reverse logical order, and a click on
+    /// any glyph finds that glyph's own character.
     #[test]
-    fn test_cluster_map() {
-        let cluster_map = [0];
-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 1);
-        let next = analyzer.next();
-        assert_eq!(next, Some((1, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, None);
+    fn a_hebrew_word_is_laid_out_as_it_is_read() {
+        let text = "ab \u{5e9}\u{5dc}\u{5d5}\u{5dd} cd";
+        let hebrew = 3..11;
+        let layout = lay_out(text);
+        let glyphs: Vec<&ShapedGlyph> = layout.runs.iter().flat_map(|run| &run.glyphs).collect();
 
-        let cluster_map = [0, 1, 2];
-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 3);
-        let next = analyzer.next();
-        assert_eq!(next, Some((1, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, Some((1, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, Some((1, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, None);
-        // 👨‍👩‍👧‍👦👩‍💻
-        let cluster_map = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4];
-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 5);
-        let next = analyzer.next();
-        assert_eq!(next, Some((11, 4)));
-        let next = analyzer.next();
-        assert_eq!(next, Some((5, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, None);
-        // 👩‍💻
-        let cluster_map = [0, 0, 0, 0, 0];
-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 1);
-        let next = analyzer.next();
-        assert_eq!(next, Some((5, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, None);
+        let xs: Vec<f32> = glyphs.iter().map(|glyph| glyph.position.x.into()).collect();
+        assert!(
+            xs.windows(2).all(|pair| pair[0] <= pair[1]),
+            "glyphs are not left to right: {xs:?}"
+        );
+
+        let mut indices: Vec<usize> = glyphs.iter().map(|glyph| glyph.index).collect();
+        let drawn_hebrew: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|index| hebrew.contains(index))
+            .collect();
+        assert_eq!(
+            drawn_hebrew,
+            [9, 7, 5, 3],
+            "the Hebrew letters are drawn right to left"
+        );
+        indices.sort_unstable();
+        let boundaries: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
+        assert_eq!(indices, boundaries, "every character is drawn exactly once");
+
+        let width: f32 = layout.width.into();
+        let next_xs = xs.iter().copied().skip(1).chain([width]);
+        for (glyph, next_x) in glyphs.iter().zip(next_xs) {
+            let x: f32 = glyph.position.x.into();
+            if next_x > x {
+                let middle = px((x + next_x) / 2.);
+                assert_eq!(
+                    layout.index_for_x(middle),
+                    Some(glyph.index),
+                    "a click at {middle:?} finds the glyph drawn there"
+                );
+            }
+        }
+    }
+
+    /// An Arabic word joins its letters into a run DirectWrite shapes with contextual
+    /// forms; the run is still left to right on screen and keeps one index per glyph.
+    #[test]
+    fn an_arabic_word_is_laid_out_left_to_right_on_screen() {
+        let text = "x \u{633}\u{644}\u{627}\u{645} y";
+        let layout = lay_out(text);
+        let glyphs: Vec<&ShapedGlyph> = layout.runs.iter().flat_map(|run| &run.glyphs).collect();
+        let xs: Vec<f32> = glyphs.iter().map(|glyph| glyph.position.x.into()).collect();
+        assert!(
+            xs.windows(2).all(|pair| pair[0] <= pair[1]),
+            "glyphs are not left to right: {xs:?}"
+        );
+        let arabic: Vec<usize> = glyphs
+            .iter()
+            .map(|glyph| glyph.index)
+            .filter(|index| (2..10).contains(index))
+            .collect();
+        assert!(
+            arabic.windows(2).all(|pair| pair[0] >= pair[1]),
+            "the Arabic letters are drawn right to left: {arabic:?}"
+        );
+        assert!(text.is_char_boundary(*arabic.last().unwrap()));
     }
 }

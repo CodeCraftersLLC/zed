@@ -3,19 +3,30 @@
 use gpui::{AnyElement, ElementId};
 use ui::{SharedString, Tooltip, div, prelude::*};
 
-use crate::{CsvPreviewView, settings::VerticalAlignment, types::DisplayCellId};
+use crate::{
+    CsvPreviewView,
+    settings::{VerticalAlignment, cell_lines},
+    types::DisplayCellId,
+};
 
 impl CsvPreviewView {
     /// Create selectable table cell with mouse event handlers.
     pub fn create_selectable_cell(
         display_cell_id: DisplayCellId,
         cell_content: SharedString,
+        drawn_lines: &[SharedString],
         vertical_alignment: VerticalAlignment,
         cx: &Context<CsvPreviewView>,
     ) -> AnyElement {
-        create_table_cell(display_cell_id, cell_content, vertical_alignment, cx)
-            // Mouse events handlers will be here
-            .into_any_element()
+        create_table_cell(
+            display_cell_id,
+            cell_content,
+            drawn_lines,
+            vertical_alignment,
+            cx,
+        )
+        // Mouse events handlers will be here
+        .into_any_element()
     }
 }
 
@@ -23,6 +34,7 @@ impl CsvPreviewView {
 fn create_table_cell(
     display_cell_id: DisplayCellId,
     cell_content: SharedString,
+    drawn_lines: &[SharedString],
     vertical_alignment: VerticalAlignment,
     cx: &Context<'_, CsvPreviewView>,
 ) -> gpui::Stateful<Div> {
@@ -50,6 +62,6 @@ fn create_table_cell(
             VerticalAlignment::Center => div.content_center(),
         })
         .font_buffer(cx)
-        .tooltip(Tooltip::text(cell_content.clone()))
-        .child(div().child(cell_content))
+        .tooltip(Tooltip::text(cell_content))
+        .child(cell_lines(drawn_lines))
 }
