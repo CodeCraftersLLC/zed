@@ -4996,6 +4996,162 @@ async fn write_file_refuses_when_the_worktree_root_is_gone(cx: &mut TestAppConte
     );
 }
 
+/// A save below a repository folder that may be entered but not listed still lands: telling the
+/// folder from a replacement must not need to read it.
+#[cfg(unix)]
+#[gpui::test]
+async fn write_file_saves_below_a_root_that_cannot_be_listed(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+    let dir = TempTree::new(json!({ "repo": { "src": { "lib.rs": "old" } } }));
+    let root = dir.path().join("repo");
+
+    let worktree = Worktree::local(
+        root.as_path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let saved = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    saved.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        "new"
+    );
+}
+
+/// A repository folder that could not be opened when the worktree was opened is still told from a
+/// replacement: it is identified without being read.
+#[cfg(unix)]
+#[gpui::test]
+async fn write_file_refuses_a_replacement_of_a_root_that_could_not_be_opened(
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+    let dir = TempTree::new(json!({ "repo": { "src": { "lib.rs": "old" } } }));
+    let root = dir.path().join("repo");
+    let moved = dir.path().join("moved");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let worktree = Worktree::local(
+        root.as_path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    std::fs::rename(&root, &moved).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    let saved = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await;
+    std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error = saved.unwrap_err();
+    assert!(
+        error.to_string().contains("was replaced by another folder"),
+        "{error}"
+    );
+    assert!(!root.join("src/lib.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(moved.join("src/lib.rs")).unwrap(),
+        "old"
+    );
+}
+
+/// A repository folder that was there when the worktree was opened but could not be identified
+/// gives a save nothing to check against, so the save is refused rather than bound to whatever
+/// folder is there now.
+#[gpui::test]
+async fn write_file_refuses_below_a_root_that_could_not_be_identified(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({ "repo": { "src": { "lib.rs": "old" } } }))
+        .await;
+    fs.refuse_identity("/root/repo", "identity unavailable".into());
+
+    let worktree = Worktree::local(
+        Path::new("/root/repo"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| worktree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    fs.allow_identity("/root/repo");
+
+    let error = worktree
+        .update(cx, |tree, cx| {
+            tree.write_file(
+                rel_path("src/lib.rs").into(),
+                "new".into(),
+                text::LineEndings::uniform(text::LineEnding::default()),
+                encoding_rs::UTF_8,
+                false,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be confirmed as the folder that was opened"),
+        "{error}"
+    );
+    assert_eq!(
+        fs.load(Path::new("/root/repo/src/lib.rs")).await.unwrap(),
+        "old"
+    );
+}
+
 /// A save bound to a repository folder that was moved must not write into a different folder
 /// created at the old path, even after the worktree has scanned that folder as its root.
 #[gpui::test]

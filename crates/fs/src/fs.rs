@@ -141,6 +141,11 @@ pub trait Fs: Send + Sync {
     async fn remove_file(&self, path: &Path, options: RemoveOptions) -> Result<()>;
 
     async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>>;
+    /// The identity of what `path` names, following links, read without opening it for reading:
+    /// a folder that may be entered but not listed still has one.
+    async fn identity(&self, path: &Path) -> Result<FileIdentity> {
+        self.open_handle(path).await?.identity()
+    }
     async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>>;
     async fn load(&self, path: &Path) -> Result<String> {
         Ok(String::from_utf8(self.load_bytes(path).await?)?)
@@ -888,6 +893,13 @@ impl Fs for RealFs {
         Ok(Arc::new(options.open(path)?))
     }
 
+    async fn identity(&self, path: &Path) -> Result<FileIdentity> {
+        let path = path.to_path_buf();
+        self.executor
+            .spawn(async move { identity_without_reading(&path) })
+            .await
+    }
+
     async fn load(&self, path: &Path) -> Result<String> {
         let path = path.to_path_buf();
         self.executor
@@ -1396,6 +1408,7 @@ struct FakeFsState {
     file_to_create_before_watch_add: Option<(PathBuf, PathBuf)>,
     remove_dir_errors: std::collections::HashMap<PathBuf, String>,
     copy_source_refusals: std::collections::HashMap<PathBuf, String>,
+    identity_refusals: std::collections::HashMap<PathBuf, String>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1725,6 +1738,7 @@ impl FakeFs {
                 file_to_create_before_watch_add: None,
                 remove_dir_errors: Default::default(),
                 copy_source_refusals: Default::default(),
+                identity_refusals: Default::default(),
             })),
         });
 
@@ -2483,6 +2497,22 @@ impl FakeFs {
             .insert(normalize_path(path.as_ref()), message);
     }
 
+    /// Makes `path`'s identity unreadable, through `Fs::identity` and through a handle opened on
+    /// it, until [`Self::allow_identity`].
+    pub fn refuse_identity(&self, path: impl AsRef<Path>, message: String) {
+        self.state
+            .lock()
+            .identity_refusals
+            .insert(normalize_path(path.as_ref()), message);
+    }
+
+    pub fn allow_identity(&self, path: impl AsRef<Path>) {
+        self.state
+            .lock()
+            .identity_refusals
+            .remove(&normalize_path(path.as_ref()));
+    }
+
     pub fn paths(&self, include_dot_git: bool) -> Vec<PathBuf> {
         let mut result = Vec::new();
         let mut queue = collections::VecDeque::new();
@@ -2768,6 +2798,7 @@ impl Watcher for FakeWatcher {
 #[derive(Debug)]
 struct FakeHandle {
     inode: u64,
+    identity_refusal: Option<String>,
 }
 
 #[cfg(feature = "test-support")]
@@ -2786,6 +2817,9 @@ impl FileHandle for FakeHandle {
     }
 
     fn identity(&self) -> Result<FileIdentity> {
+        if let Some(message) = &self.identity_refusal {
+            anyhow::bail!("{message}");
+        }
         Ok(FileIdentity {
             device: 0,
             inode: self.inode,
@@ -3075,7 +3109,11 @@ impl Fs for FakeFs {
             FakeFsEntry::Dir { inode, .. } => *inode,
             _ => unreachable!(),
         };
-        Ok(Arc::new(FakeHandle { inode }))
+        let identity_refusal = state.identity_refusals.get(&normalize_path(path)).cloned();
+        Ok(Arc::new(FakeHandle {
+            inode,
+            identity_refusal,
+        }))
     }
 
     async fn load(&self, path: &Path) -> Result<String> {
@@ -3449,6 +3487,28 @@ fn read_recursive<'a>(
 // todo(windows)
 // can we get file id not open the file twice?
 // https://github.com/rust-lang/rust/issues/63010
+#[cfg(unix)]
+fn identity_without_reading(path: &Path) -> Result<FileIdentity> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+/// No access rights asks only for the object's attributes, which a folder whose listing is
+/// refused still grants; `std::fs::metadata` opens a path the same way.
+#[cfg(target_os = "windows")]
+fn identity_without_reading(path: &Path) -> Result<FileIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)?;
+    FileHandle::identity(&file)
+}
+
 #[cfg(target_os = "windows")]
 async fn file_id(path: impl AsRef<Path>) -> Result<u64> {
     use std::os::windows::io::AsRawHandle;

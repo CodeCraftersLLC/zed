@@ -504,6 +504,59 @@ async fn test_realfs_handle_identity_follows_its_folder_not_its_path(executor: B
     assert_ne!(identity_at(&original), opened);
 }
 
+/// A folder that may be entered but not listed still has an identity, and it is the one a handle
+/// opened on the folder reads.
+#[cfg(unix)]
+#[gpui::test]
+async fn test_realfs_identity_needs_no_read_access(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    cx.executor().allow_parking();
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let folder = temp_dir.path().join("repo");
+    std::fs::create_dir(&folder).unwrap();
+    let opened = fs.open_handle(&folder).await.unwrap().identity().unwrap();
+
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let identity = fs.identity(&folder).await;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(identity.unwrap(), opened);
+}
+
+#[gpui::test]
+async fn test_copy_recursive_creates_nothing_when_the_source_itself_is_refused(
+    executor: BackgroundExecutor,
+) {
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/outer"),
+        json!({ "tree": { "a": "A", "nested": { "z": "Z" } } }),
+    )
+    .await;
+    fs.refuse_copy_source(
+        path!("/outer/tree"),
+        "link points outside the repository".into(),
+    );
+
+    let target = Path::new(path!("/outer/copy"));
+    let error = copy_recursive(
+        fs.as_ref(),
+        Path::new(path!("/outer/tree")),
+        target,
+        Default::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("outside the repository"));
+    assert!(fs.metadata(target).await.unwrap().is_none());
+}
+
 #[gpui::test]
 async fn test_realfs_atomic_write_non_existing_file(executor: BackgroundExecutor) {
     let fs = RealFs::new(None, executor);

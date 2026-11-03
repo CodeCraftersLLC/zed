@@ -216,11 +216,13 @@ pub struct LocalWorktree {
     share_private_files: bool,
     scanning_enabled: bool,
     force_defer_watch: bool,
-    /// A handle on the folder saves below the root are bound to: the one this worktree was opened
-    /// on, or, when none could be opened then, the first one a save finds. It stays open, so its
-    /// identity is never given to another folder. The scanner re-reads whatever folder is at the
-    /// root's path, so only this tells the original from another folder created there.
-    root_binding: Arc<OnceLock<Arc<dyn fs::FileHandle>>>,
+    /// The identity of the folder saves below the root are bound to. It is set when the worktree
+    /// is opened on a folder (`None` when that folder could not be identified, which refuses
+    /// saves), and, when nothing was there, by the first save, to the folder it finds. The scanner
+    /// re-reads whatever folder is at the root's path, so only this tells the original from
+    /// another folder created there. The root file handle, when it opened, keeps the identity
+    /// from being given to another folder.
+    root_binding: Arc<OnceLock<Option<fs::FileIdentity>>>,
 }
 
 pub struct PathPrefixScanRequest {
@@ -500,8 +502,12 @@ impl Worktree {
         };
 
         let root_binding = Arc::new(OnceLock::new());
-        if let Some(handle) = root_file_handle.clone() {
-            root_binding.set(handle).ok();
+        if metadata.is_some() {
+            let identity = match root_file_handle.as_ref().map(|handle| handle.identity()) {
+                Some(Ok(identity)) => Ok(identity),
+                _ => fs.identity(&abs_path).await,
+            };
+            root_binding.set(identity.warn_on_err()).ok();
         }
 
         let root_repo_common_dir = if visible {
@@ -1794,13 +1800,18 @@ impl LocalWorktree {
                             root.display()
                         );
                     }
-                    let live_root = fs.open_handle(&root).await?;
-                    let bound_root = root_binding.get_or_init(|| live_root.clone());
-                    anyhow::ensure!(
-                        bound_root.identity()? == live_root.identity()?,
-                        "'{}' was replaced by another folder. Your edits are kept in the editor; relocate the repository or use Save As elsewhere.",
-                        root.display()
-                    );
+                    let live_root = fs.identity(&root).await?;
+                    match root_binding.get_or_init(|| Some(live_root)) {
+                        Some(bound_root) if *bound_root == live_root => {}
+                        Some(_) => anyhow::bail!(
+                            "'{}' was replaced by another folder. Your edits are kept in the editor; relocate the repository or use Save As elsewhere.",
+                            root.display()
+                        ),
+                        None => anyhow::bail!(
+                            "'{}' cannot be confirmed as the folder that was opened. Your edits are kept in the editor; reopen the folder or use Save As elsewhere.",
+                            root.display()
+                        ),
+                    }
                 }
                 // For UTF-8 text whose lines all end alike, use the optimized `fs.save` which
                 // writes Rope chunks directly to disk without allocating a contiguous string.
