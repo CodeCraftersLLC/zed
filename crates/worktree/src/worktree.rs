@@ -1813,9 +1813,8 @@ impl LocalWorktree {
                     }
                     let live_root = fs.identity(&root).await?;
                     if root_binding.get().is_none() {
-                        // The pin is best effort. On Linux any folder that can be entered is
-                        // held (`O_PATH`); elsewhere one that cannot be listed is bound by its
-                        // identity alone, which APFS never gives to another folder.
+                        // The pin is best effort: a folder that cannot be opened even without
+                        // read access (`Fs::open_handle`) is bound by its identity alone.
                         let pin = fs.open_handle(&root).await.ok().filter(|pin| {
                             pin.identity()
                                 .is_ok_and(|identity| identity == live_root)

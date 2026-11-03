@@ -881,11 +881,13 @@ impl Fs for RealFs {
         Ok(Box::new(std::fs::File::open(path)?))
     }
 
+    /// Nothing is read through a handle: it names a path and an identity. So a folder that may be
+    /// entered but not listed is still held, and its identity cannot be given to another folder:
+    /// Linux opens every handle with `O_PATH`, and macOS and Windows, refused a read open, open
+    /// one with no read access.
     async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
-        // Nothing is read through a handle. `O_PATH` asks for no read access, so a folder that
-        // may be entered but not listed is still held, and its inode cannot be given to another.
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -896,7 +898,13 @@ impl Fs for RealFs {
             use std::os::windows::fs::OpenOptionsExt;
             options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS.0);
         }
-        Ok(Arc::new(options.open(path)?))
+        match options.open(path) {
+            Ok(file) => Ok(Arc::new(file)),
+            Err(refused) if refused.kind() == io::ErrorKind::PermissionDenied => Ok(Arc::new(
+                open_without_read_access(path).map_err(|_| refused)?,
+            )),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn identity(&self, path: &Path) -> Result<FileIdentity> {
@@ -3497,6 +3505,33 @@ fn read_recursive<'a>(
 // todo(windows)
 // can we get file id not open the file twice?
 // https://github.com/rust-lang/rust/issues/63010
+/// `O_SEARCH` opens a folder for search only, which needs no permission to list it.
+#[cfg(target_os = "macos")]
+fn open_without_read_access(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_SEARCH)
+        .open(path)
+}
+
+/// No access rights, as [`identity_without_reading`] opens a path.
+#[cfg(target_os = "windows")]
+fn open_without_read_access(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn open_without_read_access(_path: &Path) -> io::Result<std::fs::File> {
+    Err(io::ErrorKind::PermissionDenied.into())
+}
+
 #[cfg(unix)]
 fn identity_without_reading(path: &Path) -> Result<FileIdentity> {
     let metadata = std::fs::metadata(path)?;

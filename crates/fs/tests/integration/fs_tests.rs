@@ -530,12 +530,12 @@ async fn test_realfs_identity_needs_no_read_access(
 
 /// A handle holds a folder that may be entered but not listed: it opens, names the folder, and
 /// keeps its inode from going to a folder made in its place.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[gpui::test]
 async fn test_realfs_handle_holds_a_folder_it_may_not_list(executor: BackgroundExecutor) {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let fs = RealFs::new(None, executor);
+    let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, executor));
     let temp_dir = TempDir::new().unwrap();
     let folder = temp_dir.path().join("repo");
     std::fs::create_dir(&folder).unwrap();
@@ -543,7 +543,12 @@ async fn test_realfs_handle_holds_a_folder_it_may_not_list(executor: BackgroundE
 
     let held = gpui::block_on(fs.open_handle(&folder)).unwrap();
     let opened = held.identity().unwrap();
+    let named = held.current_path(&fs);
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(named.unwrap()).unwrap(),
+        std::fs::canonicalize(&folder).unwrap()
+    );
     for _ in 0..64 {
         std::fs::remove_dir(&folder).unwrap();
         std::fs::create_dir(&folder).unwrap();
