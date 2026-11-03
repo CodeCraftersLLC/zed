@@ -142,10 +142,9 @@ pub trait Fs: Send + Sync {
 
     async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>>;
     /// The identity of what `path` names, following links, read without opening it for reading:
-    /// a folder that may be entered but not listed still has one.
-    async fn identity(&self, path: &Path) -> Result<FileIdentity> {
-        self.open_handle(path).await?.identity()
-    }
+    /// a folder that may be entered but not listed still has one. Every file system says how it
+    /// does this; a wrapper passes it to what it wraps.
+    async fn identity(&self, path: &Path) -> Result<FileIdentity>;
     async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>>;
     async fn load(&self, path: &Path) -> Result<String> {
         Ok(String::from_utf8(self.load_bytes(path).await?)?)
@@ -3114,6 +3113,10 @@ impl Fs for FakeFs {
             inode,
             identity_refusal,
         }))
+    }
+
+    async fn identity(&self, path: &Path) -> Result<FileIdentity> {
+        self.open_handle(path).await?.identity()
     }
 
     async fn load(&self, path: &Path) -> Result<String> {

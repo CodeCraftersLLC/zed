@@ -5273,6 +5273,10 @@ async fn write_file_binds_a_root_created_after_opening_to_the_first_folder_it_sa
         fs.load(Path::new("/root/repo/src/lib.rs")).await.unwrap(),
         "first"
     );
+    assert!(
+        worktree.read_with(cx, |tree, _| tree.as_local().unwrap().root_is_pinned()),
+        "the folder bound by the first save is held open, so its identity cannot be reused"
+    );
 
     fs.pause_events();
     fs.rename(

@@ -216,13 +216,19 @@ pub struct LocalWorktree {
     share_private_files: bool,
     scanning_enabled: bool,
     force_defer_watch: bool,
-    /// The identity of the folder saves below the root are bound to. It is set when the worktree
-    /// is opened on a folder (`None` when that folder could not be identified, which refuses
-    /// saves), and, when nothing was there, by the first save, to the folder it finds. The scanner
-    /// re-reads whatever folder is at the root's path, so only this tells the original from
-    /// another folder created there. The root file handle, when it opened, keeps the identity
-    /// from being given to another folder.
-    root_binding: Arc<OnceLock<Option<fs::FileIdentity>>>,
+    /// The folder saves below the root are bound to. It is set when the worktree is opened on a
+    /// folder (`None` when that folder could not be identified, which refuses saves), and, when
+    /// nothing was there, by the first save, to the folder it finds. The scanner re-reads
+    /// whatever folder is at the root's path, so only this tells the original from another
+    /// folder created there.
+    root_binding: Arc<OnceLock<Option<RootBinding>>>,
+}
+
+/// A folder's identity and, when the folder could be opened, a handle on it that keeps the
+/// identity from being given to another folder after this one is deleted.
+struct RootBinding {
+    identity: fs::FileIdentity,
+    _pin: Option<Arc<dyn fs::FileHandle>>,
 }
 
 pub struct PathPrefixScanRequest {
@@ -507,7 +513,11 @@ impl Worktree {
                 Some(Ok(identity)) => Ok(identity),
                 _ => fs.identity(&abs_path).await,
             };
-            root_binding.set(identity.warn_on_err()).ok();
+            let binding = identity.map(|identity| RootBinding {
+                identity,
+                _pin: root_file_handle.clone(),
+            });
+            root_binding.set(binding.warn_on_err()).ok();
         }
 
         let root_repo_common_dir = if visible {
@@ -1801,8 +1811,22 @@ impl LocalWorktree {
                         );
                     }
                     let live_root = fs.identity(&root).await?;
-                    match root_binding.get_or_init(|| Some(live_root)) {
-                        Some(bound_root) if *bound_root == live_root => {}
+                    if root_binding.get().is_none() {
+                        // The pin is best effort: a folder that may be entered but not listed
+                        // cannot be opened, and is bound by its identity alone.
+                        let pin = fs.open_handle(&root).await.ok().filter(|pin| {
+                            pin.identity()
+                                .is_ok_and(|identity| identity == live_root)
+                        });
+                        root_binding.get_or_init(|| {
+                            Some(RootBinding {
+                                identity: live_root,
+                                _pin: pin,
+                            })
+                        });
+                    }
+                    match root_binding.get().and_then(Option::as_ref) {
+                        Some(bound_root) if bound_root.identity == live_root => {}
                         Some(_) => anyhow::bail!(
                             "'{}' was replaced by another folder. Your edits are kept in the editor; relocate the repository or use Save As elsewhere.",
                             root.display()
@@ -2243,6 +2267,15 @@ impl LocalWorktree {
     pub fn set_defer_watch(&mut self, defer: bool, cx: &mut Context<Worktree>) {
         self.force_defer_watch = defer;
         self.restart_background_scanners(cx);
+    }
+
+    /// Whether the folder saves below the root are bound to is held open.
+    #[cfg(feature = "test-support")]
+    pub fn root_is_pinned(&self) -> bool {
+        self.root_binding
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(|binding| binding._pin.is_some())
     }
 
     #[cfg(feature = "test-support")]

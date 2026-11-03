@@ -16,7 +16,8 @@ pub struct GlyphCluster {
 /// DirectWrite hands the glyphs and the cluster map of a run in logical order, whatever the run's
 /// bidi level, so the map is non-decreasing for left-to-right and right-to-left runs alike. Only
 /// the placement differs; see [`glyph_run_positions`]. A damaged map is read as non-decreasing
-/// from the run's first glyph, so every glyph belongs to exactly one cluster whatever it says.
+/// from the run's first glyph, so every glyph of a run with a non-empty map belongs to exactly one
+/// cluster whatever the map says. An empty map gives no clusters.
 pub fn glyph_clusters(cluster_map: &[u16], glyph_count: usize) -> Vec<GlyphCluster> {
     let mut clusters: Vec<GlyphCluster> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
