@@ -24,7 +24,10 @@ use ui::{
     text_for_keystroke,
 };
 use util::ResultExt;
-use workspace::{ItemHandle, ItemSettings, OpenInTerminal, OpenTerminal, RevealInProjectPanel};
+use workspace::{
+    ItemHandle, ItemSettings, OpenInTerminal, OpenTerminal, REVEAL_IN_PANEL_LABEL,
+    RevealInProjectPanel,
+};
 
 use super::{
     BlockLayout, EditorElement, EditorLayout, LineWithInvisibles, layout_line,
@@ -1048,7 +1051,7 @@ pub(crate) fn render_buffer_header(
                         )
                         .when_some(reveal_in_project_panel, |menu, entry_id| {
                             menu.entry(
-                                "Reveal In Project Panel",
+                                REVEAL_IN_PANEL_LABEL,
                                 Some(Box::new(RevealInProjectPanel::default())),
                                 window.handler_for(&editor, move |editor, _, cx| {
                                     if let Some(project) = &mut editor.project {

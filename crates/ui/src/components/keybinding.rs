@@ -484,6 +484,16 @@ pub fn text_for_keystroke(modifiers: &Modifiers, key: &str, cx: &App) -> String 
     keystroke_text(modifiers, key, platform_style, KeyBinding::is_vim_mode(cx))
 }
 
+/// Returns the text of a keystroke as the given platform writes it, independent of the host
+/// platform and of vim mode.
+pub fn text_for_keystroke_in_style(
+    modifiers: &Modifiers,
+    key: &str,
+    platform_style: PlatformStyle,
+) -> String {
+    keystroke_text(modifiers, key, platform_style, false)
+}
+
 /// Returns a textual representation of the given [`Keystroke`].
 fn keystroke_text(
     modifiers: &Modifiers,
@@ -732,6 +742,46 @@ mod tests {
                 false
             ),
             "Shift-PageUp".to_string()
+        );
+    }
+
+    #[test]
+    fn test_text_for_keystroke_in_style_names_keys_for_the_given_platform() {
+        let secondary_modifiers = |platform_style| match platform_style {
+            PlatformStyle::Mac => Modifiers::command(),
+            PlatformStyle::Linux | PlatformStyle::Windows => Modifiers::control(),
+        };
+
+        for (platform_style, secondary_chord, platform_key_chord) in [
+            (PlatformStyle::Mac, "Command-A", "Command-1"),
+            (PlatformStyle::Linux, "Ctrl-A", "Super-1"),
+            (PlatformStyle::Windows, "Ctrl-A", "Win-1"),
+        ] {
+            assert_eq!(
+                text_for_keystroke_in_style(
+                    &secondary_modifiers(platform_style),
+                    "a",
+                    platform_style
+                ),
+                secondary_chord,
+            );
+            assert_eq!(
+                text_for_keystroke_in_style(&Modifiers::command(), "1", platform_style),
+                platform_key_chord,
+            );
+        }
+
+        assert_eq!(
+            text_for_keystroke_in_style(
+                &Modifiers {
+                    control: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                "tab",
+                PlatformStyle::Mac,
+            ),
+            "Control-Shift-Tab",
         );
     }
 }

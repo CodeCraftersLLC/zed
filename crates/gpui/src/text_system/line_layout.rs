@@ -164,16 +164,9 @@ impl LineLayout {
 
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
+            if first_non_whitespace_ix.is_some() && LineWrapper::can_break_before(prev_ch, ch) {
+                last_candidate_ix = Some(boundary);
+                last_candidate_x = x;
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
@@ -1086,5 +1079,36 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    fn wrap_boundary_glyphs(text: &str, wrap_width: f32) -> Vec<usize> {
+        let glyph_width = 10.;
+        let glyphs = text
+            .char_indices()
+            .enumerate()
+            .map(|(glyph_ix, (index, _))| glyph_at(glyph_ix as f32 * glyph_width, index))
+            .collect();
+        let mut layout = make_layout(glyphs);
+        layout.width = px(text.chars().count() as f32 * glyph_width);
+        layout.len = text.len();
+
+        layout
+            .compute_wrap_boundaries(text, px(wrap_width), None)
+            .iter()
+            .map(|boundary| boundary.glyph_ix)
+            .collect()
+    }
+
+    #[test]
+    fn test_wrap_boundaries_keep_trailing_punctuation_with_its_word() {
+        assert_eq!(wrap_boundary_glyphs("aaaa bbbbbb?", 115.), vec![5]);
+        assert_eq!(wrap_boundary_glyphs("aaaa bbbbbb!", 115.), vec![5]);
+    }
+
+    #[test]
+    fn test_wrap_boundaries_break_after_path_separator() {
+        assert_eq!(wrap_boundary_glyphs("src/a/bbbbbbbb", 65.), vec![6, 12]);
+        assert_eq!(wrap_boundary_glyphs("src\\a\\bbbbbbbb", 65.), vec![6, 12]);
+        assert_eq!(wrap_boundary_glyphs("https://bbbbbbbb", 85.), vec![8]);
     }
 }

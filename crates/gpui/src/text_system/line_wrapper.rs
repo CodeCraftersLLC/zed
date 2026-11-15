@@ -48,6 +48,7 @@ impl LineWrapper {
         let mut last_candidate_ix = 0;
         let mut last_candidate_width = px(0.);
         let mut last_wrap_ix = 0;
+        let mut last_text_ix = None;
         let mut prev_c = '\0';
         let mut index = 0;
         let mut candidates = fragments
@@ -65,21 +66,20 @@ impl LineWrapper {
                             continue;
                         }
 
-                        if Self::is_word_char(c) {
-                            if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
-                            }
-                        } else {
-                            // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
-                            }
+                        // A break is offered only after text on the current line, so a line that
+                        // starts with the space it overflowed on is never left with only that space.
+                        let line_has_text =
+                            last_text_ix.is_some_and(|text_ix| text_ix >= last_wrap_ix);
+                        if line_has_text && Self::can_break_before(prev_c, c) {
+                            last_candidate_ix = ix;
+                            last_candidate_width = width;
                         }
 
-                        if c != ' ' && first_non_whitespace_ix.is_none() {
-                            first_non_whitespace_ix = Some(ix);
+                        if c != ' ' {
+                            last_text_ix = Some(ix);
+                            if first_non_whitespace_ix.is_none() {
+                                first_non_whitespace_ix = Some(ix);
+                            }
                         }
 
                         new_prev_c = c;
@@ -90,11 +90,14 @@ impl LineWrapper {
                         width: element_width,
                         ..
                     } => {
-                        if prev_c == ' ' && first_non_whitespace_ix.is_some() {
+                        let line_has_text =
+                            last_text_ix.is_some_and(|text_ix| text_ix >= last_wrap_ix);
+                        if prev_c == ' ' && line_has_text {
                             last_candidate_ix = ix;
                             last_candidate_width = width;
                         }
 
+                        last_text_ix = Some(ix);
                         if first_non_whitespace_ix.is_none() {
                             first_non_whitespace_ix = Some(ix);
                         }
@@ -104,6 +107,7 @@ impl LineWrapper {
                 };
 
                 width += item_width;
+                prev_c = new_prev_c;
                 if width > wrap_width && ix > last_wrap_ix {
                     if let (None, Some(first_non_whitespace_ix)) = (indent, first_non_whitespace_ix)
                     {
@@ -127,8 +131,6 @@ impl LineWrapper {
 
                     return Some(Boundary::new(last_wrap_ix, indent.unwrap_or(0)));
                 }
-
-                prev_c = new_prev_c;
             }
 
             None
@@ -377,12 +379,7 @@ impl LineWrapper {
 
             let char_width = self.width_for_char(c);
 
-            if Self::is_word_char(c) {
-                if prev_c == ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = ix;
-                    last_candidate_width = width;
-                }
-            } else if c != ' ' && first_non_whitespace_ix.is_some() {
+            if first_non_whitespace_ix.is_some() && Self::can_break_before(prev_c, c) {
                 last_candidate_ix = ix;
                 last_candidate_width = width;
             }
@@ -445,6 +442,25 @@ impl LineWrapper {
         (text, Cow::Borrowed(runs))
     }
 
+    /// Whether a line may wrap just before `c`, the character that follows `prev_c`.
+    ///
+    /// A word does not break inside itself, except after a path separator: `src/components/`
+    /// ends one line and `file.rs` starts the next. A separator inside a path stays on the line of
+    /// the text before it, so a path never wraps onto a line that starts with `/` or `\`, and
+    /// `https://` stays whole.
+    pub(crate) fn can_break_before(prev_c: char, c: char) -> bool {
+        if Self::is_word_char(c) {
+            prev_c == ' ' || (Self::is_path_separator(prev_c) && !Self::is_path_separator(c))
+        } else {
+            // CJK may not be space separated, e.g.: `Hello world你好世界`
+            c != ' '
+        }
+    }
+
+    fn is_path_separator(c: char) -> bool {
+        matches!(c, '/' | '\\')
+    }
+
     /// Any character in this list should be treated as a word character,
     /// meaning it can be part of a word that should not be wrapped.
     pub(crate) fn is_word_char(c: char) -> bool {
@@ -473,9 +489,10 @@ impl LineWrapper {
 
         // Some other known special characters that should be treated as word characters,
         // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
-        // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`
-        // is included so it stays attached to the preceding word when wrapping.
-        matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';') ||
+        // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`, `?`, `!`
+        // is included so it stays attached to the preceding word when wrapping. Path separators
+        // `/` and `\` stay attached to the text before them; `can_break_before` offers the break after them.
+        matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';' | '?' | '!' | '/' | '\\') ||
         // `⋯` character is special used in Zed, to keep this at the end of the line.
         matches!(c, '⋯')
     }
@@ -845,6 +862,78 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_line_keeps_trailing_punctuation_with_its_word() {
+        let mut wrapper = build_wrapper();
+
+        for text in ["aaaa bbbbbb?", "aaaa bbbbbb!"] {
+            assert_eq!(
+                wrapper
+                    .wrap_line(&[LineFragment::text(text)], px(110.))
+                    .collect::<Vec<_>>(),
+                &[Boundary::new(5, 0)],
+                "{text:?} must wrap before the word, not before its last character",
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrap_line_breaks_after_path_separator() {
+        let mut wrapper = build_wrapper();
+
+        for separator in ['/', '\\'] {
+            let prefix = format!("src{separator}a{separator}");
+            let text = format!("{prefix}bbbbbbbb");
+            let prefix_width: Pixels = prefix.chars().map(|c| wrapper.width_for_char(c)).sum();
+
+            let boundaries = wrapper
+                .wrap_line(&[LineFragment::text(&text)], prefix_width + px(1.))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                boundaries,
+                &[
+                    Boundary::new(prefix.len(), 0),
+                    Boundary::new(prefix.len() * 2, 0)
+                ],
+                "{text:?} must wrap right after the separator, then only where the next line is full",
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrap_line_never_leaves_a_line_of_only_the_space_it_overflowed_on() {
+        let mut wrapper = build_wrapper();
+
+        let first_word = "aaaaaaa";
+        let text = format!("{first_word} bbbbbbbb");
+        let first_word_width: Pixels = first_word.chars().map(|c| wrapper.width_for_char(c)).sum();
+        let wrap_width = first_word_width + wrapper.width_for_char('a') / 2.;
+
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text(&text)], wrap_width)
+                .collect::<Vec<_>>(),
+            &[Boundary::new(7, 0), Boundary::new(14, 0)],
+        );
+    }
+
+    #[test]
+    fn test_wrap_line_keeps_a_double_separator_together() {
+        let mut wrapper = build_wrapper();
+
+        let prefix = "https://";
+        let text = format!("{prefix}bbbbbbbb");
+        let prefix_width: Pixels = prefix.chars().map(|c| wrapper.width_for_char(c)).sum();
+
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text(&text)], prefix_width + px(1.))
+                .next(),
+            Some(Boundary::new(prefix.len(), 0)),
+        );
+    }
+
+    #[test]
     fn test_truncate_line_end() {
         let mut wrapper = build_wrapper();
 
@@ -1135,6 +1224,8 @@ mod tests {
         assert_word("a=1");
         assert_word("Self::is_word_char");
         assert_word("on;");
+        assert_word("Really?");
+        assert_word("Stop!");
         assert_word("more⋯");
         assert_word("won’t");
         assert_word("‘twas");
@@ -1144,10 +1235,10 @@ mod tests {
 
         // URL case
         assert_word("github.com");
-        assert_not_word("zed-industries/zed");
-        assert_not_word("zed-industries\\zed");
+        assert_word("zed-industries/zed");
+        assert_word("zed-industries\\zed");
+        assert_word("foo?b=2");
         assert_not_word("a=1&b=2");
-        assert_not_word("foo?b=2");
 
         // Latin-1 Supplement
         assert_word("ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏ");
