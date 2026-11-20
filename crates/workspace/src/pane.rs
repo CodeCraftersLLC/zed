@@ -186,6 +186,9 @@ pub struct RevealInProjectPanel {
     pub entry_id: Option<u64>,
 }
 
+/// What the menus that reveal an item in the project panel call that panel.
+pub const REVEAL_IN_PANEL_LABEL: &str = "Reveal in Files";
+
 /// Opens the search interface with the specified configuration.
 #[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Default, Action)]
 #[action(namespace = pane)]
@@ -3403,7 +3406,7 @@ impl Pane {
                                 .map(pin_tab_entries)
                                 .when(visible_in_project_panel, |menu| {
                                     menu.entry(
-                                        "Reveal In Project Panel",
+                                        REVEAL_IN_PANEL_LABEL,
                                         Some(Box::new(RevealInProjectPanel::default())),
                                         window.handler_for(&pane, move |pane, _, cx| {
                                             pane.project
@@ -8761,6 +8764,53 @@ mod tests {
         for split_direction in SplitDirection::all() {
             test_single_pane_split(["A"], split_direction, SplitMode::EmptyPane, cx).await;
         }
+    }
+
+    #[gpui::test]
+    async fn test_tab_context_menu_reveals_in_files_not_the_project_panel(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({ "one.txt": "" }))
+            .await;
+        let project = Project::test(fs, ["/root".as_ref()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            let item = cx.new(|cx| {
+                TestItem::new(cx)
+                    .with_label("one.txt")
+                    .with_project_items(&[TestProjectItem::new_in_worktree(
+                        1,
+                        "one.txt",
+                        worktree_id,
+                        cx,
+                    )])
+            });
+            pane.add_item(Box::new(item), true, true, None, window, cx);
+        });
+        cx.enable_accessibility();
+        cx.run_until_parked();
+
+        let tab_bounds = cx.debug_bounds("TAB-0").unwrap();
+        cx.simulate_mouse_down(tab_bounds.center(), MouseButton::Right, Modifiers::none());
+        cx.run_until_parked();
+
+        let tree = cx.a11y_tree().unwrap();
+        let labels: Vec<&str> = tree
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == gpui::Role::MenuItem)
+            .filter_map(|(_, node)| node.label())
+            .collect();
+        assert!(labels.contains(&"Reveal in Files"), "{labels:?}");
+        assert!(
+            !labels.iter().any(|label| label.contains("Project Panel")),
+            "{labels:?}"
+        );
     }
 
     #[test]

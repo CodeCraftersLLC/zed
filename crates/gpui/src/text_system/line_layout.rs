@@ -132,7 +132,7 @@ impl LineLayout {
         max_lines: Option<usize>,
     ) -> SmallVec<[WrapBoundary; 1]> {
         let mut boundaries = SmallVec::new();
-        let mut first_non_whitespace_ix = None;
+        let mut last_text_ix = None;
         let mut last_candidate_ix = None;
         let mut last_candidate_x = px(0.);
         let mut last_boundary = WrapBoundary {
@@ -164,20 +164,16 @@ impl LineLayout {
 
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
+            // A break is offered only after text on the current line, so a line that
+            // starts with the space it overflowed on is never left with only that space.
+            let line_has_text = last_text_ix.is_some_and(|text_ix| text_ix >= last_boundary);
+            if line_has_text && LineWrapper::can_break_before(prev_ch, ch) {
+                last_candidate_ix = Some(boundary);
+                last_candidate_x = x;
             }
 
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(boundary);
+            if ch != ' ' {
+                last_text_ix = Some(boundary);
             }
 
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
@@ -1086,5 +1082,41 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    fn wrap_boundary_glyphs(text: &str, wrap_width: f32) -> Vec<usize> {
+        let glyph_width = 10.;
+        let glyphs = text
+            .char_indices()
+            .enumerate()
+            .map(|(glyph_ix, (index, _))| glyph_at(glyph_ix as f32 * glyph_width, index))
+            .collect();
+        let mut layout = make_layout(glyphs);
+        layout.width = px(text.chars().count() as f32 * glyph_width);
+        layout.len = text.len();
+
+        layout
+            .compute_wrap_boundaries(text, px(wrap_width), None)
+            .iter()
+            .map(|boundary| boundary.glyph_ix)
+            .collect()
+    }
+
+    #[test]
+    fn test_wrap_boundaries_keep_trailing_punctuation_with_its_word() {
+        assert_eq!(wrap_boundary_glyphs("aaaa bbbbbb?", 115.), vec![5]);
+        assert_eq!(wrap_boundary_glyphs("aaaa bbbbbb!", 115.), vec![5]);
+    }
+
+    #[test]
+    fn test_wrap_boundaries_break_after_path_separator() {
+        assert_eq!(wrap_boundary_glyphs("src/a/bbbbbbbb", 65.), vec![6, 12]);
+        assert_eq!(wrap_boundary_glyphs("src\\a\\bbbbbbbb", 65.), vec![6, 12]);
+        assert_eq!(wrap_boundary_glyphs("https://bbbbbbbb", 85.), vec![8]);
+    }
+
+    #[test]
+    fn test_wrap_boundaries_never_leave_a_line_of_only_the_overflowing_space() {
+        assert_eq!(wrap_boundary_glyphs("aaaaaaa bbbbbbbb", 75.), vec![7, 14]);
     }
 }
