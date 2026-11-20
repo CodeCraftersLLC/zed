@@ -618,6 +618,7 @@ struct TextLayoutInner {
     lines: SmallVec<[WrappedLine; 1]>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
+    truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
 }
@@ -678,12 +679,13 @@ impl TextLayout {
                 // Only use cached layout if:
                 // 1. We have a cached size
                 // 2. wrap_width matches (or both are None)
-                // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
-                //    because the previous layout may have been computed without truncation)
+                // 3. truncate_width matches (a prior truncated measure, such as a 0px
+                //    flex-shrink pass, must not poison a later MaxContent measure, and
+                //    an untruncated measure must not bypass a later Definite truncation)
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
                     && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
-                    && truncate_width.is_none()
+                    && truncate_width == text_layout.truncate_width
                 {
                     return size;
                 }
@@ -731,6 +733,7 @@ impl TextLayout {
                         len: 0,
                         line_height,
                         wrap_width,
+                        truncate_width,
                         size: Some(Size::default()),
                         bounds: None,
                     });
@@ -749,6 +752,7 @@ impl TextLayout {
                     len,
                     line_height,
                     wrap_width,
+                    truncate_width,
                     size: Some(size),
                     bounds: None,
                 });
@@ -1286,6 +1290,74 @@ mod tests {
         assert_ne!(
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
+        );
+    }
+
+    #[crate::test]
+    fn truncated_flex_child_does_not_reuse_narrow_probe_size_for_wide_layout(
+        cx: &mut crate::TestAppContext,
+    ) {
+        use crate::{
+            Context, InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _,
+            Window, div, px, size,
+        };
+
+        struct RowView;
+        impl Render for RowView {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .child(
+                        div().flex_1().min_w(px(0.)).child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "title".into())
+                                        .flex_shrink(1.)
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .child("Read README.md"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex_shrink(1_000_000.)
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .child("README.md"),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "audit".into())
+                                        .flex_shrink(1_000_000.)
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .child("Responded: Allow once"),
+                                ),
+                        ),
+                    )
+            }
+        }
+
+        let (_, cx) = cx.add_window_view(|_, _| RowView);
+        cx.simulate_resize(size(px(800.), px(200.)));
+        cx.refresh().unwrap();
+
+        let title = cx.debug_bounds("title").expect("title bounds");
+        let audit = cx.debug_bounds("audit").expect("audit bounds");
+        assert!(
+            title.size.width >= px(80.),
+            "truncated flex child must keep its untruncated width when the row has room, got {title:?}"
+        );
+        assert!(
+            audit.size.width >= px(100.),
+            "trailing truncated flex child must keep its untruncated width when the row has room, got {audit:?}"
         );
     }
 }
