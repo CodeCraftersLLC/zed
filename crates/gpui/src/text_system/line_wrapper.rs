@@ -339,6 +339,7 @@ impl LineWrapper {
         let mut width = px(0.);
         let mut line = 0usize;
         let mut first_non_whitespace_ix = None;
+        let mut last_text_ix = None;
         let mut last_candidate_ix = 0usize;
         let mut last_candidate_width = px(0.);
         let mut last_wrap_ix = 0usize;
@@ -368,6 +369,7 @@ impl LineWrapper {
                 line += 1;
                 width = px(0.);
                 first_non_whitespace_ix = None;
+                last_text_ix = None;
                 last_candidate_ix = 0;
                 last_candidate_width = px(0.);
                 last_wrap_ix = ix + 1;
@@ -379,13 +381,19 @@ impl LineWrapper {
 
             let char_width = self.width_for_char(c);
 
-            if first_non_whitespace_ix.is_some() && Self::can_break_before(prev_c, c) {
+            // A break is offered only after text on the current line, so a line that
+            // starts with the space it overflowed on is never left with only that space.
+            let line_has_text = last_text_ix.is_some_and(|text_ix| text_ix >= last_wrap_ix);
+            if line_has_text && Self::can_break_before(prev_c, c) {
                 last_candidate_ix = ix;
                 last_candidate_width = width;
             }
 
-            if c != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(ix);
+            if c != ' ' {
+                last_text_ix = Some(ix);
+                if first_non_whitespace_ix.is_none() {
+                    first_non_whitespace_ix = Some(ix);
+                }
             }
 
             width += char_width;
@@ -1642,6 +1650,34 @@ mod tests {
             result.as_ref(),
             text,
             "Text that fits exactly should not be modified: '{}'",
+            result
+        );
+    }
+
+    #[test]
+    fn test_multiline_truncation_never_counts_an_overflowing_space_as_a_line() {
+        let mut wrapper = build_wrapper();
+
+        // "aaaaaaa" fits in 72px; the overflowing space starts line 2, followed by
+        // "bbbbbb" (line 2) and "bb" (line 3), so the whole string fits within 3 lines.
+        let text: &str = "aaaaaaa bbbbbbbb";
+        let wrap_width = px(72.);
+        let max_lines: usize = 3;
+
+        let runs = generate_test_runs(&[text.len()]);
+        let (result, _) = wrapper.truncate_wrapped_line(
+            text.into(),
+            wrap_width,
+            max_lines,
+            "\u{2026}",
+            &runs,
+            TruncateFrom::End,
+        );
+
+        assert_eq!(
+            result.as_ref(),
+            text,
+            "Overflowing space must not consume a line and force early truncation: '{}'",
             result
         );
     }

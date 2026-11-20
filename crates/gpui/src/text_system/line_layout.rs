@@ -132,7 +132,7 @@ impl LineLayout {
         max_lines: Option<usize>,
     ) -> SmallVec<[WrapBoundary; 1]> {
         let mut boundaries = SmallVec::new();
-        let mut first_non_whitespace_ix = None;
+        let mut last_text_ix = None;
         let mut last_candidate_ix = None;
         let mut last_candidate_x = px(0.);
         let mut last_boundary = WrapBoundary {
@@ -164,13 +164,16 @@ impl LineLayout {
 
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
-            if first_non_whitespace_ix.is_some() && LineWrapper::can_break_before(prev_ch, ch) {
+            // A break is offered only after text on the current line, so a line that
+            // starts with the space it overflowed on is never left with only that space.
+            let line_has_text = last_text_ix.is_some_and(|text_ix| text_ix >= last_boundary);
+            if line_has_text && LineWrapper::can_break_before(prev_ch, ch) {
                 last_candidate_ix = Some(boundary);
                 last_candidate_x = x;
             }
 
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(boundary);
+            if ch != ' ' {
+                last_text_ix = Some(boundary);
             }
 
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
@@ -1110,5 +1113,10 @@ mod tests {
         assert_eq!(wrap_boundary_glyphs("src/a/bbbbbbbb", 65.), vec![6, 12]);
         assert_eq!(wrap_boundary_glyphs("src\\a\\bbbbbbbb", 65.), vec![6, 12]);
         assert_eq!(wrap_boundary_glyphs("https://bbbbbbbb", 85.), vec![8]);
+    }
+
+    #[test]
+    fn test_wrap_boundaries_never_leave_a_line_of_only_the_overflowing_space() {
+        assert_eq!(wrap_boundary_glyphs("aaaaaaa bbbbbbbb", 75.), vec![7, 14]);
     }
 }
