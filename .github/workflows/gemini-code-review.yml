@@ -399,7 +399,21 @@ jobs:
                       }
                     }
                   }
-                }
+                },
+                "customOverrides": [
+                  {
+                    "match": {
+                      "model": "gemini-4-neon"
+                    },
+                    "modelConfig": {
+                      "generateContentConfig": {
+                        "thinkingConfig": {
+                          "thinkingLevel": "XHIGH"
+                        }
+                      }
+                    }
+                  }
+                ]
               },
               "tools": {
                 "core": [
@@ -574,6 +588,8 @@ jobs:
                       in_hunk = True
 
           def normalize_rel_path(raw: str, known_paths: set[str]) -> str:
+              if raw in known_paths:
+                  return raw
               s = raw.strip()
               if s in known_paths:
                   return s
@@ -598,7 +614,10 @@ jobs:
               if isinstance(raw, str):
                   s = raw.strip()
                   if s.isascii() and s.isdigit():
-                      val = int(s)
+                      try:
+                          val = int(s)
+                      except ValueError:
+                          return None
                       return val if val > 0 else None
               return None
 
@@ -662,24 +681,40 @@ jobs:
               full_candidate = prefix + "\n".join(entry[2] for entry in ordered)
               if len(full_candidate) <= limit:
                   return full_candidate
-              omission_reserve = 96
+
+              def omission_footer(count: int) -> str:
+                  return f"\n\n... [{count} additional finding(s) omitted to fit GitHub API size limit]"
+
               included: list[str] = []
               omitted = 0
+              highest_omitted_rank: int | None = None
               used = len(prefix)
-              for idx, (_, _, note_text) in enumerate(ordered):
+              for idx, (sev_rank, _, note_text) in enumerate(ordered):
+                  if prioritize_by_severity and highest_omitted_rank is not None and sev_rank > highest_omitted_rank:
+                      omitted += len(ordered) - idx
+                      break
                   sep = "\n" if included else ""
                   remaining_after = len(ordered) - idx - 1
-                  reserve = omission_reserve if (omitted > 0 or remaining_after > 0) else 0
+                  projected_omitted = omitted + remaining_after
+                  reserve = len(omission_footer(projected_omitted)) if projected_omitted > 0 else 0
                   if used + len(sep) + len(note_text) + reserve <= limit:
                       included.append(note_text)
                       used += len(sep) + len(note_text)
                   else:
                       omitted += 1
+                      if highest_omitted_rank is None:
+                          highest_omitted_rank = sev_rank
               if not included:
+                  extra_omitted = len(ordered) - 1
+                  if extra_omitted > 0:
+                      footer = omission_footer(extra_omitted)
+                      avail = limit - len(footer)
+                      if avail > len(prefix) + 80:
+                          return cap_body(prefix + ordered[0][2], limit=avail) + footer
                   return cap_body(prefix + ordered[0][2], limit=limit)
               body = prefix + "\n".join(included)
               if omitted:
-                  footer = f"\n\n... [{omitted} additional finding(s) omitted to fit GitHub API size limit]"
+                  footer = omission_footer(omitted)
                   if len(body) + len(footer) <= limit:
                       body += footer
                   else:

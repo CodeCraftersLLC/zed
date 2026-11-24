@@ -15,6 +15,20 @@
           }
         }
       }
-    }
+    },
+    "customOverrides": [
+      {
+        "match": {
+          "model": "gemini-4-neon"
+        },
+        "modelConfig": {
+          "generateContentConfig": {
+            "thinkingConfig": {
+              "thinkingLevel": "XHIGH"
+            }
+          }
+        }
+      }
+    ]
   }
 }
