@@ -1,7 +1,7 @@
 {
   "model": {
     "name": "gemini-4-neon-xhigh",
-    "maxSessionTurns": 25
+    "maxSessionTurns": 50
   },
   "modelConfigs": {
     "customAliases": {

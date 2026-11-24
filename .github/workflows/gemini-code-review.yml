@@ -18,7 +18,8 @@ name: Gemini PR review (gemini-4-neon xhigh)
 # - Stages PR head source strictly as read-only review data under
 #   `.gemini-review-tmp/pr-head/` (with `.git` removed before invoking Gemini).
 # - Runs Gemini CLI with strictly read-only built-in tools (no shell, no write,
-#   no third-party extension clone, no MCP Docker server).
+#   no third-party extension clone, no MCP Docker server) and relocates any WIF
+#   credentials file out of `$GITHUB_WORKSPACE` into `$RUNNER_TEMP` beforehand.
 
 on:
   pull_request:
@@ -51,7 +52,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-      issues: write
       pull-requests: write
     steps:
       - name: Check configured Gemini authentication
@@ -104,8 +104,6 @@ jobs:
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER_INPUT}/files" \
-            --jq '.[].filename' > "$RUNNER_TEMP/pr-files.txt"
           {
             echo "allowed=true"
             echo "pr_number=${PR_NUMBER_INPUT}"
@@ -172,16 +170,141 @@ jobs:
           rm -rf .gemini-review-tmp/pr-head/.git
           find .gemini-review-tmp/pr-head \( -type f -o -type l \) \
             \( -iname 'GEMINI.md' -o -iname '.gemini-context-disabled-*' \) -delete
-          # Keep both a bounded initial preview and the complete pageable patch inside review data.
+          # Keep both a bounded initial preview and the complete pageable patch inside review data,
+          # and derive pr-files.txt directly from the same pinned diff to avoid TOCTOU drift.
           cp "$RUNNER_TEMP/pr-diff-raw.patch" .gemini-review-tmp/pr-diff-full.patch
-          python3 - "$RUNNER_TEMP/pr-diff-raw.patch" ".gemini-review-tmp/pr-diff.patch" <<'PY'
+          python3 - "$RUNNER_TEMP/pr-diff-raw.patch" ".gemini-review-tmp/pr-diff.patch" "$RUNNER_TEMP/pr-files.txt" <<'PY'
+          import re
           import sys
+
           raw = open(sys.argv[1], "rb").read()
           cap = 180_000
           text = raw[:cap].decode("utf-8", errors="replace")
           if len(raw) > cap:
               text += f"\n\n... [diff preview truncated at {cap} bytes; total {len(raw)} bytes; use read_file (with line ranges) or grep_search on .gemini-review-tmp/pr-diff-full.patch for omitted hunks and deletions, and .gemini-review-tmp/pr-head/<path> for full head files]\n"
           open(sys.argv[2], "w", encoding="utf-8").write(text)
+
+          def unquote_git_path(val: str) -> str:
+              val = val.rstrip("\r")
+              if not val.startswith('"'):
+                  return val.split("\t", 1)[0]
+              buf = bytearray()
+              i = 1
+              n = len(val)
+              esc = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+              while i < n:
+                  ch = val[i]
+                  if ch == '"':
+                      break
+                  if ch == "\\" and i + 1 < n:
+                      nxt = val[i + 1]
+                      if nxt in esc:
+                          buf.append(esc[nxt])
+                          i += 2
+                          continue
+                      if i + 3 < n and all("0" <= c <= "7" for c in val[i + 1 : i + 4]):
+                          buf.append(int(val[i + 1 : i + 4], 8) & 0xFF)
+                          i += 4
+                          continue
+                      buf.extend(nxt.encode("utf-8"))
+                      i += 2
+                      continue
+                  buf.extend(ch.encode("utf-8"))
+                  i += 1
+              return buf.decode("utf-8", errors="replace")
+
+          def parse_header_path(val: str, prefix: str):
+              p = unquote_git_path(val)
+              if p == "/dev/null":
+                  return None
+              return p[len(prefix):] if p.startswith(prefix) else None
+
+          def parse_diff_git_b_path(rest: str):
+              rest = rest.rstrip("\r")
+              if rest.startswith('"'):
+                  i = 1
+                  n = len(rest)
+                  while i < n:
+                      if rest[i] == "\\" and i + 1 < n:
+                          i += 2
+                          continue
+                      if rest[i] == '"':
+                          i += 1
+                          break
+                      i += 1
+                  second = rest[i:].lstrip(" ")
+                  p = unquote_git_path(second)
+                  return p[2:] if p.startswith("b/") else None
+              quoted_b = rest.find(' "b/')
+              if quoted_b != -1:
+                  p = unquote_git_path(rest[quoted_b + 1:])
+                  return p[2:] if p.startswith("b/") else None
+              if len(rest) % 2 == 1:
+                  mid = len(rest) // 2
+                  if rest[mid] == " " and rest.startswith("a/") and rest[mid + 1:].startswith("b/"):
+                      left = rest[2:mid]
+                      right = rest[mid + 3:]
+                      if left == right:
+                          return right
+              idx = rest.rfind(" b/")
+              return rest[idx + 3:] if idx != -1 else None
+
+          diff_text = raw.decode("utf-8", errors="replace")
+          files: list[str] = []
+          seen: set[str] = set()
+          block_git_b = None
+          block_plus = None
+          block_rename = None
+          block_minus = None
+          in_hunk = False
+          old_rem = 0
+          new_rem = 0
+
+          def flush_block():
+              chosen = block_plus or block_rename or block_minus or block_git_b
+              if chosen and chosen not in seen:
+                  seen.add(chosen)
+                  files.append(chosen)
+
+          for line in diff_text.split("\n"):
+              if in_hunk and (old_rem > 0 or new_rem > 0):
+                  if line.startswith("+"):
+                      new_rem = max(0, new_rem - 1)
+                      continue
+                  if line.startswith("-"):
+                      old_rem = max(0, old_rem - 1)
+                      continue
+                  if line.startswith(" "):
+                      old_rem = max(0, old_rem - 1)
+                      new_rem = max(0, new_rem - 1)
+                      continue
+                  if line.startswith("\\"):
+                      continue
+                  in_hunk = False
+              if line.startswith("diff --git "):
+                  flush_block()
+                  block_git_b = parse_diff_git_b_path(line[11:])
+                  block_plus = None
+                  block_rename = None
+                  block_minus = None
+                  in_hunk = False
+              elif line.startswith("+++ "):
+                  block_plus = parse_header_path(line[4:], "b/")
+                  in_hunk = False
+              elif line.startswith("--- "):
+                  block_minus = parse_header_path(line[4:], "a/")
+                  in_hunk = False
+              elif line.startswith("rename to "):
+                  block_rename = unquote_git_path(line[10:])
+                  in_hunk = False
+              elif line.startswith("@@ "):
+                  m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+                  if m:
+                      old_rem = int(m.group(2)) if m.group(2) is not None else 1
+                      new_rem = int(m.group(4)) if m.group(4) is not None else 1
+                      in_hunk = True
+          flush_block()
+          open(sys.argv[3], "w", encoding="utf-8").write("\n".join(files) + ("\n" if files else ""))
           PY
           cp "$RUNNER_TEMP/pr-files.txt" .gemini-review-tmp/pr-files.txt
           if [[ -f .gemini/styleguide.md ]]; then
@@ -195,6 +318,44 @@ jobs:
             printf 'No AGENTS.md on default branch.\n' > .gemini-review-tmp/trusted-AGENTS.md
           fi
 
+      - name: Authenticate to Google Cloud via WIF
+        id: gcp_auth
+        if: steps.auth.outputs.available == 'true' && steps.pr.outputs.allowed == 'true' && steps.auth.outputs.mode == 'vertex_wif'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ vars.GOOGLE_CLOUD_PROJECT }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT_EMAIL }}
+          create_credentials_file: true
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform
+
+      - name: Relocate WIF credentials file outside Gemini workspace
+        if: steps.auth.outputs.available == 'true' && steps.pr.outputs.allowed == 'true' && steps.auth.outputs.mode == 'vertex_wif'
+        run: |
+          set -euo pipefail
+          # google-github-actions/auth writes gha-creds-*.json into $GITHUB_WORKSPACE
+          # by default, where Gemini CLI's workspace-scoped file tools could read it.
+          # Move it into $RUNNER_TEMP (outside the workspace) and update the env vars
+          # so both Vertex AI ADC and the auth action's post-step cleanup target $RUNNER_TEMP.
+          src="${GOOGLE_APPLICATION_CREDENTIALS:-}"
+          if [[ -z "$src" || ! -f "$src" ]]; then
+            echo "::error::Expected WIF credentials file at GOOGLE_APPLICATION_CREDENTIALS, got '${src}'."
+            exit 1
+          fi
+          dst="${RUNNER_TEMP}/$(basename "$src")"
+          mv "$src" "$dst"
+          chmod 600 "$dst"
+          if compgen -G "${GITHUB_WORKSPACE}/gha-creds-*.json" >/dev/null; then
+            echo "::error::Unexpected WIF credential file remains inside GITHUB_WORKSPACE."
+            exit 1
+          fi
+          {
+            echo "GOOGLE_APPLICATION_CREDENTIALS=${dst}"
+            echo "GOOGLE_GHA_CREDS_PATH=${dst}"
+            echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=${dst}"
+          } >> "$GITHUB_ENV"
+
       - name: Run Gemini PR review (gemini-4-neon xhigh)
         id: gemini
         if: steps.auth.outputs.available == 'true' && steps.pr.outputs.allowed == 'true'
@@ -202,15 +363,20 @@ jobs:
         env:
           GEMINI_CLI_TRUST_WORKSPACE: "true"
         with:
+          # WIF authentication is intentionally handled above (with credentials relocated
+          # into $RUNNER_TEMP) rather than via gcp_workload_identity_provider here, so
+          # run-gemini-cli never writes gha-creds-*.json into $GITHUB_WORKSPACE.
           gcp_location: ${{ steps.auth.outputs.mode == 'vertex_wif' && (vars.GOOGLE_CLOUD_LOCATION || 'global') || '' }}
           gcp_project_id: ${{ steps.auth.outputs.mode == 'vertex_wif' && vars.GOOGLE_CLOUD_PROJECT || '' }}
-          gcp_service_account: ${{ steps.auth.outputs.mode == 'vertex_wif' && vars.SERVICE_ACCOUNT_EMAIL || '' }}
-          gcp_workload_identity_provider: ${{ steps.auth.outputs.mode == 'vertex_wif' && vars.GCP_WIF_PROVIDER || '' }}
           gemini_api_key: ${{ steps.auth.outputs.mode == 'api_key' && secrets.GEMINI_API_KEY || '' }}
+          gemini_cli_version: "0.70.0"
           gemini_model: "gemini-4-neon-xhigh"
           use_vertex_ai: ${{ steps.auth.outputs.mode == 'vertex_wif' && 'true' || 'false' }}
           workflow_name: "gemini-pr-review"
           github_pr_number: ${{ steps.pr.outputs.pr_number }}
+          # Authoritative CI settings (overwrites .gemini/settings.json in the runner
+          # workspace to enforce read-only tools and context isolation; keep model and
+          # maxSessionTurns in sync with .gemini/settings.json for local CLI runs).
           settings: |-
             {
               "context": {
@@ -219,7 +385,7 @@ jobs:
               },
               "model": {
                 "name": "gemini-4-neon-xhigh",
-                "maxSessionTurns": 25
+                "maxSessionTurns": 50
               },
               "modelConfigs": {
                 "customAliases": {
@@ -294,7 +460,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf .gemini-review-tmp
-          python3 - "$RUNNER_TEMP/pr-diff-raw.patch" "$RUNNER_TEMP/review-payload.json" "$RUNNER_TEMP/review-payload-fallback.json" <<'PY'
+          python3 - "$RUNNER_TEMP/pr-diff-raw.patch" "$RUNNER_TEMP/review-payload.json" "$RUNNER_TEMP/review-payload-fallback.json" "$RUNNER_TEMP/pr-files.txt" <<'PY'
           import json
           import os
           import re
@@ -303,14 +469,55 @@ jobs:
           raw_diff = open(sys.argv[1], "r", encoding="utf-8", errors="replace", newline="\n").read()
           out_path = sys.argv[2]
           fallback_out_path = sys.argv[3]
+          pr_files_path = sys.argv[4] if len(sys.argv) > 4 else None
           head_sha = os.environ["HEAD_SHA"]
           raw_output = os.environ.get("GEMINI_SUMMARY", "").strip()
 
           # Parse valid right-side (new file) line numbers per path from unified diff,
-          # splitting strictly on LF and tracking exact hunk line budgets so added lines
-          # starting with `++` (making `+++`) or containing CR/Unicode line separators
-          # are counted accurately instead of breaking out of the hunk.
+          # splitting strictly on LF, decoding Git C-quoted destination paths, and
+          # tracking exact hunk line budgets so added lines starting with `++` (making
+          # `+++`) or containing CR/Unicode line separators are counted accurately.
+          def unquote_git_path(val: str) -> str:
+              val = val.rstrip("\r")
+              if not val.startswith('"'):
+                  return val.split("\t", 1)[0]
+              buf = bytearray()
+              i = 1
+              n = len(val)
+              esc = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+              while i < n:
+                  ch = val[i]
+                  if ch == '"':
+                      break
+                  if ch == "\\" and i + 1 < n:
+                      nxt = val[i + 1]
+                      if nxt in esc:
+                          buf.append(esc[nxt])
+                          i += 2
+                          continue
+                      if i + 3 < n and all("0" <= c <= "7" for c in val[i + 1 : i + 4]):
+                          buf.append(int(val[i + 1 : i + 4], 8) & 0xFF)
+                          i += 4
+                          continue
+                      buf.extend(nxt.encode("utf-8"))
+                      i += 2
+                      continue
+                  buf.extend(ch.encode("utf-8"))
+                  i += 1
+              return buf.decode("utf-8", errors="replace")
+
+          def parse_header_path(val: str, prefix: str):
+              p = unquote_git_path(val)
+              if p == "/dev/null":
+                  return None
+              return p[len(prefix):] if p.startswith(prefix) else None
+
           valid_lines: dict[str, set[int]] = {}
+          changed_paths: set[str] = set()
+          if pr_files_path and os.path.isfile(pr_files_path):
+              for p in open(pr_files_path, "r", encoding="utf-8", errors="replace").read().splitlines():
+                  if p:
+                      changed_paths.add(p)
           cur_file = None
           cur_line = 0
           old_rem = 0
@@ -341,12 +548,22 @@ jobs:
               if line.startswith("diff --git "):
                   cur_file = None
                   in_hunk = False
-              elif line.startswith("+++ b/"):
-                  cur_file = line[6:].rstrip("\r").split("\t", 1)[0]
-                  valid_lines.setdefault(cur_file, set())
+              elif line.startswith("+++ "):
+                  parsed_path = parse_header_path(line[4:], "b/")
+                  cur_file = parsed_path
+                  if cur_file is not None:
+                      valid_lines.setdefault(cur_file, set())
+                      changed_paths.add(cur_file)
                   in_hunk = False
-              elif line.startswith("+++ /dev/null"):
-                  cur_file = None
+              elif line.startswith("--- "):
+                  old_path = parse_header_path(line[4:], "a/")
+                  if old_path is not None:
+                      changed_paths.add(old_path)
+                  in_hunk = False
+              elif line.startswith("rename to "):
+                  ren_path = unquote_git_path(line[10:])
+                  if ren_path:
+                      changed_paths.add(ren_path)
                   in_hunk = False
               elif line.startswith("@@ "):
                   m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
@@ -356,15 +573,34 @@ jobs:
                       new_rem = int(m.group(4)) if m.group(4) is not None else 1
                       in_hunk = True
 
-          def normalize_rel_path(raw: str) -> str:
-              p = raw.strip().replace("\\", "/")
+          def normalize_rel_path(raw: str, known_paths: set[str]) -> str:
+              s = raw.strip()
+              if s in known_paths:
+                  return s
+              p = s.replace("\\", "/")
               while p.startswith("./") or p.startswith("/"):
                   p = p[2:] if p.startswith("./") else p[1:]
-              if p.startswith(".gemini-review-tmp/pr-head/"):
-                  p = p[len(".gemini-review-tmp/pr-head/"):]
-              while p.startswith("./") or p.startswith("/"):
-                  p = p[2:] if p.startswith("./") else p[1:]
+              if p in known_paths:
+                  return p
+              staging_prefix = ".gemini-review-tmp/pr-head/"
+              if p.startswith(staging_prefix):
+                  stripped = p[len(staging_prefix):]
+                  while stripped.startswith("./") or stripped.startswith("/"):
+                      stripped = stripped[2:] if stripped.startswith("./") else stripped[1:]
+                  return stripped
               return p
+
+          def parse_line_number(raw):
+              if isinstance(raw, bool) or raw is None:
+                  return None
+              if isinstance(raw, int):
+                  return raw if raw > 0 else None
+              if isinstance(raw, str):
+                  s = raw.strip()
+                  if s.isascii() and s.isdigit():
+                      val = int(s)
+                      return val if val > 0 else None
+              return None
 
           def extract_json(text: str):
               for candidate in [text]:
@@ -399,50 +635,116 @@ jobs:
               suffix = "\n\n... [review body truncated to fit GitHub API size limit]"
               return text[: limit - len(suffix)] + suffix
 
+          SEVERITY_RANK = {
+              "critical": 0,
+              "high": 1,
+              "medium": 2,
+              "low": 3,
+          }
+
+          def build_budgeted_body(
+              base_header: str,
+              section_heading: str,
+              notes: list[tuple[int, int, str]],
+              prioritize_by_severity: bool,
+              limit: int = 64000,
+          ) -> str:
+              if not notes:
+                  return cap_body(base_header, limit=limit)
+              ordered = (
+                  sorted(notes, key=lambda entry: (entry[0], entry[1]))
+                  if prioritize_by_severity
+                  else list(notes)
+              )
+              prefix = f"{base_header}\n\n{section_heading}\n"
+              if len(prefix) >= limit:
+                  return cap_body(prefix, limit=limit)
+              full_candidate = prefix + "\n".join(entry[2] for entry in ordered)
+              if len(full_candidate) <= limit:
+                  return full_candidate
+              omission_reserve = 96
+              included: list[str] = []
+              omitted = 0
+              used = len(prefix)
+              for idx, (_, _, note_text) in enumerate(ordered):
+                  sep = "\n" if included else ""
+                  remaining_after = len(ordered) - idx - 1
+                  reserve = omission_reserve if (omitted > 0 or remaining_after > 0) else 0
+                  if used + len(sep) + len(note_text) + reserve <= limit:
+                      included.append(note_text)
+                      used += len(sep) + len(note_text)
+                  else:
+                      omitted += 1
+              if not included:
+                  return cap_body(prefix + ordered[0][2], limit=limit)
+              body = prefix + "\n".join(included)
+              if omitted:
+                  footer = f"\n\n... [{omitted} additional finding(s) omitted to fit GitHub API size limit]"
+                  if len(body) + len(footer) <= limit:
+                      body += footer
+                  else:
+                      body = cap_body(body, limit=limit)
+              return cap_body(body, limit=limit)
+
           parsed = extract_json(raw_output)
           inline_comments = []
-          fallback_notes = []
-          all_notes = []
+          fallback_notes: list[tuple[int, int, str]] = []
+          all_notes: list[tuple[int, int, str]] = []
           max_inline = 25
           if parsed is not None:
               summary = str(parsed.get("summary") or "Review completed.").strip()
-              for item in parsed.get("comments") or []:
+              raw_comments = parsed.get("comments", [])
+              if not isinstance(raw_comments, list):
+                  schema_note = (
+                      f"- **[WARNING]** Gemini CLI returned an invalid `comments` field "
+                      f"(expected JSON array, got `{type(raw_comments).__name__}`); "
+                      f"inline comments were skipped."
+                  )
+                  fallback_notes.append((0, 0, schema_note))
+                  all_notes.append((0, 0, schema_note))
+                  raw_comments = []
+              for idx, item in enumerate(raw_comments, start=1):
                   if not isinstance(item, dict):
                       continue
-                  path = normalize_rel_path(str(item.get("path") or ""))
+                  path = normalize_rel_path(str(item.get("path") or ""), changed_paths)
                   body = str(item.get("body") or "").strip()
                   sev = str(item.get("severity") or "medium").strip().lower()
-                  line_no = item.get("line")
-                  valid_int_line = isinstance(line_no, int) and not isinstance(line_no, bool)
+                  sev_rank = SEVERITY_RANK.get(sev, 4)
+                  line_no = parse_line_number(item.get("line"))
                   if not path or not body:
                       continue
                   badge = f"**[{sev.upper()}]** "
-                  loc = f"`{path}:{line_no}`" if valid_int_line else f"`{path}`"
+                  loc = f"`{path}:{line_no}`" if line_no is not None else f"`{path}`"
                   note_line = f"- {loc}: {badge}{body}"
-                  all_notes.append(note_line)
-                  if valid_int_line and line_no in valid_lines.get(path, set()) and len(inline_comments) < max_inline:
+                  all_notes.append((sev_rank, idx, note_line))
+                  if line_no is not None and line_no in valid_lines.get(path, set()) and len(inline_comments) < max_inline:
                       inline_comments.append(
                           {"path": path, "line": line_no, "side": "RIGHT", "body": badge + body}
                       )
                   else:
-                      fallback_notes.append(note_line)
+                      fallback_notes.append((sev_rank, idx, note_line))
           else:
               summary = raw_output[:4000] if raw_output else "Gemini CLI completed without output."
 
           marker = f"<!-- gemini-4-neon-xhigh-review head={head_sha} -->"
           base_header = f"{marker}\n### Gemini Review (`gemini-4-neon` · `xhigh`)\n\n{summary}"
-          primary_body = base_header
-          if fallback_notes:
-              primary_body += "\n\n#### Additional Findings\n" + "\n".join(fallback_notes)
-
-          fallback_body = base_header
-          if all_notes:
-              fallback_body += "\n\n#### Findings\n" + "\n".join(all_notes)
+          primary_body = build_budgeted_body(
+              base_header,
+              "#### Additional Findings",
+              fallback_notes,
+              prioritize_by_severity=True,
+          )
+          fallback_body = build_budgeted_body(
+              base_header,
+              "#### Findings",
+              all_notes,
+              prioritize_by_severity=True,
+          )
 
           payload = {
               "commit_id": head_sha,
               "event": "COMMENT",
-              "body": cap_body(primary_body),
+              "body": primary_body,
           }
           if inline_comments:
               payload["comments"] = inline_comments
@@ -450,7 +752,7 @@ jobs:
           fallback_payload = {
               "commit_id": head_sha,
               "event": "COMMENT",
-              "body": cap_body(fallback_body),
+              "body": fallback_body,
           }
 
           with open(out_path, "w", encoding="utf-8") as fh:
