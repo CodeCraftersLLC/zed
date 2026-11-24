@@ -1,0 +1,20 @@
+{
+  "model": {
+    "name": "gemini-4-neon-xhigh",
+    "maxSessionTurns": 25
+  },
+  "modelConfigs": {
+    "customAliases": {
+      "gemini-4-neon-xhigh": {
+        "modelConfig": {
+          "model": "gemini-4-neon",
+          "generateContentConfig": {
+            "thinkingConfig": {
+              "thinkingLevel": "XHIGH"
+            }
+          }
+        }
+      }
+    }
+  }
+}
