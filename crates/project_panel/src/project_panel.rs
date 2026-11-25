@@ -152,6 +152,17 @@ pub struct ProjectPanelContextMenuPolicy {
     /// entry stays hidden there rather than presenting an action that does
     /// nothing.
     pub show_host_file_content_actions: bool,
+    /// Show OS-local actions (`Reveal in Finder/File Manager`, `Open in Default App`,
+    /// and external OS file drag/drop/paste). Disabled for SSH-backed remote trees
+    /// mounted through a custom `Fs` implementation.
+    pub show_local_os_actions: bool,
+    /// Show the OS `Trash` action (disabled for remote trees where only permanent
+    /// `Delete` exists).
+    pub show_trash: bool,
+    /// Write filesystem paths to the OS clipboard on `Cut`/`Copy`. Disabled for
+    /// SSH-backed remote trees whose synthetic local root paths must never leak
+    /// into the host OS clipboard.
+    pub write_system_clipboard_paths: bool,
 }
 
 impl ProjectPanelContextMenuPolicy {
@@ -164,6 +175,9 @@ impl ProjectPanelContextMenuPolicy {
             show_git_actions: true,
             show_workspace_folder_actions: true,
             show_host_file_content_actions: false,
+            show_local_os_actions: true,
+            show_trash: true,
+            write_system_clipboard_paths: true,
         }
     }
 
@@ -176,6 +190,29 @@ impl ProjectPanelContextMenuPolicy {
             show_git_actions: false,
             show_workspace_folder_actions: false,
             show_host_file_content_actions: true,
+            show_local_os_actions: true,
+            show_trash: true,
+            write_system_clipboard_paths: true,
+        }
+    }
+
+    /// Embedded policy for SSH-backed remote trees mounted through a custom `Fs`:
+    /// keeps all remote-safe file operations (`New File`, `New Folder`, `Cut`,
+    /// `Copy`, `Duplicate`, `Paste`, `Copy Path`, `Copy Relative Path`,
+    /// `Copy Contents`, `Rename`, `Delete`, `Fold/Unfold`, `Collapse All`) while
+    /// disabling local-OS-only actions (`Reveal in Finder`, `Open in Default App`,
+    /// `Trash`, external OS file drops/pastes, and synthetic-path OS clipboard writes).
+    pub const fn embedded_remote() -> Self {
+        Self {
+            show_terminal_actions: false,
+            show_search_actions: false,
+            show_compare_actions: false,
+            show_git_actions: false,
+            show_workspace_folder_actions: false,
+            show_host_file_content_actions: true,
+            show_local_os_actions: false,
+            show_trash: false,
+            write_system_clipboard_paths: false,
         }
     }
 }
@@ -221,6 +258,7 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     context_menu_policy: ProjectPanelContextMenuPolicy,
+    copy_path_root_override: Option<String>,
     name_validator: Option<NameValidator>,
     state: State,
 }
@@ -991,6 +1029,7 @@ impl ProjectPanel {
                 update_visible_entries_task: Default::default(),
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
                 context_menu_policy: ProjectPanelContextMenuPolicy::default(),
+                copy_path_root_override: None,
                 name_validator: None,
             };
             this.update_visible_entries(None, false, false, window, cx);
@@ -1202,7 +1241,9 @@ impl ProjectPanel {
             let is_read_only = project.is_read_only(cx);
             let is_remote = project.is_remote();
             let is_collab = project.is_via_collab();
-            let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
+            let context_menu_policy = self.context_menu_policy;
+            let is_local = (project.is_local() || project.is_via_wsl_with_host_interop(cx))
+                && context_menu_policy.show_local_os_actions;
             // Names only: the menu is built on the UI thread. The action checks the file itself.
             let offers_default_app = is_local
                 && !is_named_like_program_or_shortcut(
@@ -1215,7 +1256,6 @@ impl ProjectPanel {
             let should_hide_rename = is_root
                 && (cfg!(target_os = "windows")
                     || (settings.hide_root && visible_worktrees_count == 1));
-            let context_menu_policy = self.context_menu_policy;
             let should_show_compare = context_menu_policy.show_compare_actions
                 && !is_dir
                 && self.file_abs_paths_to_diff(cx).is_some();
@@ -1335,7 +1375,7 @@ impl ProjectPanel {
                             .when(!should_hide_rename, |menu| {
                                 menu.separator().action("Rename", Box::new(Rename))
                             })
-                            .when(!is_root && !is_remote, |menu| {
+                            .when(!is_root && !is_remote && context_menu_policy.show_trash, |menu| {
                                 menu.action("Trash", Box::new(Trash { skip_prompt: false }))
                             })
                             .when(!is_root, |menu| {
@@ -2415,6 +2455,9 @@ impl ProjectPanel {
     }
 
     fn trash(&mut self, action: &Trash, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.context_menu_policy.show_trash {
+            return;
+        }
         self.remove(true, action.skip_prompt, window, cx);
     }
 
@@ -3740,6 +3783,17 @@ impl ProjectPanel {
                 .into_iter()
                 .filter_map(|entry| {
                     let entry_path = project.path_for_entry(entry.entry_id, cx)?.path;
+                    if let Some(root_override) = self.copy_path_root_override.as_deref() {
+                        let rel = entry_path.as_unix_str();
+                        let joined = if rel.is_empty() {
+                            root_override.to_string()
+                        } else if root_override == "/" {
+                            format!("/{rel}")
+                        } else {
+                            format!("{}/{rel}", root_override.trim_end_matches('/'))
+                        };
+                        return Some(joined);
+                    }
                     Some(
                         project
                             .worktree_for_id(entry.worktree_id, cx)?
@@ -3810,6 +3864,9 @@ impl ProjectPanel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.context_menu_policy.show_local_os_actions {
+            return;
+        }
         if let Some(path) = self.reveal_in_file_manager_path(cx) {
             self.project
                 .update(cx, |project, cx| project.reveal_path(&path, cx));
@@ -3867,6 +3924,9 @@ impl ProjectPanel {
     }
 
     fn open_system(&mut self, _: &OpenWithSystem, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.context_menu_policy.show_local_os_actions {
+            return;
+        }
         if let Some((worktree, entry)) = self.selected_entry(cx) {
             let abs_path = worktree.absolutize(&entry.path);
             // Looking at the file can block on a slow mount, so it is not done on this thread.
@@ -4212,6 +4272,20 @@ impl ProjectPanel {
         cx.notify();
     }
 
+    /// Override the root path prefix used by `Copy Path` (e.g., the real remote
+    /// POSIX root for an SSH-backed tree mounted at a synthetic local path).
+    pub fn set_copy_path_root_override(
+        &mut self,
+        root: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.copy_path_root_override == root {
+            return;
+        }
+        self.copy_path_root_override = root;
+        cx.notify();
+    }
+
     /// Compared to selected_entry, this function resolves to the currently
     /// selected subentry if dir auto-folding is enabled.
     fn selected_sub_entry<'a>(
@@ -4242,6 +4316,9 @@ impl ProjectPanel {
     }
 
     fn write_entries_to_system_clipboard(&self, entries: &BTreeSet<SelectedEntry>, cx: &mut App) {
+        if !self.context_menu_policy.write_system_clipboard_paths {
+            return;
+        }
         let project = self.project.read(cx);
         let paths: Vec<String> = entries
             .iter()
@@ -4264,6 +4341,9 @@ impl ProjectPanel {
     }
 
     fn external_paths_from_system_clipboard(&self, cx: &App) -> Option<ExternalPaths> {
+        if !self.context_menu_policy.show_local_os_actions {
+            return None;
+        }
         let clipboard_item = cx.read_from_clipboard()?;
         for entry in clipboard_item.entries() {
             if let GpuiClipboardEntry::ExternalPaths(paths) = entry {
@@ -4709,7 +4789,8 @@ impl ProjectPanel {
         cx: &mut Context<Self>,
     ) {
         // Dropping files in copies them into the project's tree.
-        if self.project.read(cx).is_read_only(cx) {
+        if self.project.read(cx).is_read_only(cx) || !self.context_menu_policy.show_local_os_actions
+        {
             return;
         }
         let mut paths: Vec<Arc<Path>> = paths.iter().map(|path| Arc::from(path.clone())).collect();
@@ -7151,17 +7232,22 @@ impl Render for ProjectPanel {
                         .on_action(cx.listener(Self::restore_file))
                         .on_action(cx.listener(Self::add_to_gitignore))
                         .on_action(cx.listener(Self::add_to_git_info_exclude))
-                        .when(!project.is_remote(), |el| {
+                        .when(!project.is_remote() && self.context_menu_policy.show_trash, |el| {
                             el.on_action(cx.listener(Self::trash))
                         })
                 })
                 .when(
-                    project.is_local() || project.is_via_wsl_with_host_interop(cx),
+                    (project.is_local() || project.is_via_wsl_with_host_interop(cx))
+                        && self.context_menu_policy.show_local_os_actions,
                     |el| {
                         el.on_action(cx.listener(Self::reveal_in_finder))
                             .on_action(cx.listener(Self::open_system))
-                            .on_action(cx.listener(Self::open_in_terminal))
                     },
+                )
+                .when(
+                    (project.is_local() || project.is_via_wsl_with_host_interop(cx))
+                        && self.context_menu_policy.show_terminal_actions,
+                    |el| el.on_action(cx.listener(Self::open_in_terminal)),
                 )
                 .when(project.is_via_remote_server(), |el| {
                     el.on_action(cx.listener(Self::open_in_terminal))
@@ -7602,7 +7688,7 @@ impl Render for ProjectPanel {
                             .log_err();
                     }),
                 )
-                .when(is_local, |div| {
+                .when(is_local && self.context_menu_policy.show_local_os_actions, |div| {
                     div.when(panel_settings.drag_and_drop, |div| {
                         div.drag_over::<ExternalPaths>(|style, _, _, cx| {
                             style.bg(cx.theme().colors().drop_target_background)

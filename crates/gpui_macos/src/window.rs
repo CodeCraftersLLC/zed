@@ -181,6 +181,14 @@ unsafe fn build_classes() {
                 reset_cursor_rects as extern "C" fn(&Object, Sel),
             );
             decl.add_method(
+                sel!(cursorUpdate:),
+                cursor_update as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(acceptsFirstResponder),
+                yes as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+            decl.add_method(
                 sel!(pressureChangeWithEvent:),
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
@@ -317,7 +325,57 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
     )
 }
 
-/// Stores the cursor style on the active GPUI window and invalidates its cursor rects.
+/// Map a GPUI [`CursorStyle`] exhaustively to its corresponding AppKit `NSCursor`.
+///
+/// # Safety
+///
+/// Must be called on the AppKit main thread. All returned objects are valid
+/// autoreleased/singleton `NSCursor` instances.
+unsafe fn ns_cursor_for_style(style: CursorStyle) -> id {
+    // SAFETY: Caller guarantees AppKit main-thread access. Every selector below
+    // returns a valid `NSCursor` singleton on macOS.
+    unsafe {
+        match style {
+            CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
+            CursorStyle::IBeam => msg_send![class!(NSCursor), IBeamCursor],
+            CursorStyle::Crosshair => msg_send![class!(NSCursor), crosshairCursor],
+            CursorStyle::ClosedHand => msg_send![class!(NSCursor), closedHandCursor],
+            CursorStyle::OpenHand => msg_send![class!(NSCursor), openHandCursor],
+            CursorStyle::PointingHand => msg_send![class!(NSCursor), pointingHandCursor],
+            CursorStyle::ResizeLeftRight => msg_send![class!(NSCursor), resizeLeftRightCursor],
+            CursorStyle::ResizeUpDown => msg_send![class!(NSCursor), resizeUpDownCursor],
+            CursorStyle::ResizeLeft => msg_send![class!(NSCursor), resizeLeftCursor],
+            CursorStyle::ResizeRight => msg_send![class!(NSCursor), resizeRightCursor],
+            CursorStyle::ResizeColumn => msg_send![class!(NSCursor), resizeLeftRightCursor],
+            CursorStyle::ResizeRow => msg_send![class!(NSCursor), resizeUpDownCursor],
+            CursorStyle::ResizeUp => msg_send![class!(NSCursor), resizeUpCursor],
+            CursorStyle::ResizeDown => msg_send![class!(NSCursor), resizeDownCursor],
+
+            // Undocumented, private class methods:
+            // https://stackoverflow.com/questions/27242353/cocoa-predefined-resize-mouse-cursor
+            CursorStyle::ResizeUpLeftDownRight => {
+                msg_send![class!(NSCursor), _windowResizeNorthWestSouthEastCursor]
+            }
+            CursorStyle::ResizeUpRightDownLeft => {
+                msg_send![class!(NSCursor), _windowResizeNorthEastSouthWestCursor]
+            }
+
+            CursorStyle::IBeamCursorForVerticalLayout => {
+                msg_send![class!(NSCursor), IBeamCursorForVerticalLayout]
+            }
+            CursorStyle::OperationNotAllowed => {
+                msg_send![class!(NSCursor), operationNotAllowedCursor]
+            }
+            CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
+            CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
+            CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+        }
+    }
+}
+
+/// Stores the cursor style on the active GPUI window, invalidates its cursor rects
+/// when changed, and actively applies `[NSCursor set]` when visible so AppKit /
+/// `NSTextInputContext` never leaves a stale I-beam cursor behind.
 ///
 /// # Safety
 ///
@@ -326,7 +384,9 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
 /// with Objective-C objects.
 pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
     // SAFETY: The caller guarantees AppKit main-thread access. `is_gpui_window` ensures the
-    // window has our WINDOW_STATE_IVAR before reading it.
+    // window has our WINDOW_STATE_IVAR before reading it. We drop `window_state` lock before
+    // invoking AppKit cursor APIs so synchronous callbacks (`resetCursorRects` / `cursorUpdate:`)
+    // can never deadlock re-locking `MacWindowState`.
     unsafe {
         let app = NSApplication::sharedApplication(nil);
         let key_window: id = msg_send![app, keyWindow];
@@ -344,13 +404,25 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
         };
 
         let window_state = get_window_state(&*active_window);
-        let mut window_state = window_state.lock();
-        if window_state.cursor_style != style {
-            window_state.cursor_style = style;
-            let _: () = msg_send![
-                window_state.native_window,
-                invalidateCursorRectsForView: window_state.native_view.as_ptr()
-            ];
+        let (native_window, native_view_ptr, changed, visible) = {
+            let mut lock = window_state.lock();
+            let changed = lock.cursor_style != style;
+            if changed {
+                lock.cursor_style = style;
+            }
+            (
+                lock.native_window,
+                lock.native_view.as_ptr(),
+                changed,
+                lock.cursor_visible.load(Ordering::Relaxed),
+            )
+        };
+        if changed {
+            let _: () = msg_send![native_window, invalidateCursorRectsForView: native_view_ptr];
+        }
+        if visible {
+            let cursor = ns_cursor_for_style(style);
+            let _: () = msg_send![cursor, set];
         }
     }
 }
@@ -1953,52 +2025,37 @@ extern "C" fn dealloc_view(this: &Object, _: Sel) {
 
 extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
     // SAFETY: AppKit invokes cursor-rect updates on the main thread for GPUIView instances,
-    // whose WINDOW_STATE_IVAR is initialized when the view is created. The cursor registered
-    // below is a valid NSCursor.
+    // whose WINDOW_STATE_IVAR is initialized when the view is created. The lock is dropped
+    // before invoking `addCursorRect:cursor:`.
     unsafe {
         let _: () = msg_send![super(this, class!(NSView)), resetCursorRects];
 
         let window_state = get_window_state(this);
         let cursor_style = window_state.lock().cursor_style;
-
-        let cursor: id = match cursor_style {
-            CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
-            CursorStyle::IBeam => msg_send![class!(NSCursor), IBeamCursor],
-            CursorStyle::Crosshair => msg_send![class!(NSCursor), crosshairCursor],
-            CursorStyle::ClosedHand => msg_send![class!(NSCursor), closedHandCursor],
-            CursorStyle::OpenHand => msg_send![class!(NSCursor), openHandCursor],
-            CursorStyle::PointingHand => msg_send![class!(NSCursor), pointingHandCursor],
-            CursorStyle::ResizeLeftRight => msg_send![class!(NSCursor), resizeLeftRightCursor],
-            CursorStyle::ResizeUpDown => msg_send![class!(NSCursor), resizeUpDownCursor],
-            CursorStyle::ResizeLeft => msg_send![class!(NSCursor), resizeLeftCursor],
-            CursorStyle::ResizeRight => msg_send![class!(NSCursor), resizeRightCursor],
-            CursorStyle::ResizeColumn => msg_send![class!(NSCursor), resizeLeftRightCursor],
-            CursorStyle::ResizeRow => msg_send![class!(NSCursor), resizeUpDownCursor],
-            CursorStyle::ResizeUp => msg_send![class!(NSCursor), resizeUpCursor],
-            CursorStyle::ResizeDown => msg_send![class!(NSCursor), resizeDownCursor],
-
-            // Undocumented, private class methods:
-            // https://stackoverflow.com/questions/27242353/cocoa-predefined-resize-mouse-cursor
-            CursorStyle::ResizeUpLeftDownRight => {
-                msg_send![class!(NSCursor), _windowResizeNorthWestSouthEastCursor]
-            }
-            CursorStyle::ResizeUpRightDownLeft => {
-                msg_send![class!(NSCursor), _windowResizeNorthEastSouthWestCursor]
-            }
-
-            CursorStyle::IBeamCursorForVerticalLayout => {
-                msg_send![class!(NSCursor), IBeamCursorForVerticalLayout]
-            }
-            CursorStyle::OperationNotAllowed => {
-                msg_send![class!(NSCursor), operationNotAllowedCursor]
-            }
-            CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
-            CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
-            CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
-        };
+        let cursor = ns_cursor_for_style(cursor_style);
 
         let bounds = NSView::bounds(this as *const Object as id);
         let _: () = msg_send![this, addCursorRect: bounds cursor: cursor];
+    }
+}
+
+extern "C" fn cursor_update(this: &Object, _: Sel, _: id) {
+    // SAFETY: AppKit invokes `cursorUpdate:` on the main thread for `GPUIView`.
+    // We release `MacWindowState` before calling `[cursor set]` to avoid any
+    // lock reentrancy.
+    unsafe {
+        let window_state = get_window_state(this);
+        let (cursor_style, visible) = {
+            let lock = window_state.lock();
+            (
+                lock.cursor_style,
+                lock.cursor_visible.load(Ordering::Relaxed),
+            )
+        };
+        if visible {
+            let cursor = ns_cursor_for_style(cursor_style);
+            let _: () = msg_send![cursor, set];
+        }
     }
 }
 
@@ -2301,10 +2358,23 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 
         match &event {
             PlatformInput::MouseDown(_) => {
+                let native_window = lock.native_window;
+                // Drop `MacWindowState` before invoking AppKit responder / IME
+                // methods so any synchronous AppKit reentrancy cannot deadlock.
                 drop(lock);
+                // SAFETY: `handle_view_event` runs on the AppKit main thread for
+                // a live `GPUIView` attached to `native_window`. Restoring `this`
+                // as `firstResponder` ensures `keyDown:` and `NSTextInputClient`
+                // (`insertText:replacementRange:`) continue working after a
+                // native sheet or sibling `WKWebView` relinquished focus.
                 unsafe {
+                    let first_responder: id = msg_send![native_window, firstResponder];
+                    let this_id = this as *const Object as id;
+                    if first_responder != this_id {
+                        let _: BOOL = msg_send![native_window, makeFirstResponder: this_id];
+                    }
                     let input_context: id = msg_send![this, inputContext];
-                    msg_send![input_context, handleEvent: native_event]
+                    let _: BOOL = msg_send![input_context, handleEvent: native_event];
                 }
                 lock = window_state.as_ref().lock();
             }
@@ -2495,8 +2565,25 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         return;
     }
 
-    let executor = lock.foreground_executor.clone();
+    let (executor, restore_first_responder) = {
+        let restore = (selector == sel!(windowDidBecomeKey:) && is_active)
+            .then_some((lock.native_window, lock.native_view.as_ptr()));
+        (lock.foreground_executor.clone(), restore)
+    };
     drop(lock);
+
+    if let Some((native_window, native_view_ptr)) = restore_first_responder {
+        // SAFETY: Runs on the AppKit main thread after releasing `MacWindowState`.
+        // Only restore `GPUIView` when `firstResponder` is `nil` or fell back to
+        // `NSWindow` (e.g., after dismissing an `NSOpenPanel` / `NSAlert` sheet),
+        // preserving intentional subview focus such as an active `WKWebView`.
+        unsafe {
+            let first_responder: id = msg_send![native_window, firstResponder];
+            if first_responder.is_null() || first_responder == native_window {
+                let _: BOOL = msg_send![native_window, makeFirstResponder: native_view_ptr];
+            }
+        }
+    }
 
     let a11y_events = {
         let mut lock = window_state.lock();

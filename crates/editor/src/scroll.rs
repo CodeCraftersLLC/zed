@@ -669,6 +669,15 @@ impl Editor {
         self.scroll_manager.set_forbid_vertical_scroll(forbid);
     }
 
+    /// Returns true when the editor currently has horizontal overflow (`scroll_max_x > 0`).
+    /// Used by embedding shells so horizontal wheel events over soft-wrapped editors
+    /// can scroll the outer column strip instead of being swallowed.
+    pub fn can_scroll_horizontally(&self) -> bool {
+        self.scroll_manager
+            .scroll_max_x
+            .is_some_and(|max_x| max_x > 0.0)
+    }
+
     pub fn scroll_top_display_point(&self, snapshot: &DisplaySnapshot, cx: &App) -> DisplayPoint {
         self.scroll_manager.scroll_top_display_point(snapshot, cx)
     }
