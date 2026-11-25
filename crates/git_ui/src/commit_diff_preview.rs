@@ -413,6 +413,12 @@ fn split_files(files: Vec<CommitDiffPreviewFile>) -> Split {
 }
 
 impl CommitDiffPreview {
+    /// Returns true when the underlying diff editor currently has horizontal
+    /// overflow and remaining scroll room in `delta_x`'s direction.
+    pub fn can_scroll_horizontally(&self, delta_x: f32, cx: &App) -> bool {
+        self.editor.read(cx).can_scroll_horizontally(delta_x, cx)
+    }
+
     pub fn new(
         files: Vec<CommitDiffPreviewFile>,
         options: CommitDiffPreviewOptions,

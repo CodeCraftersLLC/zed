@@ -669,13 +669,26 @@ impl Editor {
         self.scroll_manager.set_forbid_vertical_scroll(forbid);
     }
 
-    /// Returns true when the editor currently has horizontal overflow (`scroll_max_x > 0`).
-    /// Used by embedding shells so horizontal wheel events over soft-wrapped editors
-    /// can scroll the outer column strip instead of being swallowed.
-    pub fn can_scroll_horizontally(&self) -> bool {
-        self.scroll_manager
-            .scroll_max_x
-            .is_some_and(|max_x| max_x > 0.0)
+    /// Returns true when the editor currently has horizontal overflow (`scroll_max_x > 0`)
+    /// AND remaining scroll room in `delta_x`'s direction.
+    ///
+    /// In GPUI wheel events, `delta_x < 0.0` advances `scroll_position.x` to the right
+    /// and `delta_x > 0.0` moves `scroll_position.x` back toward `0.0`.
+    pub fn can_scroll_horizontally(&self, delta_x: f32, cx: &App) -> bool {
+        let Some(max_x) = self.scroll_manager.scroll_max_x else {
+            return false;
+        };
+        if max_x <= 0.5 {
+            return false;
+        }
+        let current_x = self.scroll_manager.offset(cx).x;
+        if delta_x < 0.0 {
+            current_x < max_x - 0.5
+        } else if delta_x > 0.0 {
+            current_x > 0.5
+        } else {
+            false
+        }
     }
 
     pub fn scroll_top_display_point(&self, snapshot: &DisplaySnapshot, cx: &App) -> DisplayPoint {
